@@ -19,7 +19,7 @@ class RenderedPrompt:
 
 def has_images(messages):
     return any(isinstance(m, dict) and isinstance(m.get('content'), list)
-               and any(isinstance(p, dict) and p.get('type') == 'image_url' for p in m['content'])
+               and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
                for m in messages or [])
 
 
@@ -46,14 +46,24 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
     if frontend is None:
         raise RequestError('image input requires a supported vision checkpoint served with --vision')
     allow_urls = bool(getattr(frontend, 'allow_urls', False))
+    videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
     try:
-        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls)
+        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos)
     except (ImageInputError, ValueError) as exc:
         raise RequestError(str(exc)) from exc
     slot = image_slot()
     try:
-        images = load_images(sources, limits=limits, allow_urls=allow_urls)
-        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+        from tensorfold.vision.images import ImageSource
+
+        images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=limits, allow_urls=allow_urls)
+        clips: list[Any] = [s for s in sources if not isinstance(s, ImageSource)]
+        if clips:
+            from tensorfold.vision.videos import load_videos
+
+            clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
+        else:
+            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
     except (ImageInputError, ValueError, ImportError) as exc:
         raise RequestError(str(exc)) from exc
     finally:

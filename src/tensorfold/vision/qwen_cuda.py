@@ -9,7 +9,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-MAX_PATCHES = 16384
+MAX_PATCHES = 16384                  # an image request's patches, and a video's per tower call
+MAX_VIDEO_PATCHES = 16 * 16384       # a request's video patches (~65k tokens), encoded MAX_PATCHES at a time
 WORKSPACE_BYTES = 4 * 1024**3
 
 
@@ -154,6 +155,9 @@ class QwenCudaVision:
         self.frontend = QwenImageProcessor.from_directory(model_dir)
         raw = json.loads((Path(model_dir) / "config.json").read_text())
         self.image_token = int(raw["image_token_id"])
+        # videos: Flash Next's frontend (the frame groups ride the image path; tested on that checkpoint)
+        self.videos = raw.get("model_type") == "qwen4_exp" and "video_token_id" in raw
+        self.media_tokens = frozenset({self.image_token} | ({int(raw["video_token_id"])} if self.videos else set()))
         self.device = device
         config = Qwen3_5VisionConfig(**{k: v for k, v in self.config.items()
                                       if k not in ("model_type", "deepstack_visual_indexes")})
@@ -198,41 +202,80 @@ class QwenCudaVision:
         if tuple(prompt) != tuple(prepared.token_ids):
             raise ValueError("vision preparation belongs to different prompt tokens")
         grid = prepared.image_grid_thw
+        videos = getattr(prepared, "video_grid_thw", None)
+        if videos is not None and not self.videos:
+            raise ValueError("this server's vision frontend encodes images only")
         if len(grid.shape) != 2 or grid.shape[1] != 3 or any(int(t) != 1 for t in grid[:, 0]):
             raise ValueError("CUDA vision accepts images with one temporal grid, not video")
         merge = self.config["spatial_merge_size"]
-        if any(int(value) != value or value <= 0 for row in grid for value in row) or any(
-                int(h) % merge or int(w) % merge for _, h, w in grid):
+        every = list(grid) + ([] if videos is None else list(videos))
+        if any(int(value) != value or value <= 0 for row in every for value in row) or any(
+                int(h) % merge or int(w) % merge for _, h, w in every):
             raise ValueError("image grids must contain positive merge-aligned dimensions")
         patches = sum(int(t) * int(h) * int(w) for t, h, w in grid)
-        if patches <= 0 or patches > MAX_PATCHES:
+        clips = 0 if videos is None else sum(int(t) * int(h) * int(w) for t, h, w in videos)
+        if patches > MAX_PATCHES or (patches <= 0 and clips <= 0):
             raise ValueError(f"image request exceeds the CUDA vision budget of {MAX_PATCHES} patches")
+        if clips > MAX_VIDEO_PATCHES:
+            raise ValueError(f"video request exceeds the CUDA vision budget of {MAX_VIDEO_PATCHES} patches")
         patch_width = (self.config["in_channels"] * self.config["temporal_patch_size"] * self.config["patch_size"]**2)
-        if tuple(prepared.pixel_values.shape) != (patches, patch_width):
+        if tuple(prepared.pixel_values.shape) != (patches, patch_width) or (
+                videos is not None and tuple(prepared.video_pixel_values.shape) != (clips, patch_width)):
             raise ValueError("image patch tensor has an invalid shape")
         if tuple(prepared.position_ids.shape) != (3, 1, len(prompt)):
             raise ValueError("image positions must have shape (3, 1, prompt tokens)")
-        rows = tuple(i for start, end in prepared.image_spans for i in range(start, end))
+        frames: tuple[tuple[int, int], ...] = tuple(getattr(prepared, "video_spans", ()))
+        spans = sorted(tuple(prepared.image_spans) + frames)
+        rows = tuple(i for start, end in spans for i in range(start, end))
         positions = prepared.position_ids[:, 0, :].tolist()
-        validate_encoded(rows, positions, prepared.rope_delta, prompt, self.image_token,
-                         (patches // self.config["spatial_merge_size"]**2, self.config["out_hidden_size"]),
+        validate_encoded(rows, positions, prepared.rope_delta, prompt, self.media_tokens,
+                         ((patches + clips) // merge**2, self.config["out_hidden_size"]),
                          self.config["out_hidden_size"])
         with torch.inference_mode(), sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
-            # a copy: the prepared arrays are read-only, and a tensor may not share them
-            pixels = torch.tensor(prepared.pixel_values, dtype=torch.bfloat16, device=self.device)
-            grids = torch.tensor(grid, dtype=torch.int64, device=self.device)
-            features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
-            features = features.to(dtype=torch.bfloat16).contiguous()
+            blocks = {}                                  # span start -> its features, in the tower's order
+            if patches:
+                # a copy: the prepared arrays are read-only, and a tensor may not share them
+                pixels = torch.tensor(prepared.pixel_values, dtype=torch.bfloat16, device=self.device)
+                grids = torch.tensor(grid, dtype=torch.int64, device=self.device)
+                features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
+                features = features.to(dtype=torch.bfloat16)
+                for (start, end), part in zip(prepared.image_spans, features.split([e - s for s, e in
+                                                                                   prepared.image_spans])):
+                    blocks[start] = part
+            if clips and videos is not None:
+                # frame groups never attend to one another: a video encodes a bounded run of them at a time
+                done, spans_left = 0, iter(frames)
+                for t, h, w in videos:
+                    t, h, w = int(t), int(h), int(w)
+                    step = max(1, MAX_PATCHES // (h * w))
+                    for g in range(0, t, step):
+                        n = min(step, t - g)
+                        pixels = torch.tensor(prepared.video_pixel_values[done:done + n * h * w],
+                                              dtype=torch.bfloat16, device=self.device)
+                        grids = torch.tensor([[n, h, w]], dtype=torch.int64, device=self.device)
+                        features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
+                        for part in features.to(dtype=torch.bfloat16).split(h * w // merge**2):
+                            start, end = next(spans_left)
+                            if end - start != part.shape[0]:
+                                raise ValueError("video frame features do not match their placeholders")
+                            blocks[start] = part
+                        done += n * h * w
+            features = torch.cat([blocks[start] for start, _ in spans]).contiguous()
         if tuple(features.shape) != (len(rows), self.config["out_hidden_size"]):
             raise ValueError("vision tower returned a different number of image features")
         return EncodedVision(rows, features, torch.tensor(positions, dtype=torch.int32, device=self.device),
                              prepared.rope_delta)
 
+    def video_size(self, frames: int, height: int, width: int) -> tuple[int, int]:
+        return self.frontend.video_size(frames, height, width)
 
-def validate_encoded(rows, positions, delta: int, prompt, image_token: int, feature_shape, hidden: int) -> None:
-    """Reject a payload that could overwrite text rows or misalign the language cache."""
+
+def validate_encoded(rows, positions, delta: int, prompt, image_token, feature_shape, hidden: int) -> None:
+    """Reject a payload that could overwrite text rows or misalign the language cache; ``image_token``: the
+    placeholder id, or the set of them (images and videos)."""
     n = len(prompt)
-    if list(rows) != [i for i, token in enumerate(prompt) if token == image_token]:
+    media = image_token if isinstance(image_token, (set, frozenset, tuple)) else {image_token}
+    if list(rows) != [i for i, token in enumerate(prompt) if token in media]:
         raise ValueError("vision feature rows must match every image placeholder exactly")
     if not rows or tuple(feature_shape) != (len(rows), hidden):
         raise ValueError("vision feature count or width differs from the image placeholders")
