@@ -12,7 +12,23 @@ from tensorfold.cuda import prompt_precision
 from . import CONFIDENCE, DEPTH
 
 MAX_DEPTH = 15           # a verify window of at most 16 rows
-KEEP = 8                 # prompt states (one token before each end) a concurrent decoder keeps to resume from
+KEEP = 8                 # prompt ends a concurrent decoder keeps to resume from
+# the image tower's workspace with --vision: measured peaks 0.76 GiB (a 4,096-token image) and 0.83 GiB (a
+# 256-frame video, encoded 16,384 patches at a time) over its 0.85 GiB of weights. TENSORFOLD_VISION_WORKSPACE_MIB
+# sets what startup reserves for it; 0 draws it, for the moment of an encode, from the system reserve (the decoder
+# returns it right after the image prompt's prefill)
+VISION_WORKSPACE = 5 * 2**28
+
+
+def vision_workspace() -> int:
+    import os
+
+    value = os.environ.get("TENSORFOLD_VISION_WORKSPACE_MIB")
+    if value is None or value == "":
+        return VISION_WORKSPACE
+    if not value.isdecimal() or int(value) > 16384:
+        raise ValueError(f"TENSORFOLD_VISION_WORKSPACE_MIB: 0 to 16,384 MiB, not {value!r}")
+    return int(value) * 2**20
 
 
 class FlashNextEngine:
@@ -22,7 +38,8 @@ class FlashNextEngine:
                  draft_vocab: str | int | None = "default", max_len: int | None = None,
                  context_explicit: bool | None = None, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551,
                  prefetch: bool = True, graphs: bool = True, streams: int = 1, ple_on_ssd: bool = False,
-                 kv_dtype: str = "bf16", share: float = 0.0) -> None:
+                 kv_dtype: str = "bf16", share: float = 0.0, vision: bool = False,
+                 vision_urls: bool = False) -> None:
         import torch
 
         from .exl3_pack import admission, extra_files, is_exl3
@@ -33,6 +50,9 @@ class FlashNextEngine:
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
                              "2, or serve the MLX checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
+        if vision and (exl3 or streams < 2 or tp != 1):
+            raise ValueError("image input on Flash Next runs on one GPU with --parallel 2 or more, from the MLX "
+                             "checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)")
         if exl3 and ple_on_ssd:
             raise ValueError("--ple-on-ssd reads the MLX checkpoint's n-gram tables; an EXL3 pack maps its own table "
                              "from its file, so drop --ple-on-ssd")
@@ -55,6 +75,7 @@ class FlashNextEngine:
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
+        self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
         ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
         if tp == 2:
             from tensorfold.cuda.comm import NCCL
@@ -71,8 +92,13 @@ class FlashNextEngine:
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits)))
         if exl3:
             geometry = admission(geometry)
-        self.capacity_plan = admit(model_dir, max_len, context_explicit, torch, geometry,
-                                   indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), rank=rank, world=tp,
+        # --vision: the tower's bf16 weights and its workspace join the one admission
+        from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
+
+        self.capacity_plan = admit(model_dir, max_len, context_explicit, torch,
+                                   capacity_geometry(geometry, model_dir, vision, rank, vision_workspace()),
+                                   vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
+                                   rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
         self.max_len = self.capacity_plan["cache_slots"]
         if tp == 2:
@@ -100,6 +126,15 @@ class FlashNextEngine:
             raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
                              "that has it, or --no-drafts for the serial reference (one token a round)")
         self.w = w
+        if vision:
+            from tensorfold.vision.qwen_cuda import QwenCudaVision
+
+            self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
+                                         allow_urls=vision_urls)
+            torch.cuda.empty_cache()
+            print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
+                  f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
+                  f"workspace reserved{'; https URLs allowed' if vision_urls else ''}", flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
@@ -110,7 +145,8 @@ class FlashNextEngine:
 
             self.e = None
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
-                                      confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype, share=share)
+                                      confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype, share=share,
+                                      vision=self.vision)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
@@ -135,6 +171,9 @@ class FlashNextEngine:
             from .decode import warm
 
             warm(self.e)
+        if self.vision is not None:          # the tower's kernels load now, not on top of the first image request
+            self.vision.warm()
+            torch.cuda.empty_cache()
         warm_s = time.perf_counter() - started
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
@@ -314,10 +353,13 @@ class FlashNextEngine:
 
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
-                 stop_eos: bool = True, background: bool = False, probabilities=None) -> dict[str, Any]:
-        """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones."""
+                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None) -> dict[str, Any]:
+        """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones.
+        ``vision`` (a prepared image prompt): its rows take the tower's features and their t/h/w positions."""
 
         max_tokens = self._limit(prompt, max_tokens)
+        if vision is not None and self.vision is None:
+            raise ValueError("image inputs require starting this server with --vision")
         if probabilities is not None and not self.supports_logprobs:
             raise ValueError("logprobs are supported on one GPU only")
         if probabilities is not None and constraint is not None:
@@ -325,7 +367,8 @@ class FlashNextEngine:
         if self.scheduler is not None:
             grammar = {} if constraint is None else {"constraint": constraint}
             return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
-                                         **grammar, **({"background": True} if background else {}), probabilities=probabilities)
+                                         vision=vision, **grammar,
+                                         **({"background": True} if background else {}), probabilities=probabilities)
         hit = self._resume(prompt) if draft else None
         if self.tp == 2:                     # rank 0 decodes exactly what it hands rank 1
             prompt, max_tokens, sampling, draft, _, _, stop_eos = self._share(

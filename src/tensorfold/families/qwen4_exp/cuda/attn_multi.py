@@ -24,21 +24,28 @@ def _ptr(TABLE, s, T: tl.constexpr):
 
 
 @triton.jit
-def _prep_multi(P, POSR, SID, CP, QW, KW, IW, INV, Q, IQ, eps, N, PW: tl.constexpr, NQ: tl.constexpr,
+def _prep_multi(P, POSR, SID, CP, RDELTA, QW, KW, IW, INV, Q, IQ, eps, N, PW: tl.constexpr, NQ: tl.constexpr,
                 NKV: tl.constexpr, HD: tl.constexpr, NI: tl.constexpr, IHD: tl.constexpr, HALF: tl.constexpr,
                 BITS: tl.constexpr, KT: tl.constexpr):
+    """One row per lane: ``RDELTA`` [rows] holds each row's stream's rotary offset (MODE 3, see ``_prep_row``)."""
+
     r = tl.program_id(0)
     s = tl.load(SID + r)
     glue._prep_row(P, tl.load(POSR + r), r, tl.program_id(1), QW, KW, IW, INV, Q, _ptr(CP, s, KT),
                    _ptr(CP + N, s, KT), _ptr(CP + 2 * N, s, tl.float16), _ptr(CP + 3 * N, s, tl.float16), IQ,
-                   _ptr(CP + 4 * N, s, tl.bfloat16), eps, PW, NQ, NKV, HD, NI, IHD, HALF, BITS)
+                   _ptr(CP + 4 * N, s, tl.bfloat16), RDELTA, RDELTA, eps, PW, NQ, NKV, HD, NI, IHD, HALF, BITS,
+                   MODE=3)
 
 
 @triton.jit
-def _pool_multi(CP, P0, RS, W, INV, eps, N, DI: tl.constexpr, HALF: tl.constexpr, RATIO: tl.constexpr):
+def _pool_multi(CP, P0, RS, DL, W, INV, eps, N, DI: tl.constexpr, HALF: tl.constexpr, RATIO: tl.constexpr,
+                S1: tl.constexpr = 11, S2: tl.constexpr = 10):
+    """A stream per lane: its blocks rotate past its own offset (``DL`` [streams], MODE 1)."""
+
     s = tl.program_id(0)
     _pool_block(_ptr(CP + 4 * N, s, tl.bfloat16), _ptr(CP + 5 * N, s, tl.bfloat16), tl.load(P0 + s),
-                tl.program_id(1), W, INV, eps, tl.load(RS + s), DI, HALF, RATIO)
+                tl.program_id(1), W, INV, DL + s, DL + s, eps, tl.load(RS + s), DI, HALF, RATIO, MODE=1,
+                S1=S1, S2=S2)
 
 
 @triton.jit
@@ -81,6 +88,12 @@ class Step:
             posr[a0:a1] = p0 + np.arange(a1 - a0)
             sid[a0:a1] = s
         counts = [a1 - a0 for _, a0, a1 in segs]
+        # rotary offsets: each stream's own (its text after an image prompt rotates past its tokens), and each
+        # row's, since a lane serves the streams in one launch and `_prep_row` reads the row's
+        deltas = np.array([int(getattr(st, "rope_delta", 0)) for st, _, _ in segs], np.int32)
+        rdelta = np.zeros((rows,), np.int32)
+        for st, a0, a1 in segs:
+            rdelta[a0:a1] = int(getattr(st, "rope_delta", 0))
         ptrs = np.empty((len(layers), PTRS, n), np.int64)
         for s, (st, _, _) in enumerate(segs):
             for i, layer in enumerate(layers):
@@ -92,9 +105,11 @@ class Step:
                 ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
                                  ikc.data_ptr(), pooled.data_ptr()]
         dev = w.device
-        ints = shared.to_device(np.concatenate([posr, sid, first, counts]).tolist(), torch.int32, dev)
+        ints = shared.to_device(np.concatenate([posr, sid, first, counts, rdelta, deltas]).tolist(), torch.int32, dev)
         self.posr, self.sid = ints[:rows], ints[rows:2 * rows]
-        self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:]
+        self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:2 * rows + 2 * n]
+        self.rdelta = ints[2 * rows + 2 * n:2 * rows + 2 * n + rows]
+        self.deltas = ints[2 * rows + 2 * n + rows:]
         self.ptrs = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev).view(len(layers), PTRS * n)
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
@@ -111,15 +126,16 @@ def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
     bits = 0 if not cache0.quantized else cache0.bits
     kt = {0: tl.bfloat16, 8: tl.int8, 4: tl.uint8}[bits]
     heads = c.heads + c.kv_heads + c.index_heads + 1
-    _prep_multi[(rows, heads)](b.pa[:rows], step.posr, step.sid, cp, a.q_scale, a.k_scale, a.iq_scale, w.inv_freq,
-                               b.q, b.iq, c.eps, n, PW=b.pa.shape[1], NQ=c.heads, NKV=c.kv_heads, HD=c.head_dim,
-                               NI=c.index_heads, IHD=c.index_dim, HALF=w.inv_freq.numel(), BITS=bits, KT=kt,
-                               num_warps=2)
+    _prep_multi[(rows, heads)](b.pa[:rows], step.posr, step.sid, cp, step.rdelta, a.q_scale, a.k_scale, a.iq_scale,
+                               w.inv_freq, b.q, b.iq, c.eps, n, PW=b.pa.shape[1], NQ=c.heads, NKV=c.kv_heads,
+                               HD=c.head_dim, NI=c.index_heads, IHD=c.index_dim, HALF=w.inv_freq.numel(), BITS=bits,
+                               KT=kt, num_warps=2)
     top = sc.budget // sc.ratio
     if sc.qsa:
-        _pool_multi[(n, step.most // sc.ratio + 2)](cp, step.first, step.counts, a.ik_scale, w.inv_freq, c.eps, n,
-                                                    DI=c.index_dim, HALF=w.inv_freq.numel(), RATIO=sc.ratio,
-                                                    num_warps=1)
+        sections = getattr(c, "mrope_section", (11, 11, 10))
+        _pool_multi[(n, step.most // sc.ratio + 2)](cp, step.first, step.counts, step.deltas, a.ik_scale, w.inv_freq,
+                                                    c.eps, n, DI=c.index_dim, HALF=w.inv_freq.numel(),
+                                                    RATIO=sc.ratio, S1=sections[1], S2=sections[2], num_warps=1)
         for (st, a0, a1), end in zip(step.segs, step.ends):
             if end // sc.ratio > top:                # this stream has sparse rows: its own select
                 _, _, pooled, pos, _ = _caches(layer, st, mtp)

@@ -16,7 +16,7 @@ from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 from tensorfold.engine.grammar import GrammarError
 
-from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin
+from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin, vision_features, vision_positions
 from . import attn_multi, gdn_multi
 from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
@@ -43,10 +43,11 @@ class MultiDecoder:
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
-                 share: float = SHARE) -> None:
+                 share: float = SHARE, vision=None) -> None:
         if w.comm is not None:
             raise ValueError("concurrent Flash Next runs on one GPU for now")
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
+        self.vision = vision                         # the image tower (``QwenCudaVision``) with --vision, else None
         self.eos = tuple(w.cfg.eos) if stop_eos else ()
         rows = slots * (depth + 1)
         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
@@ -68,7 +69,7 @@ class MultiDecoder:
         self.memory_gate = MemoryGate(live() if live is not None else 1 << 62, reserve=2 * GIB, live=live)
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
-        self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]
+        self.fills: dict[int, list] = {}                 # stream id -> [engine, drafts?, next row, kept state, vision]
         self.next_id = 0
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
@@ -203,7 +204,13 @@ class MultiDecoder:
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
         t0 = time.perf_counter()
-        st, resume, s.cached = self._slot_for(list(s.prompt), s.draft)
+        encoded = None
+        if s.vision is not None:                         # an image prompt: the tower encodes it now
+            if self.vision is None:
+                raise ValueError("image inputs require starting this server with --vision")
+            encoded = self.vision.encode(s.vision, s.prompt)
+        s.image = encoded is not None                    # image placeholders look alike whatever the image
+        st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and not s.image)
         if not self._grow(st, len(s.prompt) + self.depth + 2, alone=not self.streams and not self.filling):
             if resume is None:
                 self.free.append(st)
@@ -217,11 +224,15 @@ class MultiDecoder:
         except Exception:
             self.free.append(st)
             raise
+        finally:
+            s.vision = None                              # the features ride the fills from here
+            if s.image:                                  # the tower's scratch goes back to the system at once
+                torch.cuda.empty_cache()
         s.sid, s.st = self.next_id, st
         self.next_id += 1
         s.prefill_s = time.perf_counter() - t0
         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
-        self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
+        self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None, encoded]
         self.filling.append(s)
 
     def _fill(self) -> list[Stream]:
@@ -256,13 +267,18 @@ class MultiDecoder:
 
         pieces, room = [], self.prefill_rows if rows is None else rows
         for s in sorted(self.filling, key=lambda x: x.background):     # foreground prompts first, each oldest first
-            e, mtp, start, _ = self.fills[s.sid]
+            e, mtp, start, _, _ = self.fills[s.sid]
+            image = getattr(s, "image", False)
+            if image and pieces:                        # an image prompt's pass is its own: its t/h/w positions
+                break                                   # cover every row of the pass (see ``_pass``)
             n = min(len(s.prompt) - start, room)
             ends = sum(1 for x, a, k in pieces if a + k == len(x.prompt))
             if n == 0 or (start + n == len(s.prompt) and ends == ENDS):
                 break
             pieces.append((s, start, n))
             room -= n
+            if image:
+                break
         return pieces
 
     def _pass(self) -> list[Stream]:
@@ -270,14 +286,23 @@ class MultiDecoder:
 
         pieces = self._pieces()
         t0 = time.perf_counter()
+        vision = self.fills[pieces[0][0].sid][4] if pieces and getattr(pieces[0][0], "image", False) else None
         try:
             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
             ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
-            logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
+            features = None
+            if vision is not None:                       # an image pass: its rows rotate at their own t/h/w positions
+                _, a, n = pieces[0]
+                positions, rows = vision_positions(vision)
+                features = vision_features(vision, rows, a, n)
+                self.pbuf.rope_rows = positions[a:a + n]
+            logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts, features=features)
             heads = logits[:len(ends)].clone() if ends else None
             lasts = self._absorb(pieces, segs, cuts)
         except Exception as exc:                         # noqa: BLE001  (these requests fail, the others go on)
             return self._failed(pieces, exc)
+        finally:
+            self.pbuf.rope_rows = None                   # an image pass alone sets it
         return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces))
 
     @staticmethod
@@ -340,8 +365,11 @@ class MultiDecoder:
         joined, head = [], 0
         for (s, a, n), last in zip(pieces, lasts):
             s.prefill_s += spent
-            e, mtp, _, kept = self.fills[s.sid]
+            e, mtp, _, kept, vision = self.fills[s.sid]
             self.fills[s.sid][2] = a + n
+            image = vision is not None                   # an image prompt: never kept, and its own rope offset
+            if image and a + n == len(s.prompt):         # decode goes on past the prompt's last image position
+                s.st.set_rope_delta(vision.rope_delta)
             if a + n < len(s.prompt):
                 continue
             self.filling.remove(s)
@@ -356,7 +384,7 @@ class MultiDecoder:
             if s.constraint is not None:
                 s.constraint.advance([first])
             head += 1
-            if s.draft:                # the state one token before the prompt's end, which a next turn extends
+            if s.draft and not image:  # the state one token before the prompt's end, which a next turn extends
                 self._remember(list(s.prompt[:self._keep_at(s)]), st, *kept)
             s.context = list(s.prompt)
             s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,

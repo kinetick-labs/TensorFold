@@ -279,10 +279,28 @@ def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume:
     return st.pos
 
 
+def vision_positions(vision) -> tuple[torch.Tensor, torch.Tensor]:
+    """An image prompt's t/h/w rotary positions [prompt, 3] int32 and its image rows [n] int64, in pass order."""
+
+    return vision.positions.t().contiguous(), torch.tensor(vision.rows, dtype=torch.int64,
+                                                            device=vision.features.device)
+
+
+def vision_features(vision, rows: torch.Tensor, start: int, R: int):
+    """The chunk's image rows and their features (rows within the chunk [n] int64, features [n, hidden]), else None."""
+
+    inside = ((rows >= start) & (rows < start + R)).nonzero().flatten()
+    if not inside.numel():
+        return None
+    return rows.index_select(0, inside) - start, vision.features.index_select(0, inside)
+
+
 @torch.no_grad()
 def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = True,
-                  keep_at: int | None = None) -> torch.Tensor | None:
-    """Commit up to ``e.prefill_rows`` rows from ``start`` (the last chunk returns its logits); a chunk holding ``keep_at`` sets ``e.kept``."""
+                  keep_at: int | None = None, vision=None) -> torch.Tensor | None:
+    """Commit up to ``e.prefill_rows`` rows from ``start`` (the last chunk returns its logits); a chunk holding ``keep_at`` sets ``e.kept``.
+    ``vision`` (``tensorfold.vision.qwen_cuda.EncodedVision``): its image rows take the tower's features in place of
+    their embeddings, and every row of the chunk rotates at its own t/h/w position."""
 
     w, st, pb = e.w, e.st, e.pbuf
     end = min(start + e.prefill_rows, len(prompt))
@@ -291,8 +309,16 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = T
     final = end == len(prompt)
     point = keep_at - start if keep_at is not None and start < keep_at <= end else 0     # the kept point's row
     cut = Cut(point) if 0 < point < R else None           # inside the chunk, not at its end
-    # only the prompt's last row is sampled: the head runs on the final chunk alone
-    logits = forward(w, st, pb, chunk, logits=final, cut=cut)
+    positions = rows = features = None
+    if vision is not None:
+        positions, rows = vision_positions(vision)
+        features = vision_features(vision, rows, start, R)
+        pb.rope_rows = positions[start:start + R]
+    try:
+        # only the prompt's last row is sampled: the head runs on the final chunk alone
+        logits = forward(w, st, pb, chunk, logits=final, cut=cut, features=features)
+    finally:
+        pb.rope_rows = None
     last = logits.clone() if final else None
     e.last_streams = pb.streams[R - 1:R].clone()
     use_mtp = _absorbs(e, mtp)
@@ -312,16 +338,29 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = T
 
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True,
-            resume: dict | None = None, constraint=None, probabilities=None, keep_at: int | None = None) -> int:
-    """Commit the prompt in chunks and sample the first token (``resume`` equals a fresh run); ``e.kept`` resumes prompt[:keep_at]."""
+            resume: dict | None = None, constraint=None, probabilities=None, keep_at: int | None = None,
+            vision=None) -> int:
+    """Commit the prompt in chunks and sample the first token (``resume`` equals a fresh run); ``e.kept`` resumes prompt[:keep_at].
+    ``vision`` (``tensorfold.vision.qwen_cuda.EncodedVision``): an image prompt, prefilled from its start, whose rows
+    rotate at the positions its processor gave them; later text rotates at its position plus the prompt's offset."""
 
+    if vision is not None and resume is not None:
+        raise ValueError("an image prompt prefills from its start")
+    pb = e.pbuf
+    if vision is not None and pb.attn.qsa and e.prefill_rows % pb.attn.ratio:   # a block's first row is in its chunk
+        raise ValueError(f"image prompts need TENSORFOLD_PREFILL_ROWS divisible by {pb.attn.ratio}")
     start, last = prefill_begin(e, prompt, mtp=mtp, resume=resume), None
     if keep_at is not None and not start <= keep_at <= len(prompt):
         raise ValueError(f"keep_at {keep_at} is outside the prefilled range [{start}, {len(prompt)}]")
     e.kept = resume if keep_at == start else None                 # the same prompt again: its own point
-    while start < len(prompt):
-        last = prefill_chunk(e, prompt, start, mtp=mtp, keep_at=keep_at)
-        start += e.prefill_rows
+    try:
+        while start < len(prompt):
+            last = prefill_chunk(e, prompt, start, mtp=mtp, keep_at=keep_at, vision=vision)
+            start += e.prefill_rows
+        if vision is not None:                       # decode continues at the image prompt's rotary offset
+            e.st.set_rope_delta(vision.rope_delta)
+    finally:
+        pb.rope_rows = None
     if constraint is not None:                           # a reply's grammar: this rank's vocabulary columns
         last = constraint.mask(last, None, e.w.meta.get("vocab_offset", 0))
     first = e.sample(last, [len(prompt)], sampling)[0]
