@@ -19,7 +19,7 @@ from tensorfold.engine.grammar import GrammarError
 
 from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin
 from . import attn_multi, gdn_multi, image_rows, prefixes
-from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
+from .forward import Cut, ask_ple_rows, commit, compute, compute_mixed, converges, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
 from .prompt_plan import pass_limit
 from .state import ENDS, Buffers, State
@@ -533,22 +533,34 @@ class MultiDecoder:
         logits = self._mtp(segs)
         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
             st.set_mtp_len(st.mtp_len + len(keep))
+        # each stream's next verify window so far (its last kept token, then its drafts): a token's n-gram rows are
+        # asked for as it lands, while the GPU runs the depth after it
+        rows = {s.sid: [keep[-1]] for s, _, keep in todo}
+        for s, _, _ in todo:
+            ask_ple_rows(self.w, s.st, rows[s.sid])
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
         for j in range(self.depth):
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
+            landed = []
             for (s, row), (d, p) in zip(active, picks):
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
+                rows[s.sid].append(d)
+                landed.append(s)
                 if not low and j + 1 < room[s.sid]:
                     nxt.append((s, row, d))
             if not nxt:
+                for s in landed:
+                    ask_ple_rows(self.w, s.st, rows[s.sid])
                 return
             windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
             segs = mtp_stage(self.w, self.mbuf, windows)
             logits = self._mtp(segs)
+            for s in landed:
+                ask_ple_rows(self.w, s.st, rows[s.sid])
             for s, _, _ in nxt:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1

@@ -315,6 +315,21 @@ def stage_ple_rows(p, b: Buffers, ids: np.ndarray, at: int = 0) -> None:
     b.ple_b[rows].copy_(b.ple_hb[rows].view(torch.bfloat16), non_blocking=True)
 
 
+def ask_ple_rows(w: Weights, st: State, window: Sequence[int]) -> None:
+    """Ask the n-gram tables for the rows of ``window``'s last token, ``window`` being the next forward's tokens so
+    far after ``st``'s committed history: the pages start coming in while the GPU drafts, and ``stage`` later copies
+    the very same rows (the ids are ``stage``'s own, a token's n-gram reaching back only n - 1 tokens)."""
+
+    if st.ple_history is None or not window:
+        return
+    history = np.concatenate([st.ple_history, np.asarray(window[:-1], dtype=np.int64)])[-(w.cfg.ngram_size - 1):]
+    token = np.asarray(window[-1:], dtype=np.int64)
+    for layer in w.layers:
+        need = getattr(layer.ple.table, "will_need", None) if layer.ple is not None else None
+        if need is not None:
+            need(layer.ple.ngram.ids(history, token))
+
+
 def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     """Routed experts + the shared expert. Returns the pending write-back: (2, slots y, weights) on one GPU, (3, gathered fp32 partials, None) across ranks."""
 
