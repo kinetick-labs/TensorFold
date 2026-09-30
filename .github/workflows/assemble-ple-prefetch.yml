@@ -1,0 +1,47 @@
+name: assemble-ple-prefetch
+on:
+  push:
+    branches: [cursor/ple-row-prefetch-0ff8]
+    paths: ['.github/ple-prefetch/**']
+  workflow_dispatch:
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cursor/ple-row-prefetch-0ff8
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble and apply patch onto feat/vision-qwen4-exp tip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ple-prefetch
+          cp -a .github/ple-prefetch/. /tmp/ple-prefetch/
+          cp .github/workflows/assemble-ple-prefetch.yml /tmp/assemble-ple-prefetch.yml
+          git fetch origin feat/vision-qwen4-exp
+          git reset --hard origin/feat/vision-qwen4-exp
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          parts = sorted(Path('/tmp/ple-prefetch').glob('part*.b64'))
+          assert parts, 'no patch parts'
+          data = ''.join(p.read_text().strip() for p in parts)
+          Path('/tmp/ple.patch').write_bytes(base64.b64decode(data))
+          print('parts', len(parts), 'bytes', Path('/tmp/ple.patch').stat().st_size)
+          PY
+          git config user.name "tournierjc"
+          git config user.email "mail@tournierjc.fr"
+          git am --3way /tmp/ple.patch
+          # Keep assembler on the tip so force-push does not delete workflow files (needs workflows scope).
+          mkdir -p .github/ple-prefetch .github/workflows
+          cp -a /tmp/ple-prefetch/. .github/ple-prefetch/
+          cp /tmp/assemble-ple-prefetch.yml .github/workflows/assemble-ple-prefetch.yml
+          git add .github/ple-prefetch .github/workflows/assemble-ple-prefetch.yml
+          git commit -m "ci: keep ple prefetch assemble parts on the tip"
+          git push --force origin HEAD:cursor/ple-row-prefetch-0ff8
