@@ -18,18 +18,22 @@ from tensorfold.families.qwen4_exp.cuda import bf16, nvfp4, nvfp4_moe  # noqa: E
 def test_the_faces_a_load_copies_follow_the_environment(monkeypatch) -> None:
     """A face is eligible and the environment chooses: a load that never sets the value pays for no copy, and a
     value that is not one of the two names means none either. The loader used to mark its faces ``copy=True``, so
-    they were built whether or not anything would read them."""
+    they were built whether or not anything would read them. ``=1`` is the projection lane (``face=True``);
+    other ``make_b16`` call sites stay on the stored rows unless the mode is ``all``."""
 
     torch.manual_seed(6)
     w = (torch.randn(320, 10240, device="cuda") * 0.02).to(torch.bfloat16)
     monkeypatch.delenv("TENSORFOLD_FACES_FP8", raising=False)
+    monkeypatch.delenv("TENSORFOLD_FACES_12BIT", raising=False)
     assert bf16.make_b16(w).rows8 is None
+    assert bf16.make_b16(w, face=True).rows8 is None
     monkeypatch.setenv("TENSORFOLD_FACES_FP8", "1")
-    assert bf16.make_b16(w).rows8 is not None
+    assert bf16.make_b16(w).rows8 is None                      # not a projection face
+    assert bf16.make_b16(w, face=True).rows8 is not None
     monkeypatch.setenv("TENSORFOLD_FACES_FP8", "all")
     assert bf16.make_b16(w).rows8 is not None
     monkeypatch.setenv("TENSORFOLD_FACES_FP8", "yes")         # malformed means none
-    assert bf16.make_b16(w).rows8 is None
+    assert bf16.make_b16(w, face=True).rows8 is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -232,6 +236,7 @@ def test_a_face_with_an_8bit_copy_reads_it_for_a_round_and_its_rows_for_a_prompt
     e4m3 half and a prompt the stored rows - the reading the copy is honest about, since it is coarser."""
 
     monkeypatch.delenv("TENSORFOLD_FACES_FP8", raising=False)
+    monkeypatch.delenv("TENSORFOLD_FACES_12BIT", raising=False)
     monkeypatch.setattr(bf16, "DECODE_FP8", True)
     torch.manual_seed(3)
     dev = "cuda"
@@ -249,3 +254,54 @@ def test_a_face_with_an_8bit_copy_reads_it_for_a_round_and_its_rows_for_a_prompt
     assert not torch.equal(stored, decode)
     assert bf16.make_b16(w).rows8 is None                    # off unless the load asks for it
     assert bf16.make_b16(w, copy=False).rows8 is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_12bit_faces_a_load_copies_follow_the_environment(monkeypatch) -> None:
+    """Lossless 12-bit: ``=1`` is the projection lane; ``all`` also packs the lm_head (copy=False) because
+    unpack is bit-identical. Prefers 12-bit over e4m3 when both env lanes are set."""
+
+    torch.manual_seed(7)
+    w = (torch.randn(320, 10240, device="cuda") * 0.02).to(torch.bfloat16)
+    monkeypatch.delenv("TENSORFOLD_FACES_FP8", raising=False)
+    monkeypatch.delenv("TENSORFOLD_FACES_12BIT", raising=False)
+    assert bf16.make_b16(w, face=True).rows12 is None
+    monkeypatch.setenv("TENSORFOLD_FACES_12BIT", "1")
+    assert bf16.make_b16(w).rows12 is None
+    assert bf16.make_b16(w, face=True).rows12 is not None
+    assert bf16.make_b16(w, copy=False).rows12 is None          # head stays stored under =1
+    monkeypatch.setenv("TENSORFOLD_FACES_12BIT", "all")
+    head = bf16.make_b16(w, copy=False)
+    assert head.rows12 is not None and head.rows8 is None
+    monkeypatch.setenv("TENSORFOLD_FACES_FP8", "all")
+    both = bf16.make_b16(w, face=True)                          # 12-bit wins; no second e4m3 face
+    assert both.rows12 is not None and both.rows8 is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_face_with_a_12bit_copy_is_bit_exact_on_decode(monkeypatch) -> None:
+    """A round reads the packed face; bits match the stored-row matmul (escape table + shared-exp unpack)."""
+
+    monkeypatch.delenv("TENSORFOLD_FACES_FP8", raising=False)
+    monkeypatch.delenv("TENSORFOLD_FACES_12BIT", raising=False)
+    monkeypatch.setattr(bf16, "DECODE_12BIT", True)
+    torch.manual_seed(8)
+    dev = "cuda"
+    w = (torch.randn(640, 2560, device=dev) * 0.04).to(torch.bfloat16)
+    # Sprinkle a few subnormals / large exponent spreads so escapes are exercised.
+    bits = w.view(torch.uint16)
+    bits[0, :32] = bits[0, :32] & 0x007F                      # subnormals -> escape
+    w = bits.view(torch.bfloat16)
+    x = (torch.randn(7, 2560, device=dev) * 0.5).to(torch.bfloat16)
+    monkeypatch.setenv("TENSORFOLD_FACES_12BIT", "1")
+    face = bf16.make_b16(w, face=True)
+    assert face.rows12 is not None
+    assert face.rows12.nbytes() < w.numel() * 2
+    assert face.rows12.n_esc > 0
+    assert torch.equal(bf16.unpack12(face.rows12), w)
+    stored = bf16.matmul(x, face, prefill=True)
+    decode = bf16.matmul(x, face, prefill=False)
+    assert torch.equal(stored, decode)
+    solo = torch.empty((1, 640), dtype=torch.bfloat16, device=dev)
+    bf16.matmul(x[:1], face, out=solo, prefill=False)
+    assert torch.equal(solo[0], decode[0])
