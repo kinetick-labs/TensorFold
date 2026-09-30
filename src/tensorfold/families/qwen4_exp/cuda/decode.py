@@ -15,7 +15,7 @@ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import CONFIDENCE, DEPTH
-from .forward import Cut, commit, cut_snapshot, forward
+from .forward import Cut, ask_ple_rows, commit, cut_snapshot, forward
 from .state import CAND, Buffers, State
 from .mtp import mtp_forward
 from .weights import Weights
@@ -234,6 +234,8 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
 
     st = e.st
     logits = absorb(e, streams, next_tokens)
+    window = [next_tokens[-1]]              # the verify's rows so far: each one's n-gram rows are asked for as it
+    ask_ple_rows(e.w, st, window)           # lands, while the GPU runs the next MTP step
     drafts: list[int] = []
     for j in range(count):
         low = False
@@ -245,7 +247,9 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
         else:
             d = e.sample(logits[:1], [position + j], sampling, draft=True)[0]
         drafts.append(d)
+        window.append(d)
         if low:
+            ask_ple_rows(e.w, st, window)
             break
         if j + 1 < count:
             prev = e.mbuf.streams[len(next_tokens) - 1:len(next_tokens)] if j == 0 else e.mbuf.streams[:1]
@@ -253,6 +257,7 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
             st.set_mtp_len(st.mtp_len + 1)
             st.mtp_drafted += 1
             next_tokens = [d]
+        ask_ple_rows(e.w, st, window)
     return drafts
 
 
