@@ -42,11 +42,16 @@ Boolean `true` inherits global settings; `false` and an empty mapping disable qu
 Conflicting aliases and packed shapes that disagree with the declared bit width or group size are refused.
 
 A CUDA checkpoint may quantize only its routed experts, leaving the dense projections in BF16 that a decoding
-round re-reads whole however few rows it verifies. `TENSORFOLD_FACES_FP8` loads those projections with an e4m3
-copy a round reads instead of the stored rows: `1` for the DeltaNet and attention linears a round re-reads most,
-`all` for every BF16 face, and unset or any unrecognized value for none. A prompt keeps the stored rows - the
-copy is a decode lane - and rows a draft chain is compared against, such as the lm_head's, are never copied,
-since a coarser copy there costs the drafts more than the round saves.
+round re-reads whole however few rows it verifies. Two optional decode-side copies exist:
+
+* `TENSORFOLD_FACES_FP8` — e4m3, half the bytes, **not** bit-exact. `1` for the DeltaNet and attention
+  linears a round re-reads most, `all` for every BF16 face, unset or unrecognized for none. A prompt keeps
+  the stored rows. The lm_head is never copied on this lane (`copy=False`): a coarser head costs the drafts
+  more than the round saves.
+* `TENSORFOLD_FACES_12BIT` — lossless shared-exponent 12-bit groups of 32 along K (~0.78×–0.90× the stored
+  bytes; escape table for rare groups). Same `1` / `all` names; because unpack is bit-identical, `all` may
+  include the lm_head. Decode reads the packed face; prompts keep the stored rows. When both env lanes are
+  set, the loader builds the 12-bit copy and skips the e4m3 one.
 
 Fused stacks combine projections only when bit width, group size, input width and metadata dtypes agree.
 Otherwise the model computes those projections separately with their declared formats.

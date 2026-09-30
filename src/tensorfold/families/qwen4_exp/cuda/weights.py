@@ -116,9 +116,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
                      for kind, ws in runs]
             return faces[0] if len(faces) == 1 else Concat(faces)
         if all(s is None for _, s in got):
-            # Eligible, not chosen: ``make_b16`` reads TENSORFOLD_FACES_FP8, so a load without it keeps the
-            # stored rows and does not pay for copies nothing would read.
-            faces = [b16_rows(w.to(torch.bfloat16), copy=None) for w, _ in got]
+            # Eligible, not chosen: ``make_b16`` reads TENSORFOLD_FACES_FP8 / TENSORFOLD_FACES_12BIT, so a
+            # load without them keeps the stored rows and does not pay for copies nothing would read.
+            # ``face=True`` marks the ``=1`` lane (DeltaNet / attention projections).
+            faces = [b16_rows(w.to(torch.bfloat16), copy=None, face=True) for w, _ in got]
             return faces[0] if len(faces) == 1 else stack_b16(faces)
         if all(s is not None for _, s in got):
             from tensorfold.cuda.nvfp4.linear import Mx8Linear
@@ -207,8 +208,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
             out[r:r + 16384] = blk.view(-1, w.shape[1]).to(torch.bfloat16)
         return out
 
-    def b16_rows(t: torch.Tensor, *, copy: bool | None = None):
-        return b16_from_rows(t.to(torch.bfloat16).contiguous(), copy=copy)
+    def b16_rows(t: torch.Tensor, *, copy: bool | None = None, face: bool = False):
+        return b16_from_rows(t.to(torch.bfloat16).contiguous(), copy=copy, face=face)
 
     def moe(name: str) -> MoEW:
         gate_rows = raw(name + ".gate.weight").to(torch.bfloat16)
