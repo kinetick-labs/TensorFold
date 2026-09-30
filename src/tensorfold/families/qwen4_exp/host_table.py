@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,10 @@ _PARTS = ("weight", "scales", "biases")
 # a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded
 GATHER_THREADS = 16
 GATHER_SPLIT = 512
+# A decode step's rows are too few for threads, so their pages are asked for first (``will_need``): the kernel starts
+# every missing page's read at once and the copy then waits for the slowest, not for each in turn. The drafts also ask
+# for their rows while the GPU drafts, a step before the verify gathers them. TENSORFOLD_PLE_PREFETCH=0 turns both off.
+PREFETCH = os.environ.get("TENSORFOLD_PLE_PREFETCH", "1").strip() != "0"
 
 
 def ngrams_on_host(model_dir: Path, ssd: bool = False) -> bool:
@@ -91,6 +96,13 @@ class HostTable:
         # threads start with the first threaded gather
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
 
+    def will_need(self, ids: np.ndarray) -> None:
+        """Start reading the pages rows ``ids`` sit on, without waiting: a later gather of them copies cached bytes."""
+
+        flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+        shard = np.searchsorted(self.starts, flat, side="right") - 1
+        _pages(self).ask((self.words, self.scales, self.biases), shard, flat - self.starts[shard])
+
     def gather(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Rows ``ids`` (global) -> words [n, W] uint32, scales and biases [n, G] (bf16 bits as uint16)."""
 
@@ -98,6 +110,8 @@ class HostTable:
         n = len(flat)
         shard = np.searchsorted(self.starts, flat, side="right") - 1
         local = flat - self.starts[shard]
+        if n < 2 * GATHER_SPLIT:                                  # a decode step: every missing page read at once
+            _pages(self).ask((self.words, self.scales, self.biases), shard, local)
         where = self.fidx[shard]
         wo = self.wbase[shard] + local * self.wrow
         so = self.sbase[shard] + local * self.grow
@@ -171,6 +185,17 @@ class BF16Table:
         self.nbytes = sum(a.nbytes for a in self.values)
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
 
+    def _parts(self) -> tuple[list[np.ndarray], ...]:
+        """The memory-mapped arrays a row is read from, each indexed by shard."""
+
+        return (self.values,)
+
+    def will_need(self, ids: np.ndarray) -> None:
+        """Start reading the pages rows ``ids`` sit on, without waiting: a later gather of them copies cached bytes."""
+
+        shard, local = self._where(ids)
+        _pages(self).ask(self._parts(), shard, local)
+
     def _where(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Each id's shard and row in it, after checking the ids lie in the table."""
 
@@ -184,6 +209,8 @@ class BF16Table:
         """Rows ``ids`` (global) -> [n, W] uint16 (the bf16 bits of W values)."""
 
         shard, local = self._where(ids)
+        if shard.size < 2 * GATHER_SPLIT:                         # a decode step: every missing page read at once
+            _pages(self).ask(self._parts(), shard, local)
         out = np.empty((shard.size, self.width), dtype=np.uint16)
 
         def copy(f: int, at: np.ndarray) -> None:
@@ -271,10 +298,15 @@ class NVFP4Table(BF16Table):
         self.e2m1, self.e4m3, self.g = E2M1, e4m3(np.arange(256)), np.float32(scale)
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
 
+    def _parts(self) -> tuple[list[np.ndarray], ...]:
+        return (self.values, self.scales)
+
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """Rows ``ids`` (global) -> [n, W] uint16: bf16 bits of the fp32 code x block scale x table scale, rounded once."""
 
         shard, local = self._where(ids)
+        if shard.size < 2 * GATHER_SPLIT:                         # a decode step: every missing page read at once
+            _pages(self).ask(self._parts(), shard, local)
         codes = np.empty((shard.size, self.width // 2), dtype=np.uint8)
         blocks = np.empty((shard.size, self.width // 16), dtype=np.uint8)
 
@@ -375,6 +407,46 @@ def _copy_rows(pool: ThreadPoolExecutor, shard: np.ndarray, copy) -> None:
     else:
         for f in np.unique(shard):
             copy(f, np.nonzero(shard == f)[0])
+
+
+class _Pages:
+    """``posix_fadvise(WILLNEED)`` on the byte span of each row asked for: Linux starts the reads of whichever of
+    those pages are not cached and returns, so the rows of a step go to disk together instead of one fault at a
+    time. It moves no bytes the gather would not read anyway, and where the call is missing it does nothing."""
+
+    def __init__(self) -> None:
+        self.fds: dict[str, int] = {}
+        self.ok = PREFETCH and hasattr(os, "posix_fadvise")
+
+    def _fd(self, path: str) -> int:
+        fd = self.fds.get(path)
+        if fd is None:
+            fd = self.fds[path] = os.open(path, os.O_RDONLY)
+            weakref.finalize(self, os.close, fd)
+        return fd
+
+    def ask(self, parts: tuple[list[np.ndarray], ...], shard: np.ndarray, local: np.ndarray) -> None:
+        if not self.ok or not shard.size:
+            return
+        try:
+            spans = set()
+            for arrays in parts:
+                for f, row in zip(shard.tolist(), local.tolist()):
+                    a = arrays[f]
+                    spans.add((a.filename, a.offset + row * a.strides[0], a.strides[0]))
+            for path, at, size in spans:
+                os.posix_fadvise(self._fd(path), at, size, os.POSIX_FADV_WILLNEED)
+        except (AttributeError, OSError, TypeError):   # not a file mapping, or no such advice here: the gather reads
+            self.ok = False
+
+
+def _pages(table: Any) -> _Pages:
+    """The table's page asker, made on first use (the tables' subclasses do not share one constructor)."""
+
+    pages = table.__dict__.get("_page_asker")
+    if pages is None:
+        pages = table.__dict__["_page_asker"] = _Pages()
+    return pages
 
 
 def _key(ids: np.ndarray) -> bytes:
