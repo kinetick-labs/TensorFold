@@ -28,7 +28,10 @@ class Scratch:
         self.xh = self.z = self.tmp = self.part = None
         self.moe: x3experts.Scratch | None = None
         self.ple_host = self.ple_dev = self.ple_emb = None
-        self.prefill = x3prefill.Workspace()
+        # Our prompt rows are bf16 (the engine builds them so) and this family takes the folded path:
+        # W'' = diag(suh) H W_q H / 128 is decoded once a call and the raw rows go straight into the GEMM.
+        # The guard in prefill_matmul checks the dtypes, so a fp16 call falls back to the W_q path.
+        self.prefill = x3prefill.Workspace(fold=True)
 
     def allocate(self, device, *, experts: x3experts.Exl3RoutedExperts, rows: int, ple_words: int, ple_heads: int,
                  ple_dim: int) -> None:
