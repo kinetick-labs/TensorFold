@@ -36,6 +36,20 @@ def _header(path: Path) -> tuple[dict, int]:
     return header, 8 + length
 
 
+def _quantized_sidecar(model_dir: Path) -> Path | None:
+    """A quantized vision sidecar the index does not list: the EXL3 packs keep their tower in one."""
+
+    for path in sorted(model_dir.glob("vision*.safetensors")):
+        try:
+            header, _ = _header(path)
+        except ValueError:
+            continue
+        if any(vision_key(name) is not None and name.endswith(".trellis")
+               for name in header if name != "__metadata__"):
+            return path
+    return None
+
+
 def vision_tensors(model_dir: Path, *, weights_path: Path | None = None) -> dict[str, tuple[Path, dict, int]]:
     """Inspect headers only and return local tower names with their file, tensor metadata and data start."""
     model_dir = Path(model_dir)
@@ -70,6 +84,13 @@ def vision_tensors(model_dir: Path, *, weights_path: Path | None = None) -> dict
     if missing:
         raise ValueError(f"Vision checkpoint is missing indexed tensors: {sorted(missing)[:3]}")
     if not result:
+        sidecar = _quantized_sidecar(model_dir)
+        if sidecar is not None:
+            raise ValueError(
+                f"Vision weights are quantized in {sidecar.name}, which the index does not list: convert it once with "
+                f"`python -m tensorfold.vision.exl3_convert {sidecar.name} vision-f16.safetensors` and serve with "
+                "TENSORFOLD_VISION_WEIGHTS pointing at the converted file (the converter records its source hash and "
+                "codec, and leaves the sidecar untouched)")
         raise ValueError("This local checkpoint has no vision tower weights; use a complete multimodal checkpoint")
     return result
 
