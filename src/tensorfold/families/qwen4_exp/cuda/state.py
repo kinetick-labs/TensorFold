@@ -170,9 +170,12 @@ class State:
         self.ple_tail = torch.zeros(((c.ple_kernel - 1) * c.ngram_size, wide), dtype=torch.bfloat16, device=dev)
         self.ple_history = c.ngram(0).initial_history() if c.ple_layers else None
         self.ple_last: tuple[np.ndarray, np.ndarray] | None = None
-        # MTP head (its own attention cache; ``mtp_len`` entries, the last ``mtp_drafted`` of them chained drafts)
+        # MTP head (its own attention cache; ``mtp_len`` entries, the last ``mtp_drafted`` of them chained drafts).
+        # ``mtp_off`` marks a stream whose draft cache can no longer hold its chain: it decodes without drafting
+        # (the speculative head is optional, so running out of room for it costs speed, never the request).
         self.mtp_len = 0
         self.mtp_drafted = 0
+        self.mtp_off = False
         self.mtp_pos = torch.zeros((1,), dtype=torch.int32, device=dev)
         if w.mtp is not None:
             self.mtp_kc = kvcache.KVCache(capacity, c.kv_heads, c.head_dim, dev, self.kv_dtype)
@@ -240,6 +243,7 @@ class State:
         self.set_rope_delta(0)
         self.image_positions, self.image_rows, self.image_features = None, (), None
         self.mtp_drafted = 0
+        self.mtp_off = False
         self.set_mtp_len(0)
 
     def set_rope_delta(self, delta: int) -> None:

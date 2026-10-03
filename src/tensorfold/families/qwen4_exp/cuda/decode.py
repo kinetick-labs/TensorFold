@@ -250,13 +250,18 @@ class Engine:
         return mtp_forward(self.w, self.st, self.mbuf, next_tokens, streams)
 
 
-def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torch.Tensor:
-    """The MTP cache takes positions with main-model streams [n, S*D] and next tokens; logits of the last."""
+def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torch.Tensor | None:
+    """The MTP cache takes positions with main-model streams [n, S*D] and next tokens; logits of the last.
+    A stream whose draft cache cannot hold these rows is served without drafting: this returns None, leaving
+    ``st.mtp_off`` set, rather than refusing the request."""
 
     st = e.st
     if st.mtp_drafted:
         st.set_mtp_len(st.mtp_len - st.mtp_drafted)
         st.mtp_drafted = 0
+    if st.mtp_off or st.mtp_len + len(next_tokens) > st.capacity:
+        st.mtp_off = True
+        return None
     logits = e.mtp_forward(next_tokens, streams)
     st.set_mtp_len(st.mtp_len + len(next_tokens))
     return logits
@@ -264,10 +269,12 @@ def absorb(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int]) -> torc
 
 def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
           sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-    """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft."""
+    """Absorb kept rows and chain drafts, always retaining the first even below ``confidence``, then stopping before later drafts below it or after a low-confidence first draft. A draft cache with no room for the next chain row stops the chain and decodes without drafting (never refused)."""
 
     st = e.st
     logits = absorb(e, streams, next_tokens)
+    if logits is None:
+        return []
     drafts: list[int] = []
     for j in range(count):
         low = False
@@ -282,6 +289,9 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
         if low:
             break
         if j + 1 < count:
+            if st.mtp_off or st.mtp_len + 1 > st.capacity:
+                st.mtp_off = True                        # one more chain row would pass the cache: stop here
+                break
             prev = e.mbuf.streams[len(next_tokens) - 1:len(next_tokens)] if j == 0 else e.mbuf.streams[:1]
             logits = e.mtp_forward([d], prev)
             st.set_mtp_len(st.mtp_len + 1)
@@ -291,7 +301,7 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
 
 
 def _absorbs(e: Engine, mtp: bool) -> bool:
-    return mtp and e.w.mtp is not None and e.mbuf is not None
+    return mtp and e.w.mtp is not None and e.mbuf is not None and not e.st.mtp_off
 
 
 @torch.no_grad()
@@ -308,8 +318,11 @@ def prefill_begin(e: Engine, prompt: Sequence[int], *, mtp: bool = True, resume:
     if not 0 < st.pos < len(prompt):
         raise ValueError("a resumed prompt must extend the cached tokens")
     if _absorbs(e, mtp) and resume.get("tail") is not None:
-        mtp_forward(e.w, st, e.pbuf, [prompt[st.pos]], resume["tail"])
-        st.set_mtp_len(st.mtp_len + 1)
+        if st.mtp_len + 1 > st.capacity:             # the draft cache cannot take the tail: decode without drafting
+            st.mtp_off = True
+        else:
+            mtp_forward(e.w, st, e.pbuf, [prompt[st.pos]], resume["tail"])
+            st.set_mtp_len(st.mtp_len + 1)
     return st.pos
 
 
@@ -329,12 +342,15 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = T
     logits = forward(w, st, pb, chunk, logits=final, cut=cut)
     last = logits.clone() if final else None
     e.last_streams = pb.streams[R - 1:R].clone()
+    nxt = list(prompt[start + 1:end + 1])
     use_mtp = _absorbs(e, mtp)
+    if use_mtp and st.mtp_len + len(nxt) > st.capacity:
+        st.mtp_off = True      # the draft cache cannot take this chunk: the stream decodes without drafting
+        use_mtp = False
     if point:                    # before the MTP head writes the streams: the point's tail, its state inside the chunk
         mtp_len = st.mtp_len + point - 1 if use_mtp else st.mtp_len       # every row but the point's last
         tail = pb.streams[point - 1:point].clone() if use_mtp else None
         snap = cut_snapshot(w, st, pb, cut, mtp_len) if cut is not None else None
-    nxt = list(prompt[start + 1:end + 1])
     if use_mtp and nxt:
         mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
         st.set_mtp_len(st.mtp_len + len(nxt))
