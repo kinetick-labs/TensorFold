@@ -156,9 +156,16 @@ class PromptPasses:
                   for (s, a, n), (_, a0, _) in zip(pieces, segs) if self.fills[s.sid][1] and a + 1 < len(s.prompt)]
         if absorb:                   # the MTP head absorbs each prompt's rows (its cache in position order)
             absorb = [(st, nxt, streams[:len(nxt)]) for st, nxt, streams in absorb]
-            mtp_compute(self.w, mtp_stage(self.w, self.pbuf, absorb), self.pbuf)
-            for st, nxt, _ in absorb:
-                st.set_mtp_len(st.mtp_len + len(nxt))
+            fits = []
+            for st, nxt, streams in absorb:
+                if st.mtp_off or st.mtp_len + len(nxt) > st.capacity:
+                    st.mtp_off = True                 # its draft cache is full: the prompt decodes without drafting
+                    continue
+                fits.append((st, nxt, streams))
+            if fits:
+                mtp_compute(self.w, mtp_stage(self.w, self.pbuf, fits), self.pbuf)
+                for st, nxt, _ in fits:
+                    st.set_mtp_len(st.mtp_len + len(nxt))
         for (s, a, n), (st, a0, _) in zip(pieces, segs):
             commit(self.w, st, self.pbuf, n, n, at=a0)
         for s, mtp_len, tail, snap in points:            # a point that ends its piece: the state as committed

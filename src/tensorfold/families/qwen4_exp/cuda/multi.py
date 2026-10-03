@@ -415,19 +415,27 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         return failed + done + ended
 
     def _draft_all(self, streams: list) -> None:
-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth. A
+        stream whose draft cache cannot hold the next chain row decodes plainly from here on: an out-of-room
+        draft costs that stream its speed, never the request (the other streams in the batch keep drafting)."""
 
         for s, _, _ in streams:
             s.drafts = []
         room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
-        todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
-        if not todo:
-            return
-        for s, _, _ in todo:
+        todo = []
+        for s, a0, keep in streams:
             st = s.st
-            if st.mtp_drafted:
+            if st.mtp_drafted:                       # drop the chain the last round left unverified
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
+            if self.mbuf is None or room[s.sid] <= 0:
+                continue
+            if st.mtp_off or st.mtp_len + len(keep) > st.capacity:
+                st.mtp_off = True                    # its draft cache is full: plain decode from here
+                continue
+            todo.append((s, a0, keep))
+        if not todo:
+            return
         windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
         segs = mtp_stage(self.w, self.mbuf, windows)
         logits = self._mtp(segs)
@@ -440,6 +448,11 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             for (s, row), (d, p) in zip(active, picks):
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
+                    continue
+                st = s.st
+                if st.mtp_off or st.mtp_len + 1 > st.capacity:
+                    st.mtp_off = True                # one more chain row would pass the cache: stop drafting
+                    s.drafts = []
                     continue
                 s.drafts.append(d)
                 if not low and j + 1 < room[s.sid]:
