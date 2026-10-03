@@ -28,10 +28,11 @@ class Scratch:
         self.xh = self.z = self.tmp = self.part = None
         self.moe: x3experts.Scratch | None = None
         self.ple_host = self.ple_dev = self.ple_emb = None
-        # Our prompt rows are bf16 (the engine builds them so) and this family takes the folded path:
-        # W'' = diag(suh) H W_q H / 128 is decoded once a call and the raw rows go straight into the GEMM.
-        # The guard in prefill_matmul checks the dtypes, so a fp16 call falls back to the W_q path.
-        self.prefill = x3prefill.Workspace(fold=True)
+        # Measured on the 4.05 pack, three arms on one image: the folded path (W'' = diag(suh) H W_q H / 128) is
+        # 4.2% faster on prefill and 1.3% faster per decode round, but it moves the token stream - its arithmetic
+        # differs from the W_q path's by design - and draft acceptance fell 2.2 points behind it, for -3.8% at four
+        # clients. Not opted in: `TENSORFOLD_EXL3_FOLD=1` is upstream's and this family never sets `fold`.
+        self.prefill = x3prefill.Workspace()
 
     def allocate(self, device, *, experts: x3experts.Exl3RoutedExperts, rows: int, ple_words: int, ple_heads: int,
                  ple_dim: int) -> None:
