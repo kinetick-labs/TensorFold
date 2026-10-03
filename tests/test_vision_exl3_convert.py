@@ -110,3 +110,30 @@ def test_conversion_hashes_config_beside_snapshot_symlink(tmp_path):
     convert(source, output)
     with safe_open(str(output), framework="np") as artifact:
         assert artifact.metadata()["config_sha256"] == hashlib.sha256(config).hexdigest()
+
+
+def test_index_without_vision_names_the_quantized_sidecar(tmp_path):
+    """An EXL3 pack keeps its tower in a sidecar the index does not list: the refusal must name the converter."""
+    from safetensors.numpy import save_file
+
+    from tensorfold.vision.qwen_checkpoint import vision_tensors
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"model.language_model.layers.0.mlp.gate.weight": "model-00001-of-00009.safetensors"}}))
+    sidecar = tmp_path / "vision_k6.safetensors"
+    save_file(_group(np.random.default_rng(7), "model.visual.blocks.0.attn.q_proj"), str(sidecar))
+    with pytest.raises(ValueError, match=r"vision_k6\.safetensors.*exl3_convert"):
+        vision_tensors(tmp_path)
+
+
+def test_a_floating_sidecar_keeps_the_plain_refusal(tmp_path):
+    """A floating tower beside an index with no vision names is not an EXL3 sidecar; do not send it to the converter."""
+    from safetensors.numpy import save_file
+
+    from tensorfold.vision.qwen_checkpoint import vision_tensors
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"model.language_model.layers.0.mlp.gate.weight": "model-00001-of-00009.safetensors"}}))
+    save_file({"model.visual.pos_embed.weight": np.zeros((4, 8), np.float16)}, str(tmp_path / "vision.safetensors"))
+    with pytest.raises(ValueError, match="complete multimodal checkpoint"):
+        vision_tensors(tmp_path)
