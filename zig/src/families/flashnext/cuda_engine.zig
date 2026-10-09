@@ -25,6 +25,7 @@ const decode = @import("cuda_decode.zig");
 const fwd = @import("cuda_forward.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
+const exl3 = @import("cuda_exl3.zig");
 const mtp = @import("cuda_mtp.zig");
 const vmm = @import("cuda_vmm.zig");
 const nucleus = @import("cuda_nucleus.zig");
@@ -367,6 +368,8 @@ pub const Engine = struct {
     /// INT4-AutoRound: the block-FP8 lane matmul (cuda_fp8.zig) and the GPTQ int4 kernels (cuda_int4.zig)
     k8: ?fp8.Kernels = null,
     k4: ?int4.Kernels = null,
+    /// EXL3 (an ExLlamaV3 pack): the trellis linear and grouped expert kernels (cuda_exl3.zig)
+    k3: ?exl3.Kernels = null,
     /// with `digest`: each chunk's (streams, logits) sha256 prefixes kept here too (the CLI's media gate)
     digests: ?*std.ArrayList([2][16]u8) = null,
     /// TF_FLASHNEXT_POISON_PADS: rows past a chunk's end in the row-indexed prompt buffers overwritten with
@@ -412,7 +415,8 @@ pub const Engine = struct {
         e.round_segs = try gpa.alloc(fwd.Seg, @max(1, o.streams));
         errdefer gpa.free(e.round_segs);
         const ag = tri.AttnGeometry.init(e.max_len, e.g.index_budget, e.g.index_ratio);
-        e.buf = .{ .b = try state.Buffers.init(d, e.g, rows, .{ .moe_prefill = true, .capacity = e.max_len }), .y_f32 = false, .attn = ag };
+        const x3 = e.c.quant == .exl3; // EXL3's experts leave per-slot fp32 rows (Python _exl3_moe), so their y is fp32
+        e.buf = .{ .b = try state.Buffers.init(d, e.g, rows, .{ .moe_prefill = !x3, .capacity = e.max_len }), .y_f32 = x3, .attn = ag };
         errdefer e.buf.deinit();
         if (e.w.mtp != null) e.mbuf = .{ .b = try state.Buffers.init(d, e.g, rows, .{ .capacity = e.max_len }), .y_f32 = true, .attn = ag };
         errdefer if (e.mbuf) |*m| m.deinit();
@@ -422,7 +426,7 @@ pub const Engine = struct {
             e.prefill_tail = std.fmt.parseInt(usize, v, 10) catch return error.BadPrefillTail;
             if (e.prefill_tail % 16 != 0 or e.prefill_rows + e.prefill_tail > 16384) return error.BadPrefillTail;
         }
-        e.pbuf = .{ .b = try state.Buffers.init(d, e.g, e.prefill_rows + e.prefill_tail, .{ .prefill = true, .capacity = e.max_len }), .y_f32 = false, .attn = tri.AttnGeometry.init(e.max_len, e.g.index_budget, e.g.index_ratio) };
+        e.pbuf = .{ .b = try state.Buffers.init(d, e.g, e.prefill_rows + e.prefill_tail, .{ .prefill = true, .moe_prefill = !x3, .capacity = e.max_len }), .y_f32 = x3, .attn = tri.AttnGeometry.init(e.max_len, e.g.index_budget, e.g.index_ratio) };
         errdefer e.pbuf.deinit();
         try e.initWindows();
         const th = e.torch.on(e.stream);
@@ -439,8 +443,13 @@ pub const Engine = struct {
             e.f.k8 = &e.k8.?;
             e.f.k4 = &e.k4.?;
         }
+        if (e.c.quant == .exl3) {
+            e.k3 = try exl3.Kernels.load(ctx);
+            e.f.k3 = &e.k3.?;
+        }
         errdefer if (e.k8) |*q| q.deinit();
         errdefer if (e.k4) |*q| q.deinit();
+        errdefer if (e.k3) |*q| q.deinit();
         // prompt matmuls without split-K partials when the kernel set has them (TF_FLASHNEXT_PROMPT_MM=0: off)
         e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
         e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
@@ -632,6 +641,7 @@ pub const Engine = struct {
         if (e.px) |*q| q.deinit();
         if (e.k8) |*q| q.deinit();
         if (e.k4) |*q| q.deinit();
+        if (e.k3) |*q| q.deinit();
         if (e.mtpq) |*t| t.deinit();
         if (e.qsa_fast) |*q| q.deinit();
         if (e.f.cs) |*cs| {
@@ -1200,10 +1210,10 @@ pub const Engine = struct {
         const v: u8 = if (e.rank == 0) 0xFF else 0x7F;
         const qrow = g.heads * g.head_dim * 2;
         const list = [_][2]u64{
-            .{ b.h, g.wide() * 2 },                   .{ b.streams, g.wide() * 2 },          .{ b.mixed, g.hidden * 2 },
-            .{ b.gout, g.nv * state.gdn_dv * 2 },     .{ b.gated, qrow },                     .{ b.attn_o, qrow },
-            .{ b.moe_y, g.slots() * g.hidden * 2 },   .{ b.moe_wts, g.slots() * 4 },          .{ b.moe_act, g.slots() * g.moe_width * 2 },
-            .{ b.inj_a, g.streams * 2 },              .{ b.inj_m, g.streams * 2 },            .{ b.pss, (g.hidden / 256) * g.streams * 4 },
+            .{ b.h, g.wide() * 2 },                 .{ b.streams, g.wide() * 2 },  .{ b.mixed, g.hidden * 2 },
+            .{ b.gout, g.nv * state.gdn_dv * 2 },   .{ b.gated, qrow },            .{ b.attn_o, qrow },
+            .{ b.moe_y, g.slots() * g.hidden * 2 }, .{ b.moe_wts, g.slots() * 4 }, .{ b.moe_act, g.slots() * g.moe_width * 2 },
+            .{ b.inj_a, g.streams * 2 },            .{ b.inj_m, g.streams * 2 },   .{ b.pss, (g.hidden / 256) * g.streams * 4 },
         };
         if (R >= b.rows) return;
         for (list) |it| {

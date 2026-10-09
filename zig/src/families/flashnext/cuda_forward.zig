@@ -26,6 +26,7 @@ const prompt = @import("cuda_prompt.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
+const exl3 = @import("cuda_exl3.zig");
 
 const Allocator = std.mem.Allocator;
 const W = weights;
@@ -235,6 +236,90 @@ pub const Scratch = struct {
         s.arena.buf.free();
     }
 };
+
+/// EXL3's scratch: a dense trellis linear's rotated fp16 input, its split-K partials and one launch's counters.
+const X3Scratch = struct {
+    arena: state.Arena,
+    xh: u64, // [128, K] fp16: a dense linear's rotated input, the widest dense K
+    z: u64, // fp32: the most split-K partials a dense linear leaves
+    ctr: u64, // int32: a dense linear's counters, the widest N; zeroed once, every launch re-zeroes its own slots
+    face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
+    // the grouped experts' rows: P = x3_moe_window * slots
+    mg: u64, // [P, D] fp16: the rotated gate input
+    mu: u64, // [P, D] fp16: the rotated up input
+    md: u64, // [P, I] fp16: the SwiGLU's rotated down input
+    mz: u64, // fp32: the most expert split-K partials
+    my: u64, // [P, D] fp32: a window's per-slot rows
+    mids: u64, // [maxu] int32
+    mcnt: u64, // [1] int32
+    mmem: u64, // [maxu, x3_moe_window] int32
+
+    fn deinit(x: *X3Scratch) void {
+        x.arena.buf.free();
+    }
+
+    /// The scratch a model's trellis matrices need: widest K, split-K partials and counters, and the experts' buffers.
+    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize) !X3Scratch {
+        var kmax: usize = @max(g.hidden, g.heads * g.head_dim);
+        var zmax: usize = 0;
+        var ctrmax: usize = 0;
+        var face: usize = @max(@max(g.gdnConv(), g.nv * state.gdn_dv), @max(g.heads * 2 * g.head_dim, (g.index_heads + 1) * g.index_dim));
+        face = @max(face, 2 * g.nv);
+        for (w.layers) |l| {
+            if (l.gdn) |gd| {
+                x3Fold(gd.qkv3, &kmax, &zmax, &ctrmax);
+                x3Fold(gd.z3, &kmax, &zmax, &ctrmax);
+                x3Fold(gd.out3, &kmax, &zmax, &ctrmax);
+            }
+            if (l.attn) |a| {
+                x3Fold(a.q3, &kmax, &zmax, &ctrmax);
+                x3Fold(a.k3, &kmax, &zmax, &ctrmax);
+                x3Fold(a.v3, &kmax, &zmax, &ctrmax);
+                x3Fold(a.iq3, &kmax, &zmax, &ctrmax);
+                x3Fold(a.o3, &kmax, &zmax, &ctrmax);
+            }
+        }
+        x3Fold(w.head3, &kmax, &zmax, &ctrmax);
+        if (w.mtp) |m| {
+            x3Fold(m.fc_e3, &kmax, &zmax, &ctrmax);
+            x3Fold(m.fc_h3, &kmax, &zmax, &ctrmax);
+        }
+        const mrows = @min(max_rows, x3_moe_window);
+        const slots = g.slots();
+        const P = mrows * slots;
+        const maxu = @min(P, g.experts);
+        const gu = exl3.defaultTile(g.hidden, g.moe_width, true) catch exl3.glm_gateup;
+        const dn = exl3.defaultTile(g.moe_width, g.hidden, false) catch exl3.glm_down;
+        const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
+        const sizes = [12]usize{
+            128 * kmax * 2,   @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
+            P * g.hidden * 2, P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
+            4,                @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
+        };
+        var total: usize = 0;
+        for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
+        var s: X3Scratch = undefined;
+        s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
+        errdefer s.arena.buf.free();
+        try s.arena.buf.fill8(0, null);
+        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem };
+        for (ptrs, sizes) |p, n| p.* = s.arena.take(n);
+        return s;
+    }
+};
+
+/// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
+pub const x3_moe_window = 1024;
+
+/// A trellis matrix `a`'s share of an EXL3 scratch's sizes: the widest K, the most split-K partials and counters.
+fn x3Fold(a: ?W.X3, kmax: *usize, zmax: *usize, ctrmax: *usize) void {
+    const q = a orelse return;
+    if (q.k > kmax.*) kmax.* = q.k;
+    const parts = q.split.sk * 128 * q.n;
+    if (parts > zmax.*) zmax.* = parts;
+    const c = exl3.counterCount(q.n);
+    if (c > ctrmax.*) ctrmax.* = c;
+}
 
 /// A round's DeltaNet scratch and tables (Python gdn_multi.Scratch and Tables): the window rows' queries, and their
 /// keys, values, gates and betas kept a round per parity (the next round's trees fold a stream's kept rows from
@@ -492,6 +577,10 @@ pub const Forward = struct {
     seqs: std.ArrayList(*Seq) = .empty,
     /// two ranks: the n-gram table's GPU gather of this rank's heads (fn_pack.cu)
     gather: ?W.Gather = null,
+    /// EXL3 (an ExLlamaV3 pack): the trellis kernels (cuda_exl3.zig), set by cuda_engine.zig when c.quant == .exl3
+    k3: ?*const exl3.Kernels = null,
+    /// EXL3's scratch (the trellis kernels' rotated inputs, partials and counters)
+    x3: ?X3Scratch = null,
     eps: f32,
     vocab_offset: i64 = 0,
     /// the sampling scratch (cuda_engine.zig sizes it for the head rows); `candidates` reads it at two ranks
@@ -554,10 +643,13 @@ pub const Forward = struct {
         var f: Forward = .{ .gpa = gpa, .d = d, .s = s, .ops = ops, .t = t, .th = th, .w = w, .c = c, .dims = dims, .g = g, .sc = undefined, .pin = undefined, .pin_rows = max_rows, .staged = undefined, .eps = @floatCast(c.eps), .vocab_offset = w.vocab_offset };
         f.sc = try Scratch.init(d, g, max_rows, partBytes(g, max_rows));
         errdefer f.sc.deinit();
-        f.pin = try cuda.HostBuffer.alloc(d, max_rows * 4 + max_rows * g.pleHeads() * g.pleHeadDim() * 2 + 256);
+        const per_row: usize = if (w.table) |tb| @max(@as(usize, tb.width), if (tb.exl3) |e| e.words else 0) else g.pleHeads() * g.pleHeadDim();
+        f.pin = try cuda.HostBuffer.alloc(d, max_rows * 4 + max_rows * per_row * 2 + max_rows * g.pleHeads() * g.pleHeadDim() * 2 + 512);
         errdefer f.pin.free();
         f.staged = try cuda.Event.init(d, false);
         try f.staged.record(s);
+        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows);
+        errdefer if (f.x3) |*q| q.deinit();
         var lin: usize = 0;
         var att: usize = 0;
         for (w.layers, 0..) |l, i| {
@@ -868,7 +960,55 @@ pub const Forward = struct {
     /// The head's logits of `m` rows: bf16 rows, or INT4-AutoRound's GPTQ int4 columns.
     pub fn headMm(f: *Forward, x: u64, x_stride: usize, out: u64, m: usize) !void {
         if (f.w.head4) |h| return int4.dense(f.k4 orelse return error.NoInt4Kernels, f.s, x, x_stride, h, out, false, m);
+        if (f.w.head3) |h| return f.x3mm(null, x, x_stride, 1, h, out, 1, m);
         return f.mm(x, x_stride, f.w.head, out, false, m);
+    }
+
+    /// An EXL3 trellis projection's `m` rows (128 at a time): the rotated fp16 input, then the 3-bit matmul.
+    pub fn x3mm(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_dtype: c_int, m: usize) !void {
+        const k3 = f.k3 orelse return error.NoExl3Kernels;
+        const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        const st = exl3.strides(.strips, q.k, q.n, q.k2);
+        const esz: usize = if (out_dtype == 2) 4 else 2;
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += 128) {
+            const nn = @min(128, m - r0);
+            try exl3.rotIn(k3, x + r0 * x_stride, x_dtype, q.suh, xs.xh, nn, q.k, f.s);
+            try exl3.linear(k3, q.k2, q.cb, xs.xh, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * @as(usize, q.n) * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, f.s);
+        }
+        if (part) |p| try f.mark(p);
+    }
+
+    /// One trellis part of an EXL3 stack: `q`'s columns into `out` from column `col`, through the scratch and a copy.
+    fn x3Col(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_w: usize, col: usize, m: usize) !void {
+        const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += 128) {
+            const nn = @min(128, m - r0);
+            try f.x3mm(null, x + r0 * x_stride, x_stride, x_dtype, q, xs.face, 1, nn);
+            try f.th.slotCopy(xs.face, q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+        }
+        if (part) |p| try f.mark(p);
+    }
+
+    /// A bf16-rows part of an EXL3 projection stack: `r`'s columns into `out` from column `col`.
+    fn rowsCol(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, r: W.Rows, out: u64, out_w: usize, col: usize, m: usize) !void {
+        const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += 128) {
+            const nn = @min(128, m - r0);
+            try f.mmAt(null, x + r0 * x_stride, x_stride, r, xs.face, false, nn);
+            try f.th.slotCopy(xs.face, r.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, r.n * 2, nn);
+        }
+        if (part) |p| try f.mark(p);
+    }
+
+    /// The stack an EXL3 gdn/attention projection is: qkv3, z3, b, a rows into `out`, in the GDN proj's order.
+    fn x3GdnProj(f: *Forward, gd: *const W.Gdn, x: *const Bufs, out: u64, out_w: usize, R: usize) !void {
+        const g = f.g;
+        try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
+        try f.x3Col(null, x.b.mixed, g.hidden, 1, gd.z3.?, out, out_w, g.gdnConv(), R);
+        try f.rowsCol(null, x.b.mixed, g.hidden, gd.ba3.?, out, out_w, g.gdnConv() + g.nv * state.gdn_dv, R);
     }
 
     /// The shared expert's NVFP4-table matmul (nvfp4.matmul), marked as `part` when profiling.
@@ -886,8 +1026,7 @@ pub const Forward = struct {
         try f.mark(part);
     }
 
-    /// Whether `_fp4mm`'s single-slice launch (SK 1: the shared expert's gate/up) runs as fn_ops' K-serial kernel
-    /// (TF_FLASHNEXT_FP4_SERIAL=1; its bits are `_fp4mm`'s): bf16-pattern tables, decode-sized rows.
+    /// Whether `_fp4mm`'s single-slice launch (SK 1) runs as fn_ops' K-serial kernel (its bits are `_fp4mm`'s).
     fn fp4Serial(f: *const Forward, fp: tri.Fp4, x_stride: usize, m: usize, n: usize, k: usize) bool {
         return f.fp4_serial and !fp.codes and m > 8 and m <= fp4SerialRows(n) and tri.fp4SplitK(n, k) == 1 and tops.fp4SerialFits(x_stride, n, k);
     }
@@ -960,8 +1099,7 @@ pub const Forward = struct {
         f.dropMedia(seq);
     }
 
-    /// The sequence's images and video frames released (State.reset clears image_positions), their bytes given
-    /// back to the budget. The stream drains first: launches in flight may read the table.
+    /// The sequence's images and video frames released, their bytes back to the budget; the stream drains first.
     pub fn dropMedia(f: *Forward, seq: *Seq) void {
         const m = &(seq.media orelse return);
         f.s.synchronize() catch {};
@@ -971,11 +1109,7 @@ pub const Forward = struct {
         seq.media = null;
     }
 
-    /// Python image_rows.attach: the prompt's rotary table and features onto the device, the decode offset set.
-    /// Two ranks: rank 0 holds the media; rank 1's copy carries only the rows' count (`follower_rows`), and the
-    /// table, the rows and the features reach it by NCCL broadcasts from rank 0 here (nothing large rides the
-    /// control link). Validity, budget and the device allocations are agreed first, so either both ranks refuse
-    /// (error.MediaRefused, before any collective of the prompt) or both run the same broadcasts.
+    /// Python image_rows.attach: the prompt's rotary table and features onto the device, the decode offset set. Two
     pub fn attachMedia(f: *Forward, seq: *Seq, media: *const @import("lanes").Media, prompt_len: usize) !void {
         const lead = if (f.comm) |cm| cm.rank == 0 else true;
         var valid = true;
@@ -1048,8 +1182,7 @@ pub const Forward = struct {
         m.charged -|= freed;
     }
 
-    /// Python image_rows.embed: the prompt chunk's rows [pos, pos + R) that are image or video placeholders get
-    /// their feature row in each of the S residual streams (index_copy_ of features.repeat(1, S): data movement).
+    /// Python image_rows.embed: the prompt chunk's image/video placeholder rows get their feature row in each stream.
     pub fn injectMedia(f: *Forward, seq: *Seq, x: *const Bufs, R: usize) !void {
         const m = &(seq.media orelse return);
         const feats = m.feats orelse return;
@@ -1074,12 +1207,9 @@ pub const Forward = struct {
         }
     }
 
-
     // -- staging ----------------------------------------------------------------------------------------------
 
-    /// A sequence's caches grown to hold `rows` rows (a growth step at a time, State.ensure) within the budget: the
-    /// grown caches must fit beside the old ones while the copy runs. The stream drains first (the resize copies on
-    /// the legacy stream and frees the old caches).
+    /// A sequence's caches grown to hold `rows` rows (State.ensure) within the budget; the stream drains first.
     pub fn grow(f: *Forward, seq: *Seq, rows: usize) !void {
         const st = &seq.st;
         if (rows <= st.capacity) return;
@@ -1195,6 +1325,16 @@ pub const Forward = struct {
                 try f.gather.?.run(f.s, table, f.sc.ngram_ids, heads, @intCast(R), x.b.ple_v);
                 continue;
             }
+            if (table.exl3) |e| {
+                // EXL3: the packed rows decoded on the host (Python _ple_rows), so pleBlock skips the decode kernel
+                const words = std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * e.words * 2]);
+                try table.gatherExl3(nid, words);
+                const emb_at = f.pleEmbAt(rows_at, table);
+                const emb = std.mem.bytesAsSlice(u16, f.pin.bytes[emb_at..][0 .. R * heads * p.ngram.dims * 2]);
+                try table.decodePle(words, heads, p.ngram.dims, emb);
+                try f.upload(x.b.ple_emb, emb_at, R * heads * p.ngram.dims * 2);
+                continue;
+            }
             const out = std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * table.width * 2]);
             try table.gather(nid, @alignCast(out));
             try f.upload(x.b.ple_v, rows_at, R * heads * table.width * 2);
@@ -1213,8 +1353,7 @@ pub const Forward = struct {
 
     // -- the forward ------------------------------------------------------------------------------------------
 
-    /// forward.compute on staged rows: the embedding, every layer, then `finish`; the head's logits (`logits`) of
-    /// every row (a window) or the last (a prompt chunk), or null. `segs` are the streams' rows (one for a prompt).
+    /// forward.compute on staged rows: the embedding, every layer, then `finish`; the head's logits, or null.
     pub fn computeSegs(f: *Forward, segs: []const Seg, x: *const Bufs, logits: bool) !?u64 {
         const b = &x.b;
         const R = segs[segs.len - 1].a1;
@@ -1404,6 +1543,12 @@ pub const Forward = struct {
         return f.outProjX(x, in, 0, r, l8, R);
     }
 
+    /// outProj on an EXL3 trellis projection: the fp32 partials two ranks leave are out of scope (EXL3 is one rank).
+    fn outProjX3(f: *Forward, x: *const Bufs, in: u64, q: W.X3, R: usize) !tri.Branch {
+        try f.x3mm(.out_proj, in, q.k, 1, q, x.b.branch, 1, R);
+        return .{ .bf16 = x.b.branch };
+    }
+
     /// outProj with the input's group sums (the MTP head's o_proj in 4-bit, D5).
     fn outProjX(f: *Forward, x: *const Bufs, in: u64, xs: u64, r: W.Rows, l8: ?fp8.Linear, R: usize) !tri.Branch {
         const b = &x.b;
@@ -1429,13 +1574,22 @@ pub const Forward = struct {
         return .{ .bf16 = b.branch };
     }
 
+    /// The pinned buffer's decode region: past the ids (`max_rows * 4`) and the gathered rows alike.
+    fn pleEmbAt(f: *const Forward, rows_at: usize, table: *const W.NgramTable) usize {
+        const per = if (table.exl3) |e| e.words else table.width;
+        return std.mem.alignForward(usize, rows_at + f.pin_rows * @max(per, table.width) * 2, 256);
+    }
+
     /// ple_block: h += the n-gram embedding branch through the stream's conv tail (rows staged by `stage`).
     fn pleBlock(f: *Forward, p: *const W.Ple, segs: []const Seg, x: *const Bufs, R: usize) !void {
         const b = &x.b;
         const g = f.g;
         const scale: f32 = if (f.w.table) |t| (if (t.fp8) 1.0 else t.scale) else 1.0;
         const table = f.w.table.?;
-        if (table.gpu) |gp| {
+        if (table.exl3 != null) {
+            // EXL3: `stage` gathered and decoded the rows into b.ple_emb on the host (Python exl3_mm.ple_rows)
+            if (f.comm != null) return error.UnsupportedModel; // the decoded rows' allGather is not wired
+        } else if (table.gpu) |gp| {
             // two ranks: this rank's heads embedded (each head alone, so the split is exact), both ranks' halves
             // gathered in rank (head) order, then interleaved into the [R, heads * dh] rows and their group sums
             const cm = f.comm orelse return error.TwoRanksNeedComm;
@@ -1471,7 +1625,7 @@ pub const Forward = struct {
             // the projection over every row, then each prompt's own chain: its conv taps and state, as alone (the
             // front and back are row-wise, the chain runs over one sequence's rows; the segment's rows start the
             // windows table over again, so a prompt's taps never read the rows before it)
-            try f.projFace(.gdn_proj, b.mixed, g.hidden, gd.proj8, gd.proj, b.proj, pw, R);
+            if (gd.qkv3 != null) try f.x3GdnProj(gd, x, b.proj, pw, R) else try f.projFace(.gdn_proj, b.mixed, g.hidden, gd.proj8, gd.proj, b.proj, pw, R);
             const C = g.gdnConv();
             for (segs) |sg| {
                 const st = &sg.seq.st;
@@ -1494,10 +1648,11 @@ pub const Forward = struct {
                 try f.t.shiftWindows(f.conv(st, li), p, n, (g.conv_kernel - 1) * C, b.rows * pw, pw, 1, C, g.conv_kernel - 1);
                 try f.mark(.gdn_shift);
             }
+            if (gd.out3) |q| return f.outProjX3(x, b.gout, q, R);
             return f.outProj(x, b.gout, gd.out, gd.out8, R);
         }
         const proj = b.proj + li * b.rows * pw * 2;
-        if (gd.proj8 != null) try f.projFace(.gdn_proj, b.mixed, g.hidden, gd.proj8, gd.proj, proj, pw, R) else {
+        if (gd.qkv3 != null) try f.x3GdnProj(gd, x, proj, pw, R) else if (gd.proj8 != null) try f.projFace(.gdn_proj, b.mixed, g.hidden, gd.proj8, gd.proj, proj, pw, R) else {
             try f.mm(b.mixed, g.hidden, gd.proj, proj, false, R);
             try f.mark(.gdn_proj);
         }
@@ -1516,16 +1671,24 @@ pub const Forward = struct {
         try f.mark(.gdn_chain);
         try f.ops.gdnBack(nv, f.sc.gy, proj, gd.norm, f.eps, b.gout, b.gxs, R);
         try f.mark(.gdn_back);
+        if (gd.out3) |q| return f.outProjX3(x, b.gout, q, R);
         return f.outProj(x, b.gout, gd.out, gd.out8, R);
     }
 
-    /// attn_block: the projection, attn_prep (norms, rope, cache writes), the indexer's pool/select when the
-    /// capacity passes its budget, the chunked attention and merge (prompt chunks in 256-row blocks), the gate.
+    /// attn_block: the projection, attn_prep, the indexer's pool/select past budget, the attention and merge, the gate.
     fn attnBlock(f: *Forward, layer: *const W.Layer, segs: []const Seg, x: *const Bufs, R: usize, mtp: bool) !tri.Branch {
         const b = &x.b;
         const g = f.g;
         const a = &layer.attn.?;
-        if (a.proj8 != null) try f.projFace(.attn_proj, b.mixed, g.hidden, a.proj8, a.proj, b.pa, g.attnWidth(), R) else try f.mmxAt(.attn_proj, b.mixed, g.hidden, b.xs_mixed, a.proj, b.pa, false, R);
+        if (a.q3 != null) {
+            // the pack quantizes every attention linear whole: q (with its gate), k, v, the indexer's rows
+            const hd = g.head_dim;
+            try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
+            try f.x3Col(null, b.mixed, g.hidden, 1, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
+            try f.x3Col(null, b.mixed, g.hidden, 1, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
+            try f.x3Col(null, b.mixed, g.hidden, 1, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+            try f.mark(.attn_proj);
+        } else if (a.proj8 != null) try f.projFace(.attn_proj, b.mixed, g.hidden, a.proj8, a.proj, b.pa, g.attnWidth(), R) else try f.mmxAt(.attn_proj, b.mixed, g.hidden, b.xs_mixed, a.proj, b.pa, false, R);
         const ci: usize = if (mtp) g.attention_layers else f.sub[@intCast(layer.index)];
         const d = f.dims;
         const ag = x.attn;
@@ -1540,6 +1703,7 @@ pub const Forward = struct {
             o = b.attn_o;
             try f.t.attnGate(o, b.pa, b.gated, b.xs_gated, R, d);
             try f.mark(.attn_gate);
+            if (a.o3) |q| return f.outProjX3(x, b.gated, q, R);
             return f.outProjX(x, b.gated, b.xs_gated, a.o, a.o8, R);
         }
         for (segs, 0..) |sg, si| {
@@ -1614,12 +1778,11 @@ pub const Forward = struct {
         if (b.prefill or segs.len > 1) o = b.attn_o;
         try f.t.attnGate(o, b.pa, b.gated, b.xs_gated, R, d);
         try f.mark(.attn_gate);
+        if (a.o3) |q| return f.outProjX3(x, b.gated, q, R);
         return f.outProjX(x, b.gated, b.xs_gated, a.o, a.o8, R);
     }
 
-    /// The indexer's scores and key lists of a prompt block's `m` rows (first row at `pos`, its device copy `pos0`).
-    /// Two ranks past `qsa_split_keys`: each rank scores and selects its half of the rows (rank 0 the first) and the
-    /// lists, lengths and flags are exchanged: the same kernels on the same rows, so the same lists.
+    /// The indexer's scores and key lists of a prompt block's rows; past `qsa_split_keys` each rank takes half.
     fn qsaBlock(f: *Forward, iq: u64, pooled: u64, pos0: u64, pos: usize, sc: tri.AttnScratch, m: usize, ag: tri.AttnGeometry, ends: usize) !void {
         return f.qsaBlockOpt(iq, pooled, pos0, pos, sc, m, ag, ends, true);
     }
@@ -1775,6 +1938,7 @@ pub const Forward = struct {
     /// The experts, the shared expert and the slots of rows [a0, a0 + n) (the router's picks made for every row), `top`
     /// routed experts a row.
     fn moeRows(f: *Forward, m: *const W.MoE, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
+        if (m.x3) |ex3| return f.moeRowsExl3(m, ex3, x, a0, n, top);
         if (m.int4) |ex4| return f.moeRowsInt4(m, ex4, x, a0, n, top);
         const b = &x.b;
         const g = f.g;
@@ -1833,6 +1997,43 @@ pub const Forward = struct {
             try f.fp4At(.shared_down, shared_act, slots * ni, .{ .weight = dn.weight, .scale = dn.scale, .scale2 = dn.scale2 }, f.sc.shared_y, x.y_f32, R, dn.n, dn.k);
             try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
             try f.mark(.slot_copy);
+        }
+    }
+
+    /// EXL3's routed experts of rows [a0, a0 + n): Python `_exl3_moe` (routed, no weights), per-slot fp32 y, windowed.
+    fn moeRowsExl3(f: *Forward, m: *const W.MoE, ex: exl3.Experts, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
+        _ = m;
+        const k3 = f.k3 orelse return error.NoExl3Kernels;
+        const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        const b = &x.b;
+        const g = f.g;
+        const D = g.hidden;
+        const I = g.moe_width;
+        const E = g.experts;
+        const slots = top + 1;
+        if (ex.width != I or ex.dims != D) return error.ExpertShape;
+        const gu = exl3.defaultTile(D, I, true) catch return error.NoTileSetting;
+        const dn = exl3.defaultTile(I, D, false) catch return error.NoTileSetting;
+        const set_gu = exl3.tileIndex(gu.nt, gu.w, gu.pf) orelse return error.NoTileSetting;
+        const set_d = exl3.tileIndex(dn.nt, dn.w, dn.pf) orelse return error.NoTileSetting;
+        const rng_gu = exl3.rangeIndex(ex.k2_gu[0], ex.k2_gu[1]);
+        const rng_d = exl3.rangeIndex(ex.k2_d[0], ex.k2_d[1]);
+        const es: usize = if (x.y_f32) 4 else 2;
+        var r0: usize = 0;
+        while (r0 < n) : (r0 += x3_moe_window) {
+            const R = @min(x3_moe_window, n - r0);
+            const P = R * slots;
+            const maxu = @min(P, E);
+            const at = a0 + r0;
+            const pick = b.moe_pick + at * slots * 4;
+            const xin = b.mixed + at * D * 2;
+            const y = b.moe_y + at * slots * D * es;
+            try exl3.group(k3, pick, xs.mids, xs.mcnt, xs.mmem, R, slots, E, maxu, f.s);
+            try exl3.rotInExperts(k3, true, xin, @intCast(D), pick, ex.suh_g, ex.suh_u, xs.mg, xs.mu, R, D, slots, E, f.s);
+            try exl3.grouped(k3, set_gu, rng_gu, xs.mg, xs.mu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, D, I, P, gu.sk, maxu, slots, E, 2, f.s);
+            try exl3.gateupEpilogue(k3, xs.mz, pick, ex.svh_g, ex.svh_u, ex.suh_d, xs.md, R, slots, P, I, gu.sk, E, std.math.inf(f32), 0, f.s);
+            try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, maxu, slots, E, 1, f.s);
+            try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
         }
     }
 
@@ -1905,14 +2106,12 @@ pub const Forward = struct {
         return int4.down(k4, f.s, act, ex4.width, ex4, plan, slots, E + 1, y, y_f32, R, skip, tile);
     }
 
-    /// finish: the last write-back into a copy of the streams (b.streams), the mixer's read-out (a prompt chunk's
-    /// last row only), the head (`logits`), the candidates gathered across ranks.
+    /// finish: the write-back into b.streams, the mixer's read-out (a prompt chunk's last row), the head.
     pub fn finish(f: *Forward, mixer: *const W.Hc, x: *const Bufs, R: usize, pending: Pending, logits: bool) !?u64 {
         return f.finishSegs(mixer, x, R, pending, logits, &.{});
     }
 
-    /// `finish` of a prompt chunk that carries several prompts (`segs`, each ending its own prompt): the read-out
-    /// and the head on each prompt's last row, one row a prompt (b.logits and the candidates hold `segs.len` rows).
+    /// `finish` of a prompt chunk that carries several prompts: the read-out and the candidates per prompt.
     pub fn finishSegs(f: *Forward, mixer: *const W.Hc, x: *const Bufs, R: usize, pending: Pending, logits: bool, segs: []const Seg) !?u64 {
         const b = &x.b;
         const g = f.g;
@@ -2010,7 +2209,6 @@ pub const Forward = struct {
 test "the partial scratch covers the widest split-K matmul of a prompt chunk" {
     const g: state.Geometry = .{ .hidden = 2560, .streams = 4, .low = 320, .heads = 24, .kv_heads = 2, .head_dim = 256, .index_heads = 4, .index_dim = 128, .index_budget = 2048, .index_ratio = 4, .nk = 16, .nv = 48, .conv_kernel = 4, .experts = 512, .top_k = 10, .moe_width = 640, .ple_dim = 2560, .heads_per_ngram = 8, .ngram_size = 3, .ple_kernel = 4, .head_n = 248320, .linear_layers = 36, .attention_layers = 12, .mtp = true, .world = 1 };
     // the MTP head's fc_h over a chunk's 4 streams a row: 4 K slices of [4 * 2048, 2560] fp32 (past the shared
-    // expert's down, 8 slices of [2048, 2560])
     try std.testing.expectEqual(@as(usize, 4 * 4 * 2048 * 2560 * 4), partBytes(g, 2048));
     // the MTP head's fc_h at 8 rows takes 32 stream rows of [2560, 2560]
     try std.testing.expect(partBytes(g, 8) >= tri.b16PartBytes(32, 2560, 2560));
