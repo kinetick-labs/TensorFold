@@ -69,8 +69,10 @@ minus `tensor_storage`), which is what the engine actually reads at load time
 (`format.py:config_fields`, `format.py:281`; the reader looks under
 `quantization_config`/`quantization`, top level or `text_config`). The Python
 gate `require_config` (`format.py:293`) refuses a codebook outside
-`{3inst, mcg, mul1}`, a non-integer `head_bits`/`mtp_bits`, or an `out_scales`
-it cannot parse — **before any weight is downloaded**.
+`{3inst, mcg, mul1}`, a non-integer `head_bits`/`mtp_bits`, or an average `bits`
+outside 1 to 8 — **before any weight is downloaded**. (It does not look at
+`out_scales`: the header only carries it, `format.config_fields` returns it and
+nothing validates it.)
 
 ### 1.2 Tensor-name suffixes and their meaning
 
