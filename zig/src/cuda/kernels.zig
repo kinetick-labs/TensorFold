@@ -94,6 +94,24 @@ pub const roce_gather: []const u8 = if (available) &Blob("fatbin_roce_gather").b
 pub const route_rows: []const u8 = if (available) &Blob("fatbin_route_rows").bytes else &.{};
 pub const flashnext_hc: []const u8 = if (available) &Blob("fatbin_flashnext_hc").bytes else &.{};
 pub const flashnext_attn: []const u8 = if (available) &Blob("fatbin_flashnext_attn").bytes else &.{};
+pub const fn_gdn: []const u8 = if (available) &Blob("fatbin_fn_gdn").bytes else &.{};
+pub const fn_gdn_io: []const u8 = if (available) &Blob("fatbin_fn_gdn_io").bytes else &.{};
+pub const fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_fn_gdn_prefill").bytes else &.{};
+pub const fn_gdn_tree: []const u8 = if (available) &Blob("fatbin_fn_gdn_tree").bytes else &.{};
+pub const fn_nvfp4_experts: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_experts").bytes else &.{};
+pub const fn_qmm: []const u8 = if (available) &Blob("fatbin_fn_qmm").bytes else &.{};
+pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefill").bytes else &.{};
+pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes else &.{};
+pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
+pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
+pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
+pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};
+pub const fn_int4: []const u8 = if (available) &Blob("fatbin_fn_int4").bytes else &.{};
+pub const fn_qmmf_ld: []const u8 = if (available) &Blob("fatbin_fn_qmmf_ld").bytes else &.{};
+pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_cluster").bytes else &.{};
+pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
+pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
+pub const fn_qsa_scores: []const u8 = if (available) &Blob("fatbin_fn_qsa_scores").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

@@ -37,6 +37,16 @@ pub const CallGate = struct {
     names: []const []const u8 = &.{},
     think_open: ?u32 = null,
     think_end: ?u32 = null,
+    /// Token text the decode loop uses to finish a named call (Python's blank / decode / encode).
+    lex: CallLex,
+};
+
+/// Same signatures as lanes/call_gate.zig Lex. Kept here so this file stays in one module.
+pub const CallLex = struct {
+    ctx: *anyopaque,
+    blank: *const fn (ctx: *anyopaque, token: u32) bool,
+    text: *const fn (ctx: *anyopaque, a: Allocator, token: u32) anyerror![]const u8,
+    encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32,
 };
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
@@ -51,6 +61,8 @@ pub const Structure = struct {
 };
 
 pub const grammar = lanes.grammar;
+/// A prompt's images and video frames, prepared by the vision frontend (rows, rotary positions, features).
+pub const Media = lanes.Media;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
@@ -93,6 +105,8 @@ pub const Request = struct {
     decide: ?u32 = null,
     /// The model as shipped: no learned neuron acts on its rows, no prompt state is kept or reused (a lesson's writer).
     untaught: bool = false,
+    /// The prompt's images and videos (``Info.media`` engines only); such a prompt is never kept or resumed.
+    media: ?*const Media = null,
     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
     logprobs: ?u8 = null,
     /// Rows for each prompt token after the first, with ranks and this many best tokens, when ``Info.prompt_logprobs``.
@@ -222,6 +236,8 @@ pub const Info = struct {
     slide_conversations: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
+    /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
+    media: bool = false,
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -313,6 +329,8 @@ pub const Open = struct {
     vision: ?VisionOpen = null,
     /// --loops: passes over a looped model's recurrent block (Dory's; null: the checkpoint's own count).
     loops: ?u32 = null,
+    /// --vision-helper: the engine takes prompts whose image and video rows a helper process prepared (`Media`)
+    vision_helper: bool = false,
 };
 
 /// A packed decision: a trunk (pictures expand at `at`), a branch a question, and each branch's labels (`counts`).
