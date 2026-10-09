@@ -9,6 +9,7 @@ const serve = @import("serve.zig");
 const hf_text = @import("hf_text.zig");
 const startup = @import("startup.zig");
 const checkpoint_cli = @import("checkpoint_cli");
+const vision = @import("vision.zig");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
 
@@ -68,6 +69,25 @@ pub fn main(init: std.process.Init) !u8 {
         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
         return 0;
     }
+    // --vision (rank 0): the helper loads and warms the tower on this GPU before the engine reads its memory
+    // budget, so the tower and the helper's context stay outside the caches' share
+    var helper: ?*vision.Helper = null;
+    defer if (helper) |h| h.stop(io);
+    if (args.vision and args.rank == 0) {
+        const env_int = struct {
+            fn of(m: *const std.process.Environ.Map, name: []const u8, default: u32) u32 {
+                const t = m.get(name) orelse return default;
+                return std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch default;
+            }
+        };
+        const settings: vision.Settings = .{
+            .allow_urls = args.vision_urls,
+            .max_images = if (args.vision_max_images) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_MAX_IMAGES", 50),
+            .max_videos = if (args.vision_max_videos) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_MAX_VIDEOS", 4),
+            .image_tokens = if (args.vision_image_tokens) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_IMAGE_TOKENS", 16384),
+        };
+        helper = vision.Helper.start(gpa, io, dir, settings, init.environ_map, &problem) catch return fail(problem);
+    }
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
@@ -86,6 +106,7 @@ pub fn main(init: std.process.Init) !u8 {
         .sampling = try sampling(a, io, dir, args),
         .environ = init.environ_map,
         .started = started,
+        .vision = helper,
     });
 }
 
