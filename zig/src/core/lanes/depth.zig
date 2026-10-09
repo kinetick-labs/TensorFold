@@ -58,6 +58,12 @@ pub const Rule = struct {
     granted_depth: bool = false, // node_probabilities: a stream drafts its last grant plus draft_slack, lone ones too
     confidence_floor: ?f64 = null,
     plain_streams: u32 = 0, // a shared round with this many streams or more drafts none (0: off; a family's switch)
+    /// the head stops each chain by its own rule (a running product of its draws' probabilities): every ask is the
+    /// most drafts the stream's room allows, and the head's stops are the depth (no acceptance-rate guess cuts them)
+    head_stops: bool = false,
+    /// ... while at most this many streams are live (`live`, which the round loop sets each step)
+    head_stops_most: u32 = std.math.maxInt(u32),
+    live: usize = 0,
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (steps: the deepest stream's)
     row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
@@ -143,11 +149,16 @@ pub const Rule = struct {
         return modeled;
     }
 
+    /// Whether the head's own stops size the chains this step (head_stops, and few enough live streams).
+    pub fn stopsNow(r: *const Rule) bool {
+        return r.head_stops and r.live <= r.head_stops_most;
+    }
+
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
-        if (r.confidence_floor != null and !who.sampled and !r.k.floor_rates) return most;
+        if ((r.confidence_floor != null and !who.sampled and !r.k.floor_rates) or r.stopsNow()) return most;
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
             const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
@@ -299,7 +310,8 @@ pub const Rule = struct {
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
         // drafts lose here: none asked, no head pass
         if (r.plain_streams > 0 and whos.len >= r.plain_streams) return @memset(out, 0);
-        if (r.confidence_floor != null) {
+        if (r.confidence_floor != null or r.stopsNow()) {
+            // the head's own stops size each chain: no allocation over guessed acceptance
             for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
             return;
         }
