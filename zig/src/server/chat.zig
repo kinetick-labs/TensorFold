@@ -32,6 +32,8 @@ pub const Input = struct {
     id: []const u8 = "",
     /// ``logprobs: true`` with this many ``top_logprobs``; null: not asked.
     logprobs: ?u8 = null,
+    /// The request's own messages when they hold image or video parts (--vision): rendered by prompt.prepareMedia.
+    media: ?Value = null,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -171,7 +173,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
         limit = @min(limit, room);
     }
-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
@@ -193,6 +195,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids), // from the tokens alone, for every request: cached states are keyed by tokens
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+        .media = rendered.media,
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
     if (thinking) {
