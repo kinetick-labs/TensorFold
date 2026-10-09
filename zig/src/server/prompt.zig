@@ -6,10 +6,13 @@ const messages_mod = @import("messages.zig");
 const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
 const Server = @import("server.zig").Server;
+const api = @import("engine_api");
+const vision = @import("vision.zig");
+const log = @import("log.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0 };
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null };
 
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
@@ -96,6 +99,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
+    if (input.media) |raw| return prepareMedia(srv, cx, raw, input.tools, thinking, effort);
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
@@ -123,6 +127,44 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
     const probe = renderIds(srv, &scratch, .{ .array = list }, tools, thinking, effort, true) catch return 0;
     const i = std.mem.indexOfDiff(u32, prompt, probe) orelse return 0;
     return if (i < prompt.len) i else 0;
+}
+
+/// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, the
+/// media in order), normalized with their parts, rendered, then the vision helper's processor and tower: Python's
+/// token ids and the media the engine takes. Such a prompt is neither kept nor resumed.
+fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
+    const helper = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+    if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+    var sources: std.ArrayList(vision.Source) = .empty;
+    const template = try messages_mod.splitMedia(cx, raw, srv.media_limits, &sources);
+    if (!helper.videos) for (sources.items) |src| if (src.kind == .video) return cx.refuse("content parts must be text or image_url; audio and video are unsupported");
+    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, template, srv.late_system, srv.needs_user_after_tool, true));
+    var problem: []const u8 = "";
+    const options: model_text.RenderOptions = .{
+        .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
+        .add_generation_prompt = true,
+        .enable_thinking = thinking,
+        .reasoning_effort = if (thinking) effort else null,
+    };
+    const text = srv.text.render(cx.a, normalized, options, &problem) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Template => return cx.fail(.request, "the chat template rejected the request: {s}", .{problem}),
+    };
+    const window = srv.info.context_window;
+    const result = helper.prepare(cx.a, text, sources.items, if (window > 0) window else null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return cx.fail(.capacity, "image processing failed ({s}); retry shortly", .{@errorName(e)}),
+    };
+    switch (result) {
+        .refused => |r| {
+            if (r.context) return cx.fail(.context_length, "{s}", .{r.message});
+            return cx.fail(if (r.status == 503) .capacity else .request, "{s}", .{r.message});
+        },
+        .ok => |p| {
+            log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
+            return .{ .ids = p.tokens, .media = p.media };
+        },
+    }
 }
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
