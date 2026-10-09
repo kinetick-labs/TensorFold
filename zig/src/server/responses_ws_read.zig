@@ -6,7 +6,7 @@ const Session = @import("responses_ws.zig").Session;
 
 /// Messages a socket holds unhandled: at most this many, and ``max_queued_bytes`` in all.
 pub const max_queued = 16;
-pub const max_queued_bytes = http_body.limit;
+pub const max_queued_bytes = http_body.default_limit;
 
 /// Takes every whole piece the buffer holds; when none progresses, reads what the socket has within ``wait_ms``.
 pub fn pump(s: *Session, wait_ms: i32) void {

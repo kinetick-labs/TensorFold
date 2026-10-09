@@ -5,7 +5,9 @@ const errors = @import("errors.zig");
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
-pub const limit = 32 * 1024 * 1024;
+pub const default_limit = 32 * 1024 * 1024;
+/// 32 MiB; 96 MiB with --vision (base64 data URLs are a third larger than the files: the single-Spark recipe's limit)
+pub var limit: usize = default_limit;
 /// A body no route reads is taken only to keep the connection in step, so it gets a small cap of its own.
 pub const unread_limit = 64 * 1024;
 const metadata_limit = 65536;
