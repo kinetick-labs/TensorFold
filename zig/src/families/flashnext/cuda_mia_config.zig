@@ -14,7 +14,7 @@ pub const max_eos = 8;
 pub const max_mtp_layers = 4;
 
 pub const LayerType = enum { linear, attention };
-pub const Quant = enum { mlx, modelopt, gptq };
+pub const Quant = enum { mlx, modelopt, gptq, exl3 };
 
 /// Why a check refused the checkpoint, kept for the caller's log line (tests read it).
 pub const Why = struct {
@@ -162,6 +162,165 @@ pub const Gptq = struct {
     }
 };
 
+// -- EXL3 (ExLlamaV3's trellis quantization): the format's codebooks, its per-tensor width, and the group a
+// -- trellis and its scales form. A Zig port of the Python reference decoder's format.bits_of (:86) and
+// -- format.parse_group (:226); the arithmetic lives in the CUDA kernels, not here.
+
+/// ExLlamaV3's codebooks (Python format.CODEBOOKS). `inst3` spells "3inst" in the pack, which is not an identifier.
+pub const Codebook = enum {
+    inst3,
+    mcg,
+    mul1,
+
+    /// The codebook's name as the pack's config.json and marker tensors spell it.
+    pub fn name(self: Codebook) []const u8 {
+        return switch (self) {
+            .inst3 => "3inst",
+            .mcg => "mcg",
+            .mul1 => "mul1",
+        };
+    }
+};
+
+/// `text` as a codebook, null for one ExLlamaV3 does not write.
+pub fn codebookOf(text: []const u8) ?Codebook {
+    if (std.mem.eql(u8, text, "3inst")) return .inst3;
+    if (std.mem.eql(u8, text, "mcg")) return .mcg;
+    if (std.mem.eql(u8, text, "mul1")) return .mul1;
+    return null;
+}
+
+/// The int32 values the codebook marker tensors hold (Python format.MARKERS): a `.mul1` marker's is MARKER_MUL1, a
+/// `.mcg` marker's is MARKER_MCG — either marker's presence names its tile's codebook.
+pub const MARKER_MCG: u32 = 0xCBAC1FED;
+pub const MARKER_MUL1: u32 = 0x83DCD12D;
+
+/// Every width ExLlamaV3 writes (Python format.BITS); the x.5 widths need the mul1 codebook.
+pub const widths = [_]f64{ 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8 };
+
+/// `bits` as Python format.check_bits reads it: a whole width comes back whole, a half width stays fractional;
+/// null for a width ExLlamaV3 does not write (Python's ValueError).
+pub fn checkBits(bits: f64) ?f64 {
+    for (widths) |b| if (b == bits) return if (@trunc(bits) == bits) @trunc(bits) else bits;
+    return null;
+}
+
+/// A trellis' bits per weight from its shape's last dimension (Python format.bits_of: `last / 16`, so [K/16, N/16,
+/// 16 * bits] with 64 is 4-bit, 80 is 5-bit, 96 is 6-bit and the half widths, 40, are 2.5-bit); null for a shape
+/// that is not a whole number of 16-bit words or a width ExLlamaV3 does not write. This is where a pack's
+/// per-tensor width comes from — the header's scalar `bits` is the model's average, not a layer's.
+pub fn bitsOf(trellis_shape: []const i64) ?f64 {
+    if (trellis_shape.len == 0) return null;
+    const last = trellis_shape[trellis_shape.len - 1];
+    if (last <= 0 or @rem(last, 8) != 0) return null;
+    return checkBits(@as(f64, @floatFromInt(last)) / 16);
+}
+
+/// The 16x16 tile and the Hadamard block EXL3 rotates by (Python format.tile_words, format.HAD): K and N are
+/// multiples of the block.
+pub const exl3_tile = 16;
+pub const exl3_block = 128;
+
+/// A scale tensor's header entry, as the loader reads it (Python format.parse_group's `parts`).
+pub const Scale = struct { dtype: []const u8, shape: []const i64 };
+
+/// One EXL3 group's parts, from the safetensors headers (no data): the trellis entry, either scale spelling per
+/// side (`suh`/`svh` fp16, or the packed-sign `su`/`sv`), the codebook markers' presence and a bias.
+pub const Parts = struct {
+    trellis: Scale,
+    suh: ?Scale = null,
+    su: ?Scale = null,
+    svh: ?Scale = null,
+    sv: ?Scale = null,
+    mcg: bool = false,
+    mul1: bool = false,
+    bias: bool = false,
+};
+
+/// One EXL3 linear layer, from its parts (Python format.Exl3Tensor): the width and codebook its trellis shape and
+/// markers imply, its K (inputs) and N (outputs), which scale parts carry them, and a bias.
+pub const Exl3Group = struct {
+    bits: f64,
+    codebook: Codebook,
+    k: u32,
+    n: u32,
+    in_scales: []const u8, // "suh" or "su"
+    out_scales: []const u8, // "svh" or "sv"
+    bias: bool,
+
+    /// The trellis' bytes on disk: K * N * 2 * bits / 16 (Python Exl3Tensor.trellis_bytes).
+    pub fn trellisBytes(self: Exl3Group) u64 {
+        const per: f64 = 2 * self.bits / 16;
+        return @intFromFloat(@as(f64, @floatFromInt(self.k * self.n)) * per);
+    }
+};
+
+fn exl3Fail(why: *Why, prefix: []const u8, comptime fmt: []const u8, args: anytype) error{BadExl3} {
+    var buf: [320]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{s}: ", .{prefix}) catch {};
+    w.print(fmt, args) catch {};
+    why.set("{s}", .{buf[0..w.end]});
+    return error.BadExl3;
+}
+
+fn oneDim(shape: []const i64, want: i64) bool {
+    return shape.len == 1 and shape[0] == want;
+}
+
+/// An EXL3 group from its parts (Python format.parse_group), refusing with a reason (`why`) the shapes
+/// ExLlamaV3's LinearEXL3 would not load: a trellis that is not int16 3-D, a width or half width its codebook
+/// cannot carry, a missing or mis-shaped scale, or K/N off the Hadamard blocks.
+pub fn parseGroup(prefix: []const u8, p: Parts, why: *Why) !Exl3Group {
+    if (!std.mem.eql(u8, p.trellis.dtype, "I16") or p.trellis.shape.len != 3) {
+        return exl3Fail(why, prefix, "trellis must be int16 [K/16, N/16, 16 * bits], got {s} {any}", .{ p.trellis.dtype, p.trellis.shape });
+    }
+    if (p.trellis.shape[0] <= 0 or p.trellis.shape[1] <= 0) return exl3Fail(why, prefix, "trellis {any} has a non-positive tile count", .{p.trellis.shape});
+    const bits = bitsOf(p.trellis.shape) orelse return exl3Fail(why, prefix, "trellis width {d} is not one ExLlamaV3 writes", .{p.trellis.shape[2]});
+    if (p.mcg and p.mul1) return exl3Fail(why, prefix, "both mcg and mul1 markers", .{});
+    const codebook: Codebook = if (p.mul1) .mul1 else if (p.mcg) .mcg else .inst3;
+    if (@trunc(bits) != bits and codebook != .mul1) {
+        return exl3Fail(why, prefix, "{d}-bit tiles need the mul1 codebook, found {s}", .{ bits, codebook.name() });
+    }
+    const k: i64 = exl3_tile * p.trellis.shape[0];
+    const n: i64 = exl3_tile * p.trellis.shape[1];
+    if (k > std.math.maxInt(u32) or n > std.math.maxInt(u32)) return exl3Fail(why, prefix, "K={d} N={d} are past 32 bits", .{ k, n });
+    const in_scales: []const u8 = if (p.suh) |s| blk: {
+        if (!std.mem.eql(u8, s.dtype, "F16") or !oneDim(s.shape, k)) return exl3Fail(why, prefix, ".suh must be F16 [K], got {s} {any}", .{ s.dtype, s.shape });
+        break :blk "suh";
+    } else if (p.su) |s| blk: {
+        if (!std.mem.eql(u8, s.dtype, "I16") or !oneDim(s.shape, @divExact(k, exl3_tile))) return exl3Fail(why, prefix, ".su must be I16 [K/16], got {s} {any}", .{ s.dtype, s.shape });
+        break :blk "su";
+    } else return exl3Fail(why, prefix, "no input scales (.suh or .su)", .{});
+    const out_scales: []const u8 = if (p.svh) |s| blk: {
+        if (!std.mem.eql(u8, s.dtype, "F16") or !oneDim(s.shape, n)) return exl3Fail(why, prefix, ".svh must be F16 [N], got {s} {any}", .{ s.dtype, s.shape });
+        break :blk "svh";
+    } else if (p.sv) |s| blk: {
+        if (!std.mem.eql(u8, s.dtype, "I16") or !oneDim(s.shape, @divExact(n, exl3_tile))) return exl3Fail(why, prefix, ".sv must be I16 [N/16], got {s} {any}", .{ s.dtype, s.shape });
+        break :blk "sv";
+    } else return exl3Fail(why, prefix, "no output scales (.svh or .sv)", .{});
+    if (@rem(k, exl3_block) != 0 or @rem(n, exl3_block) != 0) {
+        return exl3Fail(why, prefix, "K={d} and N={d} must be multiples of {d} (the Hadamard blocks)", .{ k, n, exl3_block });
+    }
+    return .{ .bits = bits, .codebook = codebook, .k = @intCast(k), .n = @intCast(n), .in_scales = in_scales, .out_scales = out_scales, .bias = p.bias };
+}
+
+/// quantization_config of an EXL3 pack (quant_method "exl3"): the header ExLlamaV3 writes, as the Python
+/// reference's format.config_fields / format.require_config read it. `bits` is the model's average, not a layer's
+/// width — the width of a tensor is its trellis shape (bitsOf), read at load.
+pub const Exl3 = struct {
+    version: []const u8,
+    /// codebook: the pack's declared codebook ("mul1" here); null when the header names none
+    codebook: ?Codebook,
+    /// head_bits, mtp_bits: the lm_head's and the MTP head's widths (6 and 4 here)
+    head_bits: ?u32,
+    mtp_bits: ?u32,
+    /// out_scales: how the pack names its output scales ("always" here)
+    out_scales: []const u8,
+    /// the header's scalar `bits`: the average over the whole model (4.05 here)
+    average_bits: ?f64,
+};
+
 /// Python's re.match for the subset GPTQ dynamic rules use: literals, '.', '\x' escapes, '*' and '+' after an
 /// atom, a final '$'. Anchored at the start; without '$' a prefix match is enough.
 pub fn regexMatch(pattern: []const u8, text: []const u8) bool {
@@ -259,6 +418,8 @@ pub const Config = struct {
     modelopt: ?ModelOpt = null,
     /// a GPTQ export's settings (quant == .gptq: the INT4-AutoRound checkpoint)
     gptq: ?Gptq = null,
+    /// an EXL3 pack's header (quant == .exl3: turboderp's mul1 export)
+    exl3: ?Exl3 = null,
     mtp: Mtp = .{},
 
     pub fn deinit(self: *Config) void {
@@ -351,6 +512,10 @@ pub const Config = struct {
         return checkGptqImpl(self, why);
     }
 
+    pub fn checkExl3(self: Config, why: *Why) !void {
+        return checkExl3Impl(self, why);
+    }
+
     /// The INT4-AutoRound format (GPTQ experts and head, block-FP8 dense linears).
     pub fn int4ar(self: Config) bool {
         return self.quant == .gptq;
@@ -366,6 +531,7 @@ pub const Config = struct {
             return error.UnsupportedModel;
         }
         if (self.quant == .gptq) return self.checkGptq(why);
+        if (self.quant == .exl3) return self.checkExl3(why);
         if (self.quant != .modelopt) {
             why.set("the CUDA Flash Next engine reads the ModelOpt NVFP4 export; config.json's quantization is {t}", .{self.quant});
             return error.UnsupportedQuantization;
@@ -448,6 +614,31 @@ fn checkGptqImpl(self: Config, why: *Why) !void {
     if (self.moe_width % int4ar_group != 0 or self.hidden % int4ar_group != 0) {
         why.set("expert width {d} / hidden {d} are not whole groups of {d}", .{ self.moe_width, self.hidden, int4ar_group });
         return error.UnsupportedModel;
+    }
+}
+
+/// The EXL3 pack (turboderp's mul1 export): the header's codebook and head widths (validated as Python's
+/// format.require_config does), the layer count, the n-gram tiling and the shapes every EXL3 tile needs whole.
+/// The per-tensor width is not a config field — it is each trellis' shape, read at load (bitsOf, parseGroup) — so
+/// this is the coarse gate; the weight loaders do the precise read.
+fn checkExl3Impl(self: Config, why: *Why) !void {
+    const e = self.exl3.?;
+    if (self.layers == 0 or self.layers > max_layers) {
+        why.set("{d} layers; the engine holds up to {d}", .{ self.layers, max_layers });
+        return error.UnsupportedModel;
+    }
+    if (self.ngram_size < 2 or self.ngram_size > ngram.max_n or self.ngramHeads() > ngram.max_heads or self.ple_dim % self.ngramHeads() != 0) {
+        why.set("n-gram size {d} with {d} heads a gram does not tile {d} dims", .{ self.ngram_size, self.heads_per_ngram, self.ple_dim });
+        return error.UnsupportedModel;
+    }
+    // the header's codebook and widths were read by exl3Of; the tile needs model dims on the Hadamard blocks
+    if (self.hidden % exl3_block != 0 or self.moe_width % exl3_block != 0 or self.shared_width % exl3_block != 0 or self.vocab % exl3_block != 0) {
+        why.set("hidden {d} / expert width {d} / shared width {d} / vocab {d} are not whole {d}-column EXL3 blocks", .{ self.hidden, self.moe_width, self.shared_width, self.vocab, exl3_block });
+        return error.UnsupportedModel;
+    }
+    if (e.head_bits == null and e.mtp_bits == null and e.codebook == null and e.average_bits == null) {
+        why.set("the EXL3 block names no codebook, no head widths and no average bits", .{});
+        return error.BadConfig;
     }
 }
 
@@ -609,6 +800,54 @@ fn gptqOf(a: std.mem.Allocator, q: Obj, why: *Why) !Gptq {
         .format = try str(a, q, "checkpoint_format"),
         .dynamic = rules.items,
     };
+}
+
+/// head_bits / mtp_bits: an integer width ExLlamaV3 writes. Python's format.require_config refuses a non-number,
+/// a width outside BITS, or a fraction.
+fn exl3Width(v: Value, key: []const u8, why: *Why) !u32 {
+    const b = number(v) catch {
+        why.set("EXL3 {s}; an integer width", .{key});
+        return error.UnsupportedQuantization;
+    };
+    const c = checkBits(b) orelse {
+        why.set("EXL3 {s} {d}; a width ExLlamaV3 writes", .{ key, b });
+        return error.UnsupportedQuantization;
+    };
+    if (@trunc(c) != c) {
+        why.set("EXL3 {s} {d}; a whole width", .{ key, c });
+        return error.UnsupportedQuantization;
+    }
+    return @intFromFloat(c);
+}
+
+/// An EXL3 pack's header (quant_method "exl3"), as Python's format.config_fields reads it: version, codebook,
+/// head_bits, mtp_bits, out_scales and the model's average `bits`. Every field but quant_method is optional, and
+/// each present one is validated here (format.require_config) before any weight is read.
+fn exl3Of(a: std.mem.Allocator, q: Obj, why: *Why) !Exl3 {
+    var e: Exl3 = .{
+        .version = try str(a, q, "version"),
+        .codebook = null,
+        .head_bits = null,
+        .mtp_bits = null,
+        .out_scales = try str(a, q, "out_scales"),
+        .average_bits = null,
+    };
+    const cb = try str(a, q, "codebook");
+    if (cb.len > 0) e.codebook = codebookOf(cb) orelse {
+        why.set("EXL3 codebook {s}; the engine reads 3inst, mcg or mul1", .{cb});
+        return error.UnsupportedQuantization;
+    };
+    if (field(q, "head_bits")) |v| e.head_bits = try exl3Width(v, "head_bits", why);
+    if (field(q, "mtp_bits")) |v| e.mtp_bits = try exl3Width(v, "mtp_bits", why);
+    if (field(q, "bits")) |v| {
+        const b = try number(v);
+        if (!(b >= 1 and b <= 8)) {
+            why.set("EXL3 average bits {d}; a model's average is between 1 and 8", .{b});
+            return error.UnsupportedQuantization;
+        }
+        e.average_bits = b;
+    }
+    return e;
 }
 
 fn yarnOf(r: Obj, why: *Why) !Yarn {
@@ -807,12 +1046,17 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, generation: ?[]const u8, 
         } else if (std.ascii.eqlIgnoreCase(method, "gptq")) {
             c.quant = .gptq;
             c.gptq = try gptqOf(a, qq, why);
+        } else if (std.ascii.eqlIgnoreCase(method, "exl3")) {
+            c.quant = .exl3;
+            c.exl3 = try exl3Of(a, qq, why);
         } else {
-            why.set("quant_method {s}; Flash Next reads MLX or ModelOpt checkpoints", .{method});
+            why.set("quant_method {s}; Flash Next reads MLX, ModelOpt, GPTQ or EXL3 checkpoints", .{method});
             return error.UnsupportedQuantization;
         }
         c.group_size = try opt(qq, "group_size", 32, why);
-        c.bits = try opt(qq, "bits", 4, why);
+        // MLX/ModelOpt/GPTQ write an integer `bits`; EXL3's is the model's average and may be fractional (4.05),
+        // so it stays in c.exl3.average_bits and each layer's width is read from its trellis shape at load
+        if (c.quant != .exl3) c.bits = try opt(qq, "bits", 4, why);
         if (object(qq, "config_groups")) |cg| if (object(cg, "group_0")) |g0| if (object(g0, "weights")) |w| {
             c.nvfp4_group = try opt(w, "group_size", 16, why);
         };
@@ -1081,4 +1325,100 @@ test "GPTQ checks: zero layers, a head that is not 4-bit, 8-bit experts" {
     c2 = c;
     c2.layers = 0;
     try std.testing.expectError(error.UnsupportedModel, c2.check(&why));
+}
+
+// ---- tests: the EXL3 pack (turboderp's mul1 export): format.bits_of, format.parse_group and the config header ----
+
+test "a trellis' width is its last dimension over 16, and the pack mixes 4, 5 and 6 (format.bits_of)" {
+    // §1.3's shapes: the MoE experts 4-bit, the MTP fc_* 5-bit, the dense linears and lm_head 6-bit
+    try std.testing.expectEqual(@as(?f64, 4), bitsOf(&.{ 160, 40, 64 }));
+    try std.testing.expectEqual(@as(?f64, 4), bitsOf(&.{ 40, 160, 64 }));
+    try std.testing.expectEqual(@as(?f64, 5), bitsOf(&.{ 160, 160, 80 }));
+    try std.testing.expectEqual(@as(?f64, 6), bitsOf(&.{ 160, 768, 96 }));
+    // the mul1 half widths, and every whole width format.BITS names
+    try std.testing.expectEqual(@as(?f64, 2.5), bitsOf(&.{ 64, 8, 40 }));
+    try std.testing.expectEqual(@as(?f64, 1), bitsOf(&.{ 8, 8, 16 }));
+    try std.testing.expectEqual(@as(?f64, 8), bitsOf(&.{ 8, 8, 128 }));
+    // not a whole number of 16-bit words (52 % 8), a width ExLlamaV3 does not write (72/16 = 4.5), or no dims
+    try std.testing.expectEqual(@as(?f64, null), bitsOf(&.{ 8, 8, 52 }));
+    try std.testing.expectEqual(@as(?f64, null), bitsOf(&.{ 8, 8, 72 }));
+    try std.testing.expectEqual(@as(?f64, null), bitsOf(&.{}));
+    try std.testing.expectEqual(@as(?f64, 4), checkBits(4));
+    try std.testing.expectEqual(@as(?f64, null), checkBits(4.5));
+}
+
+test "an EXL3 group reads its codebook off the marker and its K, N off the trellis (format.parse_group)" {
+    var why: Why = .{};
+    // the pack's down_proj (layer 0, expert 10): [40, 160, 64] is K=640 N=2560 at 4 bits, mul1
+    const g = try parseGroup("model.language_model.layers.0.mlp.experts.10.down_proj", .{
+        .trellis = .{ .dtype = "I16", .shape = &.{ 40, 160, 64 } },
+        .suh = .{ .dtype = "F16", .shape = &.{640} },
+        .svh = .{ .dtype = "F16", .shape = &.{2560} },
+        .mul1 = true,
+    }, &why);
+    try std.testing.expectEqual(@as(f64, 4), g.bits);
+    try std.testing.expectEqual(Codebook.mul1, g.codebook);
+    try std.testing.expectEqual(@as(u32, 640), g.k);
+    try std.testing.expectEqual(@as(u32, 2560), g.n);
+    try std.testing.expectEqualStrings("suh", g.in_scales);
+    try std.testing.expectEqualStrings("svh", g.out_scales);
+    try std.testing.expect(!g.bias);
+    try std.testing.expectEqual(@as(u64, 640 * 2560 * 2 * 4 / 16), g.trellisBytes());
+
+    // no marker: the 3inst codebook, where a whole width is fine
+    const g3 = try parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 64 } }, .suh = .{ .dtype = "F16", .shape = &.{128} }, .svh = .{ .dtype = "F16", .shape = &.{128} } }, &why);
+    try std.testing.expectEqual(Codebook.inst3, g3.codebook);
+
+    // a half width needs the mul1 codebook: 2.5 bits with no marker, or with the mcg marker, is refused
+    try std.testing.expectError(error.BadExl3, parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 40 } }, .suh = .{ .dtype = "F16", .shape = &.{128} }, .svh = .{ .dtype = "F16", .shape = &.{128} } }, &why));
+    try std.testing.expect(std.mem.indexOf(u8, why.text(), "mul1 codebook") != null);
+    try std.testing.expectError(error.BadExl3, parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 40 } }, .suh = .{ .dtype = "F16", .shape = &.{128} }, .svh = .{ .dtype = "F16", .shape = &.{128} }, .mcg = true }, &why));
+    // both markers at once
+    try std.testing.expectError(error.BadExl3, parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 64 } }, .suh = .{ .dtype = "F16", .shape = &.{128} }, .svh = .{ .dtype = "F16", .shape = &.{128} }, .mcg = true, .mul1 = true }, &why));
+
+    // the packed-sign alternative (.su/.sv), and the shapes format.parse_group refuses
+    const gs = try parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 64 } }, .su = .{ .dtype = "I16", .shape = &.{8} }, .sv = .{ .dtype = "I16", .shape = &.{8} } }, &why);
+    try std.testing.expectEqualStrings("su", gs.in_scales);
+    try std.testing.expectEqualStrings("sv", gs.out_scales);
+    try std.testing.expectError(error.BadExl3, parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 64 } }, .suh = .{ .dtype = "F16", .shape = &.{128} } }, &why)); // no output scales
+    try std.testing.expectError(error.BadExl3, parseGroup("a.b.c", .{ .trellis = .{ .dtype = "F32", .shape = &.{ 8, 8, 64 } }, .suh = .{ .dtype = "F16", .shape = &.{128} }, .svh = .{ .dtype = "F16", .shape = &.{128} } }, &why)); // not int16
+    try std.testing.expectError(error.BadExl3, parseGroup("a.b.c", .{ .trellis = .{ .dtype = "I16", .shape = &.{ 8, 8, 64 } }, .suh = .{ .dtype = "F16", .shape = &.{256} }, .svh = .{ .dtype = "F16", .shape = &.{128} } }, &why)); // suh is not [K]
+}
+
+test "the EXL3 checkpoint's config.json reads as quant_method exl3 with the mul1 codebook" {
+    var why: Why = .{};
+    var c = try parse(std.testing.allocator, @embedFile("fixtures_cuda_config_exl3.json"), "{\"eos_token_id\": [248046, 248044]}", .{}, &why);
+    defer c.deinit();
+    try std.testing.expectEqual(Quant.exl3, c.quant);
+    const e = c.exl3.?;
+    try std.testing.expectEqualStrings("1.4.4", e.version);
+    try std.testing.expectEqual(Codebook.mul1, e.codebook.?);
+    try std.testing.expectEqual(@as(?u32, 6), e.head_bits);
+    try std.testing.expectEqual(@as(?u32, 4), e.mtp_bits);
+    try std.testing.expectEqualStrings("always", e.out_scales);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.05), e.average_bits.?, 1e-9);
+    try std.testing.expectEqual(@as(u32, 48), c.layers);
+    try std.testing.expectEqual(@as(u32, 640), c.moe_width);
+    try std.testing.expectEqual(@as(u32, 640), c.shared_width);
+    try std.testing.expectEqual(@as(u32, 10), c.top_k);
+    try c.check(&why);
+}
+
+test "checkExl3 refuses a codebook it does not read, a fractional head width and off-block dims" {
+    const gpa = std.testing.allocator;
+    const base = @embedFile("fixtures_cuda_config_exl3.json");
+    var why: Why = .{};
+    // an unknown codebook, and a fractional head width: refused while reading the config (format.require_config)
+    const bad_cb = try std.mem.replaceOwned(u8, gpa, base, "\"codebook\": \"mul1\"", "\"codebook\": \"mcg2\"");
+    defer gpa.free(bad_cb);
+    try std.testing.expectError(error.UnsupportedQuantization, parse(gpa, bad_cb, null, .{}, &why));
+    const bad_head = try std.mem.replaceOwned(u8, gpa, base, "\"head_bits\": 6", "\"head_bits\": 6.5");
+    defer gpa.free(bad_head);
+    try std.testing.expectError(error.UnsupportedQuantization, parse(gpa, bad_head, null, .{}, &why));
+    // a dimension that is not a whole Hadamard block: refused by check
+    var c = try parse(gpa, base, null, .{}, &why);
+    defer c.deinit();
+    c.moe_width = 600;
+    try std.testing.expectError(error.UnsupportedModel, c.check(&why));
+    try std.testing.expect(std.mem.indexOf(u8, why.text(), "EXL3 blocks") != null);
 }
