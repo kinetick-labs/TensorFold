@@ -47,6 +47,8 @@ const usage =
     \\           Python's Fp8BlockLinear on tools/zig/check_fp8block.py's cases in DIR, bytes compared, timed)
     \\  tensorfold int4-check MODEL   (no weights: the GPTQ int4 expert and head kernels (cuda_int4.zig) against a host
     \\           reference from the GPTQ bytes, row/tile invariance, plan == dense, then their speed)
+    \\  tensorfold weights-load MODEL   (no GPU: the checkpoint's weights loaded with the hash sink, the buffer count and
+    \\           every buffer's sha256 -- how far a real load gets without a device; --tp/--rank pick a rank's slice)
     \\  tensorfold agree MODEL CAPTURE_DIR --report OUT.json [--against REF.json] [--max-tokens N] [--only NAME,...]
     \\           (each captured prompt's greedy serial reply written to OUT.json; with REF.json, another run's replies
     \\           teacher-forced: the top-1 agreement of this engine's greedy draws with them, and where the free
@@ -245,13 +247,15 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             return 2;
         } else try positional.append(gpa, a);
     }
+    const cmd = args[1];
+    const rest = positional.items;
+    if (init.environ_map.get("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| o.reserve_gib = try std.fmt.parseFloat(f64, v);
+    // weights-load takes no driver and no kernels: the hash sink hashes the bytes a device load would hold
+    if (std.mem.eql(u8, cmd, "weights-load") and rest.len == 0) return weightsLoad(gpa, init.io, o.model, o.rank, o.tp);
     const kernels = o.kernels orelse init.environ_map.get("TENSORFOLD_CUDA_KERNELS") orelse {
         std.debug.print("the Triton kernel set: --kernels DIR or TENSORFOLD_CUDA_KERNELS (aot.json + cubins/)\n", .{});
         return 2;
     };
-    const cmd = args[1];
-    const rest = positional.items;
-    if (init.environ_map.get("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| o.reserve_gib = try std.fmt.parseFloat(f64, v);
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, @intCast(o.device));
@@ -325,6 +329,20 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, cmd, "agree") and rest.len == 1) return agree(gpa, init.io, e, rest[0], o);
     std.debug.print("{s}", .{usage});
     return 2;
+}
+
+/// `weights-load MODEL`: the load with the hash sink (no GPU, no driver), printing buffer count, bytes and sha256.
+fn weightsLoad(gpa: Allocator, io: std.Io, dir: []const u8, rank: u32, world: u32) !u8 {
+    var c = try flashnext.config.Config.read(gpa, io, dir, .{});
+    defer c.deinit();
+    var w = try flashnext.weights.load(gpa, io, dir, &c, .{ .rank = rank, .world = world, .mode = .hash });
+    defer w.deinit();
+    std.debug.print("{d} weight buffers, {d} bytes ({d:.3} GiB)\n", .{ w.named.items.len, w.bytes, @as(f64, @floatFromInt(w.bytes)) / (1 << 30) });
+    const ds = try flashnext.weights.digests(gpa, &w);
+    defer flashnext.weights.freeDigests(gpa, ds);
+    for (ds) |d| std.debug.print("{s}  {s}  {d} bytes  [{s}]\n", .{ d.sha256, d.name, d.len, d.shape });
+    std.debug.print("{d} digests\n", .{ds.len});
+    return 0;
 }
 
 /// YaRN from the config's rope parameters or TF_FLASHNEXT_YARN (cuda_rope.fromConfig, the patched Python's rule).
@@ -1322,7 +1340,7 @@ fn expertsCheck(gpa: Allocator, ctx: *const cuda.Context, o: Options) !u8 {
     ok = (try flashnext.moe_prompt.checkWith(gpa, ctx, ops, &p, 320, rows.items, true, true)) and ok;
     ok = (try flashnext.moe_prompt.check(gpa, ctx, ops, &p, 640, rows.items, false)) and ok;
     p.gu2 = false;
-        std.debug.print("{s} experts-check: the prompt expert kernel {s} Python's on 16-pair items\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFER from" });
+    std.debug.print("{s} experts-check: the prompt expert kernel {s} Python's on 16-pair items\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFER from" });
     return if (ok) 0 else 1;
 }
 
