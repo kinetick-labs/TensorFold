@@ -83,8 +83,11 @@ fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
     return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
 }
 
-/// The bytes of the checkpoint's safetensors files: what its weights need on the device, near enough to refuse early.
-fn weightBytes(io: std.Io, dir: []const u8) u64 {
+/// The checkpoint's bytes that become resident: every top-level `*.safetensors` the loader uploads to the device.
+/// The n-gram table's own file is left out (mappedNotResident): the loader memory-maps it and reads a row at a
+/// time (cuda_weights.openTable), holding none of it at one rank. At more ranks the GPU's tableToGpu copy is
+/// weighed by the post-load admission, which reads the device's own usage, not this early estimate.
+fn weightBytes(a: Allocator, io: std.Io, dir: []const u8) u64 {
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     var total: u64 = 0;
@@ -92,9 +95,39 @@ fn weightBytes(io: std.Io, dir: []const u8) u64 {
     while (it.next(io) catch null) |e| {
         if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
         const st = d.statFile(io, e.name, .{}) catch continue;
+        const path = std.fs.path.join(a, &.{ dir, e.name }) catch continue;
+        defer a.free(path);
+        if (mappedNotResident(a, io, path)) continue;
         total += st.size;
     }
     return total;
+}
+
+/// Whether `path`'s file holds only the n-gram table: its tensors all live under an `ngram_embedding` namespace, so
+/// the loader memory-maps the whole file and never holds it on the device (cuda_weights.NgramTable). Any other
+/// tensor, an unreadable file or a malformed header counts as resident: the loader reads it, or refuses loudly.
+fn mappedNotResident(a: Allocator, io: std.Io, path: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+    var head: [8]u8 = undefined;
+    if ((file.readPositionalAll(io, &head, 0) catch return false) != head.len) return false;
+    const len: usize = @intCast(std.mem.readInt(u64, &head, .little));
+    if (len == 0 or len > (16 << 20)) return false;
+    const json = aa.alloc(u8, len) catch return false;
+    if ((file.readPositionalAll(io, json, 8) catch return false) != len) return false;
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, aa, json, .{}) catch return false;
+    if (doc != .object) return false;
+    var any = false;
+    var it = doc.object.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
+        if (std.mem.indexOf(u8, kv.key_ptr.*, "ngram_embedding") == null) return false;
+        any = true;
+    }
+    return any;
 }
 
 /// A /proc file's text, streamed: procfs reports size 0, and a positional read (readFileAlloc) stops there.
@@ -383,10 +416,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
-    const weights = weightBytes(io, o.dir);
+    const weights = weightBytes(a, io, o.dir);
     const held0 = cuda.usage(false).device;
     if (weights > before.room(held0)) {
-        problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
+        problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of resident weights (its memory-mapped n-gram table is not counted) do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
     // the family's own options: upstream's context/drafts/segments, then what a newer family's Options adds,
@@ -556,4 +589,59 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
         try history.append(gpa, t);
     }
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+}
+
+/// A minimal safetensors file's bytes: each name an F16 [1] tensor in its own 2-byte slot and a header, enough for
+/// the residency gate's peek (it reads the tensors' names; the loader's own reader validates the rest).
+fn safetensors(a: Allocator, names: []const []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.append(a, '{');
+    for (names, 0..) |name, i| {
+        if (i != 0) try body.append(a, ',');
+        try body.print(a, "\"{s}\":{{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[{d},{d}]}}", .{ name, 2 * i, 2 * i + 2 });
+    }
+    try body.append(a, '}');
+    const out = try a.alloc(u8, 8 + body.items.len + 2 * names.len);
+    std.mem.writeInt(u64, out[0..8], body.items.len, .little);
+    @memcpy(out[8 .. 8 + body.items.len], body.items);
+    @memset(out[8 + body.items.len ..], 0);
+    return out;
+}
+
+test "the residency gate keeps a checkpoint shard and drops the memory-mapped n-gram table" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const shard = try safetensors(a, &.{"model.language_model.layers.0.mlp.gate_proj.weight"});
+    defer a.free(shard);
+    const other = try safetensors(a, &.{"model.language_model.embed_tokens.weight"});
+    defer a.free(other);
+    const table = try safetensors(a, &.{ "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.trellis", "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.head_bias" });
+    defer a.free(table);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00002.safetensors", .data = shard });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00002-of-00002.safetensors", .data = other });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ngram_embedding.safetensors", .data = table });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" }); // not a checkpoint file: ignored
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(dir);
+    const shard_bytes = (try tmp.dir.statFile(io, "model-00001-of-00002.safetensors", .{})).size;
+    const other_bytes = (try tmp.dir.statFile(io, "model-00002-of-00002.safetensors", .{})).size;
+    // the table's tens of GiB are not resident: the gate counts the two shards alone
+    try std.testing.expectEqual(shard_bytes + other_bytes, weightBytes(a, io, dir));
+    // and the decision itself: the table's file is mapped, a shard is not
+    const tpath = try std.fs.path.join(a, &.{ dir, "ngram_embedding.safetensors" });
+    defer a.free(tpath);
+    try std.testing.expect(mappedNotResident(a, io, tpath));
+    const spath = try std.fs.path.join(a, &.{ dir, "model-00001-of-00002.safetensors" });
+    defer a.free(spath);
+    try std.testing.expect(!mappedNotResident(a, io, spath));
+    // a file that also holds a real tensor stays resident: the loader reads its other tensors into the device
+    const mixed = try safetensors(a, &.{ "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.trellis", "model.language_model.embed_tokens.weight" });
+    defer a.free(mixed);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00003.safetensors", .data = mixed });
+    const mpath = try std.fs.path.join(a, &.{ dir, "model-00003.safetensors" });
+    defer a.free(mpath);
+    try std.testing.expect(!mappedNotResident(a, io, mpath));
 }
