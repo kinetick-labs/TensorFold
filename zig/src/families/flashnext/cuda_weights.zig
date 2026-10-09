@@ -27,6 +27,7 @@ const ngram = @import("cuda_ngram.zig");
 const ropes = @import("cuda_rope.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
+const exl3 = @import("cuda_exl3.zig");
 
 const Config = cfgs.Config;
 const st = core.safetensors;
@@ -59,6 +60,21 @@ pub const Options = struct {
 
 /// A bf16 matrix [n, k] as stored (Python bf16._Routed, its B16 at `.b`: named "<path>.b.weight").
 pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0 };
+/// One dense EXL3 layer on the device (Python linear.py:Exl3Linear): the trellis' int32 words in the strips layout
+/// the dense kernels read (linear.py:48), the fp16 input/output scales, an optional fp16 bias, and the plan, width
+/// and codebook id a launch takes. `bits`/`k2` are the trellis shape's width, never the header's mean.
+pub const X3 = struct {
+    words: u64 = 0,
+    suh: u64 = 0,
+    svh: u64 = 0,
+    bias: u64 = 0,
+    n: u32 = 0,
+    k: u32 = 0,
+    k2: u32 = 0,
+    bits: f64 = 0,
+    cb: u8 = 0,
+    split: exl3.Split = .{ .sk = 0, .wk = 0 },
+};
 /// An FP4 table in the pattern form: bf16 bits [n/64][k/64][64][64], fp32 scales [k/16, n], fp32 scale2 [n].
 pub const Fp4 = struct { weight: u64 = 0, scale: u64 = 0, scale2: u64 = 0, n: u32 = 0, k: u32 = 0 };
 pub const Expert4 = struct { gu: Fp4 = .{}, down: Fp4 = .{} };
@@ -84,8 +100,8 @@ pub const Hc = struct {
 /// INT4-AutoRound (block FP8 dense linears): `proj8` the projection's first columns (DeltaNet q, k, v, z; attention
 /// q|gate, k, v) on the block-FP8 lane matmul, `proj` the bf16 rows after them (DeltaNet b, a; the indexer);
 /// `out8` / `o8` replace `out` / `o`.
-pub const Gdn = struct { proj: Rows = .{}, conv: u64 = 0, a_log: u64 = 0, dt_bias: u64 = 0, norm: u64 = 0, out: Rows = .{}, proj8: ?fp8.Linear = null, out8: ?fp8.Linear = null };
-pub const Attn = struct { proj: Rows = .{}, q_scale: u64 = 0, k_scale: u64 = 0, iq_scale: u64 = 0, ik_scale: u64 = 0, o: Rows = .{}, proj8: ?fp8.Linear = null, o8: ?fp8.Linear = null };
+pub const Gdn = struct { proj: Rows = .{}, conv: u64 = 0, a_log: u64 = 0, dt_bias: u64 = 0, norm: u64 = 0, out: Rows = .{}, proj8: ?fp8.Linear = null, out8: ?fp8.Linear = null, qkv3: ?X3 = null, z3: ?X3 = null, out3: ?X3 = null, ba3: ?Rows = null };
+pub const Attn = struct { proj: Rows = .{}, q_scale: u64 = 0, k_scale: u64 = 0, iq_scale: u64 = 0, ik_scale: u64 = 0, o: Rows = .{}, proj8: ?fp8.Linear = null, o8: ?fp8.Linear = null, q3: ?X3 = null, k3: ?X3 = null, v3: ?X3 = null, iq3: ?X3 = null, o3: ?X3 = null };
 /// INT4-AutoRound's healed shared expert: block FP8 gate|up rows [2 w, D] and down [D, w] (w its rank's width).
 pub const Shared8 = struct { gu: fp8.Linear, down: fp8.Linear, width: u32 };
 pub const Ple = struct { key: Rows = .{}, value: Rows = .{}, norm_key: u64 = 0, norm_query: u64 = 0, norm_conv: u64 = 0, conv: u64 = 0, ngram: ngram.NGram };
@@ -216,6 +232,8 @@ pub const Weights = struct {
     head: Rows = .{},
     /// INT4-AutoRound: the GPTQ int4 lm_head's vocabulary columns of this rank
     head4: ?int4.Mat = null,
+    /// EXL3: lm_head's trellis (the whole head's words and scales; the draft head is not built from it)
+    head3: ?X3 = null,
     vocab_offset: u32 = 0,
     inv_freq: u64 = 0,
     mtp: ?Mtp = null,
@@ -447,6 +465,85 @@ const Loader = struct {
         return L.extraIndex(key) != null;
     }
 
+    /// A dense EXL3 layer `name` (e.g. "...self_attn.q_proj") with `n` outputs and `k` inputs: its `.trellis`, its
+    /// `.suh`/`.svh` fp16 scales and (when the pack has them) its `.mul1`/`.mcg` codebook marker and `.bias`, each
+    /// read through `get`/`expect` so the checkpoint's used-set covers them. The trellis' int16 words are reshaped
+    /// into the strips layout the dense kernels read (linear.py:48) and uploaded; the width is the trellis shape's
+    /// (bitsOf, never the header's mean) and the codebook the marker's. This pack mixes 4, 5 and 6 bits.
+    fn exl3Dense(L: *Loader, path: []const u8, name: []const u8, n: usize, k: usize) !X3 {
+        if (k == 0 or n == 0 or k % 16 != 0 or n % 16 != 0) return error.UnexpectedTensor;
+        const kt = k / 16;
+        const nt = n / 16;
+        const trellis = try L.get(try L.nameOf("{s}.trellis", .{name}));
+        if (trellis.dtype != .i16 or trellis.rank != 3 or trellis.dim(0) != kt or trellis.dim(1) != nt) {
+            std.log.err("{s}{s}.trellis: {t} {any}; expected I16 [{d}, {d}, 16 * bits]", .{ L.prefix, name, trellis.dtype, trellis.shape[0..trellis.rank], kt, nt });
+            return error.UnexpectedTensor;
+        }
+        const shape = [3]i64{ @intCast(kt), @intCast(nt), @intCast(trellis.dim(2)) };
+        const bits = cfgs.bitsOf(&shape) orelse {
+            std.log.err("{s}{s}.trellis: {d} last elements are not a width ExLlamaV3 writes", .{ L.prefix, name, trellis.dim(2) });
+            return error.UnsupportedQuantization;
+        };
+        const k2 = exl3.k2Of(bits) orelse return error.UnsupportedQuantization;
+        // the codebook is the marker tensor's presence: .mul1, else .mcg, else 3inst (format.parse_group)
+        var fb: [256]u8 = undefined;
+        const has_mul1 = L.has(try std.fmt.bufPrint(&fb, "{s}{s}.mul1", .{ L.prefix, name }));
+        const has_mcg = L.has(try std.fmt.bufPrint(&fb, "{s}{s}.mcg", .{ L.prefix, name }));
+        if (has_mul1 and has_mcg) {
+            std.log.err("{s}{s}: both mcg and mul1 markers", .{ L.prefix, name });
+            return error.UnexpectedTensor;
+        }
+        for ([_]struct { on: bool, part: []const u8, marker: u32 }{
+            .{ .on = has_mul1, .part = "mul1", .marker = cfgs.MARKER_MUL1 },
+            .{ .on = has_mcg, .part = "mcg", .marker = cfgs.MARKER_MCG },
+        }) |m| {
+            if (!m.on) continue;
+            const t = try L.get(try L.nameOf("{s}.{s}", .{ name, m.part }));
+            if (t.dtype != .i32 or t.numel() != 1 or std.mem.readInt(u32, t.bytes[0..4], .little) != m.marker) {
+                std.log.err("{s}{s}.{s}: not the {s} marker 0x{X}", .{ L.prefix, name, m.part, m.part, m.marker });
+                return error.UnexpectedTensor;
+            }
+        }
+        const codebook: cfgs.Codebook = if (has_mul1) .mul1 else if (has_mcg) .mcg else .inst3;
+        if (@trunc(bits) != bits and codebook != .mul1) {
+            std.log.err("{s}{s}: {d}-bit tiles need the mul1 codebook, found {s}", .{ L.prefix, name, bits, codebook.name() });
+            return error.UnsupportedQuantization;
+        }
+        const cb = exl3.codebookId(codebook.name()) orelse return error.UnsupportedQuantization;
+        // the scales: fp16 .suh [K] / .svh [N]; the packed-sign .su/.sv are refused (this engine reads fp16 scales)
+        for ([_]struct { part: []const u8, want: []const u8 }{
+            .{ .part = "su", .want = "suh" },
+            .{ .part = "sv", .want = "svh" },
+        }) |p| if (L.has(try std.fmt.bufPrint(&fb, "{s}{s}.{s}", .{ L.prefix, name, p.part }))) {
+            std.log.err("{s}{s}.{s}: packed-sign scales; this engine reads the fp16 .{s}", .{ L.prefix, name, p.part, p.want });
+            return error.UnsupportedQuantization;
+        };
+        const suh = try L.expect(try L.nameOf("{s}.suh", .{name}), .f16, &.{k});
+        const svh = try L.expect(try L.nameOf("{s}.svh", .{name}), .f16, &.{n});
+        var x: X3 = .{ .n = @intCast(n), .k = @intCast(k), .k2 = k2, .bits = bits, .cb = cb, .split = exl3.plan(k, n) };
+        var pb: [192]u8 = undefined;
+        x.suh = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.suh", .{path}), "float16", &.{k}, suh.bytes);
+        x.svh = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.svh", .{path}), "float16", &.{n}, svh.bytes);
+        if (L.has(try std.fmt.bufPrint(&fb, "{s}{s}.bias", .{ L.prefix, name }))) {
+            const b = try L.expect(try L.nameOf("{s}.bias", .{name}), .f16, &.{n});
+            x.bias = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.bias", .{path}), "float16", &.{n}, b.bytes);
+        }
+        // the trellis: int16 [K/16, N/16, 16 * bits] -> int32 strips [N/128, K/16, 8, 4 * k2] (linear.py:48; a copy)
+        const w: usize = 4 * @as(usize, k2);
+        const count = kt * nt * w;
+        if (trellis.bytes.len != count * 4) return error.UnexpectedTensor;
+        const src = try L.gpa.alloc(u32, count);
+        defer L.gpa.free(src);
+        @memcpy(std.mem.sliceAsBytes(src), trellis.bytes);
+        // both buffers from the allocator, as int4Head's packed words are: the staging buffer is a byte array, and
+        // an @alignCast to u32 on it would be an assertion the upload path does not promise
+        const dst = try L.gpa.alloc(u32, count);
+        defer L.gpa.free(dst);
+        try exl3.strips(dst, src, kt, nt, w);
+        x.words = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.words", .{path}), "int32", &.{ nt / 8, kt, 8, w }, std.mem.sliceAsBytes(dst));
+        return x;
+    }
+
     /// The INT4-AutoRound lm_head (GPTQ int4, groups of 128): this rank's vocabulary columns packed for fn_int4.cu.
     /// Returns the checkpoint's bytes (the draft head dequantizes its rows from them).
     fn int4Head(L: *Loader, w: *Weights, vl: usize) !int4.Source {
@@ -501,6 +598,22 @@ const Loader = struct {
     fn staging(L: *Loader, bytes: usize) ![]u8 {
         try L.host.resize(L.gpa, bytes);
         return L.host.items;
+    }
+
+    /// `t` (bf16 as stored, else fp16) uploaded as bf16 bytes (the engine reads bf16 activations): the fp16 values go
+    /// through fp32 and round to bf16 (layouts.bf16Rne), staged once and consumed by the `put` that follows.
+    fn putBf16(L: *Loader, t: Tensor) !void {
+        if (t.dtype == .bf16) return L.out.put(t.bytes);
+        if (t.dtype != .f16) {
+            std.log.err("{t} weights; expected bf16 or fp16", .{t.dtype});
+            return error.UnexpectedTensor;
+        }
+        const host = try L.staging(t.numel() * 2);
+        for (0..t.numel()) |i| {
+            const h: f16 = @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little));
+            std.mem.writeInt(u16, host[2 * i ..][0..2], lay.bf16Rne(@floatCast(h)), .little);
+        }
+        return L.out.put(host);
     }
 
     fn has(L: *Loader, name: []const u8) bool {
@@ -689,12 +802,35 @@ const Loader = struct {
         const ab = [1][2]usize{.{ r * vl, (r + 1) * vl }};
         var g: Gdn = .{};
         var pb: [192]u8 = undefined;
-        g.proj = try L.face(try std.fmt.bufPrint(&pb, "{s}.proj.b.weight", .{path}), &.{
-            .{ .t = try L.linear(try L.nameOf("{s}.in_proj_qkv", .{name}), c.convDim(), c.hidden), .rows = &channels },
-            .{ .t = try L.linear(try L.nameOf("{s}.in_proj_z", .{name}), c.nv * c.dv, c.hidden), .rows = &z },
-            .{ .t = try L.linear(try L.nameOf("{s}.in_proj_b", .{name}), c.nv, c.hidden), .rows = &ab },
-            .{ .t = try L.linear(try L.nameOf("{s}.in_proj_a", .{name}), c.nv, c.hidden), .rows = &ab },
-        });
+        if (L.c.quant == .exl3) {
+            // the pack quantizes in_proj_qkv and in_proj_z (whole layer) and leaves in_proj_b/a bf16/fp16 rows
+            g.qkv3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.qkv", .{path}), try L.nameOf("{s}.in_proj_qkv", .{name}), c.convDim(), c.hidden);
+            g.z3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.z", .{path}), try L.nameOf("{s}.in_proj_z", .{name}), c.nv * c.dv, c.hidden);
+            const bt = try L.get(try L.nameOf("{s}.in_proj_b", .{name}));
+            const at = try L.get(try L.nameOf("{s}.in_proj_a", .{name}));
+            for ([_]Tensor{ bt, at }) |t| {
+                if (!t.is(.bf16, &.{ c.nv, c.hidden }) and !t.is(.f16, &.{ c.nv, c.hidden })) {
+                    std.log.err("{s}{s}: {t} {any}; expected bf16 or fp16 in_proj rows", .{ L.prefix, name, t.dtype, t.shape[0..t.rank] });
+                    return error.UnexpectedTensor;
+                }
+            }
+            const bp = try L.out.begin(try std.fmt.bufPrint(&pb, "{s}.proj.b.weight", .{path}), "bfloat16", &.{ 2 * c.nv, c.hidden });
+            try L.putBf16(bt);
+            try L.putBf16(at);
+            try L.out.end();
+            L.out.ours();
+            // `ba3`, not `proj`: an EXL3 projection is qkv3 and z3 (their own kernels) plus these two plain rows,
+            // so nothing may read `proj` as one face here -- an empty `proj` fails loudly where a short one would
+            // silently compute the wrong projection.
+            g.ba3 = .{ .weight = bp, .n = @intCast(2 * c.nv), .k = @intCast(c.hidden) };
+        } else {
+            g.proj = try L.face(try std.fmt.bufPrint(&pb, "{s}.proj.b.weight", .{path}), &.{
+                .{ .t = try L.linear(try L.nameOf("{s}.in_proj_qkv", .{name}), c.convDim(), c.hidden), .rows = &channels },
+                .{ .t = try L.linear(try L.nameOf("{s}.in_proj_z", .{name}), c.nv * c.dv, c.hidden), .rows = &z },
+                .{ .t = try L.linear(try L.nameOf("{s}.in_proj_b", .{name}), c.nv, c.hidden), .rows = &ab },
+                .{ .t = try L.linear(try L.nameOf("{s}.in_proj_a", .{name}), c.nv, c.hidden), .rows = &ab },
+            });
+        }
         const conv = try L.expect(try L.nameOf("{s}.conv1d.weight", .{name}), .bf16, &.{ c.convDim(), 1, c.conv_kernel });
         const row = c.conv_kernel * 2;
         g.conv = try L.out.begin(try std.fmt.bufPrint(&pb, "{s}.conv", .{path}), "bfloat16", &.{ 2 * qk + vv, c.conv_kernel });
@@ -704,8 +840,12 @@ const Loader = struct {
         g.dt_bias = try L.widen(try std.fmt.bufPrint(&pb, "{s}.dt_bias", .{path}), try L.expect(try L.nameOf("{s}.dt_bias", .{name}), .bf16, &.{c.nv}), r * vl, (r + 1) * vl);
         const norm = try L.expect(try L.nameOf("{s}.norm.weight", .{name}), .bf16, &.{c.dv});
         g.norm = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.norm", .{path}), "bfloat16", &.{c.dv}, norm.bytes);
-        const out_t = try L.linear(try L.nameOf("{s}.out_proj", .{name}), c.hidden, c.nv * c.dv);
-        g.out = try L.face(try std.fmt.bufPrint(&pb, "{s}.out.b.weight", .{path}), &.{.{ .t = out_t, .cols = .{ r * vv, (r + 1) * vv } }});
+        if (L.c.quant == .exl3) {
+            g.out3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.out", .{path}), try L.nameOf("{s}.out_proj", .{name}), c.hidden, c.nv * c.dv);
+        } else {
+            const out_t = try L.linear(try L.nameOf("{s}.out_proj", .{name}), c.hidden, c.nv * c.dv);
+            g.out = try L.face(try std.fmt.bufPrint(&pb, "{s}.out.b.weight", .{path}), &.{.{ .t = out_t, .cols = .{ r * vv, (r + 1) * vv } }});
+        }
         return g;
     }
 
@@ -721,18 +861,30 @@ const Loader = struct {
         var a: Attn = .{};
         var pb: [192]u8 = undefined;
         const idx_rows = c.index_heads * c.index_dim + c.index_dim * c.index_kv_heads;
-        a.proj = try L.face(try std.fmt.bufPrint(&pb, "{s}.proj.b.weight", .{path}), &.{
-            .{ .t = try L.linear(try L.nameOf("{s}.q_proj", .{name}), c.heads * 2 * hd, c.hidden), .rows = &q },
-            .{ .t = try L.linear(try L.nameOf("{s}.k_proj", .{name}), c.kv_heads * hd, c.hidden), .rows = &kv },
-            .{ .t = try L.linear(try L.nameOf("{s}.v_proj", .{name}), c.kv_heads * hd, c.hidden), .rows = &kv },
-            .{ .t = try L.linear(try L.nameOf("{s}.indexer.index_qk_proj", .{name}), idx_rows, c.hidden) },
-        });
+        if (L.c.quant == .exl3) {
+            // the pack quantizes every attention linear (whole layer): q, k, v, the indexer and o_proj
+            a.q3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.q", .{path}), try L.nameOf("{s}.q_proj", .{name}), c.heads * 2 * hd, c.hidden);
+            a.k3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.k", .{path}), try L.nameOf("{s}.k_proj", .{name}), c.kv_heads * hd, c.hidden);
+            a.v3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.v", .{path}), try L.nameOf("{s}.v_proj", .{name}), c.kv_heads * hd, c.hidden);
+            a.iq3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.iq", .{path}), try L.nameOf("{s}.indexer.index_qk_proj", .{name}), idx_rows, c.hidden);
+        } else {
+            a.proj = try L.face(try std.fmt.bufPrint(&pb, "{s}.proj.b.weight", .{path}), &.{
+                .{ .t = try L.linear(try L.nameOf("{s}.q_proj", .{name}), c.heads * 2 * hd, c.hidden), .rows = &q },
+                .{ .t = try L.linear(try L.nameOf("{s}.k_proj", .{name}), c.kv_heads * hd, c.hidden), .rows = &kv },
+                .{ .t = try L.linear(try L.nameOf("{s}.v_proj", .{name}), c.kv_heads * hd, c.hidden), .rows = &kv },
+                .{ .t = try L.linear(try L.nameOf("{s}.indexer.index_qk_proj", .{name}), idx_rows, c.hidden) },
+            });
+        }
         a.q_scale = try L.cscaleRope(try std.fmt.bufPrint(&pb, "{s}.q_scale", .{path}), try L.nameOf("{s}.q_norm.weight", .{name}), hd, true);
         a.k_scale = try L.cscaleRope(try std.fmt.bufPrint(&pb, "{s}.k_scale", .{path}), try L.nameOf("{s}.k_norm.weight", .{name}), hd, true);
         a.iq_scale = try L.cscaleRope(try std.fmt.bufPrint(&pb, "{s}.iq_scale", .{path}), try L.nameOf("{s}.indexer.q_layernorm.weight", .{name}), c.index_dim, true);
         a.ik_scale = try L.cscaleRope(try std.fmt.bufPrint(&pb, "{s}.ik_scale", .{path}), try L.nameOf("{s}.indexer.k_layernorm.weight", .{name}), c.index_dim, true);
-        const o_t = try L.linear(try L.nameOf("{s}.o_proj", .{name}), c.hidden, c.heads * hd);
-        a.o = try L.face(try std.fmt.bufPrint(&pb, "{s}.o.b.weight", .{path}), &.{.{ .t = o_t, .cols = .{ r * hl * hd, (r + 1) * hl * hd } }});
+        if (L.c.quant == .exl3) {
+            a.o3 = try L.exl3Dense(try std.fmt.bufPrint(&pb, "{s}.o", .{path}), try L.nameOf("{s}.o_proj", .{name}), c.hidden, c.heads * hd);
+        } else {
+            const o_t = try L.linear(try L.nameOf("{s}.o_proj", .{name}), c.hidden, c.heads * hd);
+            a.o = try L.face(try std.fmt.bufPrint(&pb, "{s}.o.b.weight", .{path}), &.{.{ .t = o_t, .cols = .{ r * hl * hd, (r + 1) * hl * hd } }});
+        }
         return a;
     }
 
@@ -1018,7 +1170,7 @@ const Loader = struct {
             const sc = try L.expect(try std.fmt.bufPrint(&b[1], "{s}.experts.{d}.{s}.scales", .{ name, x, proj }), .f16, &.{ kf / int4.checkpoint_group, nf });
             const qz = try L.expect(try std.fmt.bufPrint(&b[2], "{s}.experts.{d}.{s}.qzeros", .{ name, x, proj }), .i32, &.{ kf / int4.checkpoint_group, nf / 8 });
             if (!int4.zerosAreSymmetric(qz.bytes)) {
-                std.log.err("{s}{s}: zero points other than 8 (AutoGPTQ v1 qzeros 7); the engine reads symmetric GPTQ", .{ L.prefix, b[2][0..std.mem.indexOfScalar(u8, &b[2], 0) orelse 0] });
+                std.log.err("{s}{s}: zero points other than 8 (AutoGPTQ v1 qzeros 7); the engine reads symmetric GPTQ", .{ L.prefix, b[2][0 .. std.mem.indexOfScalar(u8, &b[2], 0) orelse 0] });
                 return error.UnsupportedQuantization;
             }
             const src: int4.Source = .{ .qweight = qw.bytes, .scales = sc.bytes, .n_full = nf, .k_full = kf };
@@ -1522,6 +1674,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     var head_bf16: ?Tensor = null;
     if (c.int4ar()) {
         head_src = try L.int4Head(&w, vl);
+    } else if (c.quant == .exl3) {
+        w.head3 = try L.exl3Dense("head3", "lm_head", c.vocab, c.hidden);
     } else {
         const head = try L.linear("lm_head", c.vocab, c.hidden);
         head_bf16 = head;
@@ -1529,7 +1683,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     }
 
     // the draft head: the lm_head's draft rows quantized 4-bit (groups of 32), packed for the lane matmul
-    if (o.draft_head) {
+    if (o.draft_head and (head_src != null or head_bf16 != null)) {
         const ids = try draftIds(gpa, draft_vocab, c.vocab, o.rank, o.world);
         defer gpa.free(ids);
         const k = c.hidden;
@@ -1637,6 +1791,7 @@ pub fn ropeOf(c: *const Config) ropes.Rope {
 test {
     _ = lay;
     _ = cfgs;
+    _ = exl3;
     _ = &load;
     _ = &digests;
 }
