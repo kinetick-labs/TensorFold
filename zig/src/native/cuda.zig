@@ -488,7 +488,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
     const room = after.room(model) -| (if (@hasField(@TypeOf(loaded), "learn_bytes")) loaded.learn_bytes else 0);
-    const stream_bytes = if (@hasField(@TypeOf(loaded), "stream_bytes")) loaded.stream_bytes else 0;
+    const stream_bytes = loaded.stream_bytes;
     const free = if (@hasField(@TypeOf(loaded), "free_streams")) loaded.free_streams else 0;
     const streams = budget.admit(room, stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -519,7 +519,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         h.store = store;
     }
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}", .{
-        capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (@hasField(@TypeOf(loaded), "learn_bytes") and loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(stream_bytes), window, toGib(room), toGib(after.reserve), if (@hasDecl(F, "prompt_rows")) F.prompt_rows else 0, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+        capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (@hasField(@TypeOf(loaded), "learn_bytes") and loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
