@@ -33,6 +33,8 @@ pub const CallGate = @import("engine_request_controls.zig").CallGate;
 pub const Structure = @import("engine_request_controls.zig").Structure;
 
 pub const grammar = lanes.grammar;
+/// A prompt's images and video frames, prepared by the vision frontend (rows, rotary positions, features).
+pub const Media = lanes.Media;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
@@ -83,6 +85,8 @@ pub const Request = struct {
     decide: ?u32 = null,
     /// The model as shipped: no learned neuron acts on its rows, no prompt state is kept or reused (a lesson's writer).
     untaught: bool = false,
+    /// The prompt's images and videos (``Info.media`` engines only); such a prompt is never kept or resumed.
+    media: ?*const Media = null,
     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
     logprobs: ?u8 = null,
     /// Rows for each prompt token after the first, with ranks and this many best tokens, when ``Info.prompt_logprobs``.
@@ -246,6 +250,8 @@ pub const Info = struct {
     pub inline fn capability(i: Info, comptime key: Capability) bool {
         return @import("engine_capabilities.zig").read(i, key);
     }
+    /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
+    media: bool = false,
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -353,6 +359,8 @@ pub const Open = struct {
     vision: ?VisionOpen = null,
     /// --loops: passes over a looped model's recurrent block (Dory's; null: the checkpoint's own count).
     loops: ?u32 = null,
+    /// --vision-helper: the engine takes prompts whose image and video rows a helper process prepared (`Media`)
+    vision_helper: bool = false,
 };
 
 /// A packed decision: a trunk (pictures expand at `at`), a branch a question, and each branch's labels (`counts`).
