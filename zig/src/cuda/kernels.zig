@@ -62,7 +62,6 @@ pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_clust
 pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
 pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
 pub const fn_qsa_scores: []const u8 = if (available) &Blob("fatbin_fn_qsa_scores").bytes else &.{};
->>>>>>> 3a494628 (build(zig): register the Flash Next CUDA target and the native server (MiaAI-Lab))
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
