@@ -28,6 +28,16 @@ pub const CallGate = struct {
     names: []const []const u8 = &.{},
     think_open: ?u32 = null,
     think_end: ?u32 = null,
+    /// Token text the decode loop uses to finish a named call (Python's blank / decode / encode).
+    lex: CallLex,
+};
+
+/// Same signatures as lanes/call_gate.zig Lex. Kept here so this file stays in one module.
+pub const CallLex = struct {
+    ctx: *anyopaque,
+    blank: *const fn (ctx: *anyopaque, token: u32) bool,
+    text: *const fn (ctx: *anyopaque, a: Allocator, token: u32) anyerror![]const u8,
+    encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32,
 };
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
@@ -38,6 +48,9 @@ pub const Structure = struct {
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
 };
+
+/// A prompt's images and video frames, prepared by the vision frontend (rows, rotary positions, features).
+pub const Media = lanes.Media;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
@@ -67,6 +80,8 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// The prompt's images and videos (``Info.media`` engines only); such a prompt is never kept or resumed.
+    media: ?*const Media = null,
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -119,6 +134,8 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
+    /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
+    media: bool = false,
 };
 
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
@@ -143,10 +160,20 @@ pub const Open = struct {
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
+    // two ranks: rank 0 serves the API and leads, rank 1 follows it over the link to --master:--master-port
+    tp: u32 = 1,
+    rank: u32 = 0,
+    master: []const u8 = "",
+    master_port: u16 = 29551,
+    // the attention caches' format: bf16 (exact) or fp8 (e4m3 rows, about half the bytes)
+    kv_dtype: []const u8 = "bf16",
+    // --vision: image and video input (a helper process runs Python TensorFold's frontend and tower)
+    vision: bool = false,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+/// ``follow``: a rank other than 0 runs it instead of serving, until rank 0 stops (two-rank engines only).
+pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, follow: ?*const fn (ctx: *anyopaque) anyerror!void = null };
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };
 
