@@ -101,6 +101,10 @@ const Host = struct {
 
 /// The engine for `o.dir`, or null with `problem` set when no Metal engine reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    if (!std.mem.eql(u8, o.kv_dtype, "bf16")) {
+        problem.* = try std.fmt.allocPrint(a, "--kv-dtype {s} is a CUDA engine option: the Metal engine caches keys and values as bf16", .{o.kv_dtype});
+        return null;
+    }
     const dense = std.mem.eql(u8, o.model_type, "qwen3_5") and qwen27Engine(a, io, o.dir);
     if (try refusal(a, o, dense)) |why| {
         problem.* = why;
