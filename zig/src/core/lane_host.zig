@@ -309,7 +309,8 @@ pub const LaneHost = struct {
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.cancel(job); // other work came first: it never ran
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.prompt, born(r), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        // a prompt with images or video is neither resumed nor kept (Python keeps token-only states)
+        if (r.media == null) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.prompt, born(r), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -344,6 +345,7 @@ pub const LaneHost = struct {
             .decode_spans = h.spans(r),
             .decide = r.decide,
             .untaught = r.untaught,
+            .media = r.media,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
@@ -428,6 +430,58 @@ pub const LaneHost = struct {
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");
+        return true;
+    }
+
+    /// An idle backend driver takes a lone drafted request, sampled when supported; never one with logprobs.
+    fn loneFits(h: *LaneHost, job: *Job) bool {
+        const r = job.request;
+        const lone = h.lone orelse return false;
+        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null or r.prompt_logprobs != null or r.media != null) return false;
+        h.lock();
+        defer h.unlock();
+        return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0;
+    }
+
+    /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
+    fn runLone(h: *LaneHost, job: *Job, began: i96) bool {
+        h.lone_job = job;
+        job.delivered = 0;
+        const lone = h.lone.?;
+        const Hooks = struct {
+            fn committed(ctx: *anyopaque) void {
+                const host: *LaneHost = @ptrCast(@alignCast(ctx));
+                const j = host.lone_job.?;
+                if (!j.prefill_sent) {
+                    j.prefill_sent = true;
+                    host.prefilled(j, j.began);
+                }
+                host.send(j);
+                status.noteLive(host);
+            }
+            fn yield(ctx: *anyopaque) bool {
+                const host: *LaneHost = @ptrCast(@alignCast(ctx));
+                host.lock();
+                defer host.unlock();
+                return host.foregroundWaiting() or host.cancels.items.len > 0 or host.closing;
+            }
+        };
+        job.began = began;
+        const paused = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
+        h.lone_job = null;
+        const handed = paused catch |e| {
+            if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
+            h.remove(job);
+            h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
+            return true;
+        };
+        if (!job.prefill_sent) h.prefilled(job, began);
+        if (handed) {
+            h.core.adopt(&job.stream) catch |e| return h.drop(job, @errorName(e));
+            h.send(job);
+            return true;
+        }
+        if (h.deliver(job)) h.remove(job);
         return true;
     }
 
