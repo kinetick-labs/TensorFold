@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
+const cfgs = @import("cuda_config.zig");
 
 /// Codebook ids the kernels take as an int (decode.cuh:10, linear.py:13).
 pub fn codebookId(name: []const u8) ?u8 {
@@ -76,10 +77,10 @@ pub fn counterCount(n: usize) usize {
 }
 
 /// Bits a trellis holds a value at, from its shape alone: the last dimension over 16 (format.py:86, `bits_of`).
-/// This, never the header's scalar, is a layer's width -- the pack mixes 4, 5 and 6 bits under one header.
-pub fn bitsOf(shape: []const usize) f64 {
-    std.debug.assert(shape.len >= 1);
-    return @as(f64, @floatFromInt(shape[shape.len - 1])) / 16;
+/// This, never the header's scalar, is a layer's width -- the pack mixes 4, 5 and 6 bits under one 4.05 header.
+/// `cfgs.bitsOf` is the one implementation of the rule (it also refuses a width ExLlamaV3 never writes).
+pub fn bitsOf(shape: []const i64) ?f64 {
+    return cfgs.bitsOf(shape);
 }
 
 /// The `strips` copy the dense kernels read (linear.py:48): `words` [K/16, N/16, W] -> [N/128, K/16, 8, W], each
@@ -738,12 +739,16 @@ test "strips puts each 128-column block's tiles in k order (linear.py:48)" {
 
 test "bitsOf reads the width off the trellis, per tensor" {
     // The pack's own headers: a 4-bit expert, a 6-bit q_proj, a 5-bit MTP pair.
-    try testing.expectEqual(@as(f64, 4), bitsOf(&.{ 160, 40, 64 }));
-    try testing.expectEqual(@as(f64, 6), bitsOf(&.{ 160, 768, 96 }));
-    try testing.expectEqual(@as(f64, 5), bitsOf(&.{ 160, 160, 80 }));
-    try testing.expectEqual(@as(?u32, 8), k2Of(bitsOf(&.{ 160, 40, 64 })));
-    try testing.expectEqual(@as(?u32, 12), k2Of(bitsOf(&.{ 160, 768, 96 })));
-    try testing.expectEqual(@as(?u32, 10), k2Of(bitsOf(&.{ 160, 160, 80 })));
+    try testing.expectEqual(@as(?f64, 4), bitsOf(&.{ 160, 40, 64 }));
+    try testing.expectEqual(@as(?f64, 6), bitsOf(&.{ 160, 768, 96 }));
+    try testing.expectEqual(@as(?f64, 5), bitsOf(&.{ 160, 160, 80 }));
+    try testing.expectEqual(@as(?u32, 8), k2Of(bitsOf(&.{ 160, 40, 64 }).?));
+    try testing.expectEqual(@as(?u32, 12), k2Of(bitsOf(&.{ 160, 768, 96 }).?));
+    try testing.expectEqual(@as(?u32, 10), k2Of(bitsOf(&.{ 160, 160, 80 }).?));
+    // a last dimension that is not a whole number of words (the reference's own refusal)
+    try testing.expectEqual(@as(?f64, null), bitsOf(&.{ 160, 40, 63 }));
+    try testing.expectEqual(@as(?f64, null), bitsOf(&.{ 160, 40, 61 })); // the n-gram table's row: 61 is odd
+    try testing.expectEqual(@as(?f64, null), bitsOf(&.{}));
 }
 
 test "the tile setting defaultTile picks is one the fatbin carries" {
