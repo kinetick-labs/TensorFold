@@ -17,10 +17,13 @@ pub const DType = enum {
     u64,
     i64,
     f64,
+    /// FP8 (OCP): ModelOpt's NVFP4 block scales, FP8 weights and FP8 n-gram tables; e4m3 has no infinities
+    f8_e4m3,
+    f8_e5m2,
 
     pub fn size(self: DType) usize {
         return switch (self) {
-            .bool, .u8, .i8 => 1,
+            .bool, .u8, .i8, .f8_e4m3, .f8_e5m2 => 1,
             .u16, .i16, .f16, .bf16 => 2,
             .u32, .i32, .f32 => 4,
             .u64, .i64, .f64 => 8,
@@ -28,7 +31,7 @@ pub const DType = enum {
     }
 
     pub fn parse(text: []const u8) ?DType {
-        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 } };
+        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 }, .{ "F8_E4M3", .f8_e4m3 }, .{ "F8_E5M2", .f8_e5m2 } };
         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
         return null;
     }
@@ -181,6 +184,20 @@ test "header entries" {
     try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 20));
 }
 
+test "FP8 dtypes parse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"w": {"dtype": "F8_E4M3", "shape": [4, 8], "data_offsets": [0, 32]},
+        \\ "v": {"dtype": "F8_E5M2", "shape": [2], "data_offsets": [32, 34]}}
+    ;
+    const h = try parseHeader(arena.allocator(), json, 34);
+    try std.testing.expectEqual(DType.f8_e4m3, h.get("w").?.dtype);
+    try std.testing.expectEqual(@as(usize, 1), DType.f8_e4m3.size());
+    try std.testing.expectEqual(DType.f8_e5m2, h.get("v").?.dtype);
+    try std.testing.expectEqual(@as(usize, 1), DType.f8_e5m2.size());
+}
+
 test "namespace selection admits text without interpreting vision layouts" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -229,5 +246,4 @@ test "text namespace filtering skips a vision rank-five entry without hiding inv
     const h = try parseHeaderPrefix(arena.allocator(), json, 26, "language_model.");
     try std.testing.expectEqual(@as(usize, 1), h.count());
     try std.testing.expect(h.contains("language_model.lm_head.weight"));
-    try std.testing.expectError(error.BadSafetensors, parseHeaderPrefix(arena.allocator(), json, 25, "language_model."));
-}
+    try std.testing.expectError(error.BadSafetensors, parseHeaderPrefix(arena.allocator(), json, 25, "language_model."));}
