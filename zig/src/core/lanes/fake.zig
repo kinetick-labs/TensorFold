@@ -39,8 +39,16 @@ pub const Fake = struct {
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+    /// backendSliced: prompt tokens a fill takes a step (its pass runs when they reach the prompt's length)
+    slice: usize = 3,
+    fills: std.ArrayList(Fill) = .empty,
+    fill_steps: u64 = 0, // prefill_step calls
+    widest_fill: usize = 0, // the most streams one prefill_step filled
+
+    const Fill = struct { s: *Stream, done: usize };
 
     pub fn deinit(x: *Fake) void {
+        x.fills.deinit(x.gpa);
         var it = x.lanes.valueIterator();
         while (it.next()) |l| freeLane(x.gpa, l);
         x.lanes.deinit(x.gpa);
@@ -55,6 +63,37 @@ pub const Fake = struct {
 
     pub fn backend(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+    }
+
+    /// The same target filling prompts in slices between rounds (prefill_begin / prefill_step).
+    pub fn backendSliced(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .prefill_begin = prefillBegin, .prefill_step = prefillStep } };
+    }
+
+    fn prefillBegin(ptr: *anyopaque, s: *Stream) anyerror!void {
+        const x = self(ptr);
+        try x.fills.append(x.gpa, .{ .s = s, .done = 0 });
+    }
+
+    fn prefillStep(ptr: *anyopaque, streams: []const *Stream, states: []be.FillState) anyerror!void {
+        const x = self(ptr);
+        x.fill_steps += 1;
+        x.widest_fill = @max(x.widest_fill, streams.len);
+        for (streams, states) |s, *st| {
+            const i = for (x.fills.items, 0..) |fl, k| {
+                if (fl.s == s) break k;
+            } else return error.NotFilling;
+            if (s.isCancelled()) {
+                _ = x.fills.swapRemove(i);
+                st.* = .cancelled;
+                continue;
+            }
+            x.fills.items[i].done += x.slice;
+            if (x.fills.items[i].done < s.prompt_len) continue;
+            _ = x.fills.swapRemove(i);
+            try prefill(ptr, s); // the whole pass's effect once its slices are in
+            st.* = .done;
+        }
     }
 
     fn self(ptr: *anyopaque) *Fake {
@@ -218,6 +257,10 @@ pub const Fake = struct {
 
     fn release(ptr: *anyopaque, s: *Stream) void {
         const x = self(ptr);
+        for (x.fills.items, 0..) |fl, k| if (fl.s == s) {
+            _ = x.fills.swapRemove(k);
+            break;
+        };
         if (x.lanes.fetchRemove(s)) |kv| {
             var l = kv.value;
             freeLane(x.gpa, &l);
