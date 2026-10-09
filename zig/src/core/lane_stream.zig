@@ -17,7 +17,8 @@ pub fn open(h: *LaneHost, job: *Job) bool {
     const r = job.request;
     var reuse: lanes.stream.Reuse = .{};
     // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-    if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+    // a prompt with images or video is neither resumed nor kept (Python keeps token-only states)
+    if (r.media == null) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
         job.entry = l.entry;
         job.kept0 = store.counts.kept;
         job.marks = l.marks;
@@ -59,6 +60,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .untaught = r.untaught,
         .images = r.images,
         .key = r.cache_key,
+        .media = r.media,
     }) catch {
         freeProposer(h, job);
         recalls.release(job);
