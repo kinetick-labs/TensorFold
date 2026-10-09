@@ -144,9 +144,10 @@ pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
     try f.mark(.stage);
     try f.t.embed(b.ids, f.w.embed, b.mtp_e, n, D, 1);
     try f.t.rmsnorm(b.mtp_e, D, m.norm_e, b.mixed, b.xs_mixed, n, D, null, f.eps);
-    try f.mmx(b.mixed, D, b.xs_mixed, m.fc_e, b.mtp_eo, false, n);
+    // an EXL3 pack keeps the MTP fc as trellis (`fc_e3`/`fc_h3`), leaving the bf16 `Rows` unset: the head's X3 arm.
+    if (m.fc_e3) |q| try f.x3mm(null, b.mixed, D, 1, q, b.mtp_eo, 1, n) else try f.mmx(b.mixed, D, b.xs_mixed, m.fc_e, b.mtp_eo, false, n);
     try f.t.rmsnorm(b.mtp_in, Wd, m.norm_h, b.mtp_hn, b.mtp_xh, n, Wd, null, f.eps);
-    try f.mmx(b.mtp_hn, D, b.mtp_xh, m.fc_h, b.mtp_hs, false, n * S);
+    if (m.fc_h3) |q| try f.x3mm(null, b.mtp_hn, D, 1, q, b.mtp_hs, 1, n * S) else try f.mmx(b.mtp_hn, D, b.mtp_xh, m.fc_h, b.mtp_hs, false, n * S);
     try f.t.addStreams(b.mtp_eo, b.mtp_hs, b.h, n, D, S);
     try f.mark(.mtp_in);
     f.pf_moe = Forward.prefetchOf(m.mixer.down);
