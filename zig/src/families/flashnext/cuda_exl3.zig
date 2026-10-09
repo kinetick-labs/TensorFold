@@ -75,6 +75,92 @@ pub fn counterCount(n: usize) usize {
     return 8 * (n / 128);
 }
 
+/// Bits a trellis holds a value at, from its shape alone: the last dimension over 16 (format.py:86, `bits_of`).
+/// This, never the header's scalar, is a layer's width -- the pack mixes 4, 5 and 6 bits under one header.
+pub fn bitsOf(shape: []const usize) f64 {
+    std.debug.assert(shape.len >= 1);
+    return @as(f64, @floatFromInt(shape[shape.len - 1])) / 16;
+}
+
+/// The `strips` copy the dense kernels read (linear.py:48): `words` [K/16, N/16, W] -> [N/128, K/16, 8, W], each
+/// 128-column block's eight tiles in k order and each tile's words together. `dst` and `src` may not overlap.
+pub fn strips(dst: []u32, src: []const u32, kt: usize, nt: usize, w: usize) !void {
+    const words = kt * nt * w;
+    if (dst.len < words or src.len < words) return error.Short;
+    if (nt % 8 != 0) return error.UnexpectedTensor;
+    for (0..kt) |t| {
+        for (0..nt) |n| {
+            const at = ((n / 8) * kt + t) * 8 * w + (n % 8) * w;
+            @memcpy(dst[at..][0..w], src[(t * nt + n) * w ..][0..w]);
+        }
+    }
+}
+
+/// The tile setting the grouped GEMM takes for a K -> N projection (experts.py:134): GLM's own when it divides,
+/// then the narrower fallbacks, so rows stay independent and the arithmetic order matches GLM bit for bit.
+pub const Tile = struct { nt: usize, w: usize, sk: usize, pf: usize };
+
+pub const glm_gateup: Tile = .{ .nt = 8, .w = 4, .sk = 4, .pf = 1 };
+pub const glm_down: Tile = .{ .nt = 8, .w = 4, .sk = 1, .pf = 1 };
+
+pub fn defaultTile(k: usize, n: usize, gateup: bool) !Tile {
+    const cands = [5]Tile{
+        if (gateup) glm_gateup else glm_down,
+        .{ .nt = 8, .w = 4, .sk = 2, .pf = 1 },
+        .{ .nt = 8, .w = 4, .sk = 1, .pf = 1 },
+        .{ .nt = 4, .w = 4, .sk = 2, .pf = 2 },
+        .{ .nt = 4, .w = 4, .sk = 1, .pf = 2 },
+    };
+    for (cands) |t| {
+        if (k % (16 * t.sk * t.w) == 0 and n % (16 * t.nt) == 0) return t;
+    }
+    return error.NoTileSetting;
+}
+
+/// Trellis bytes one expert's gate, up and down read: (D*I/256) * (k2g + k2u + k2d) * 16 (experts.py:120).
+pub fn expertBytes(dims: usize, width: usize, k2_g: u32, k2_u: u32, k2_d: u32) u64 {
+    return @as(u64, @intCast(dims * width / 256)) * (k2_g + k2_u + k2_d) * 16;
+}
+
+/// One rank's routed experts as the kernels take them: per-expert trellis pointers and widths, the six stacked
+/// scale tables, and the tile settings (experts.py:83's `Exl3RoutedExperts`). The loader fills addresses; this is
+/// the shape both sides agree on.
+pub const Experts = struct {
+    gate_ptr: u64 = 0,
+    up_ptr: u64 = 0,
+    down_ptr: u64 = 0,
+    gate_k2: u64 = 0,
+    up_k2: u64 = 0,
+    down_k2: u64 = 0,
+    suh_g: u64 = 0,
+    suh_u: u64 = 0,
+    svh_g: u64 = 0,
+    svh_u: u64 = 0,
+    suh_d: u64 = 0,
+    svh_d: u64 = 0,
+    trellis_bytes: u64 = 0,
+    count: u32 = 0,
+    dims: u32 = 0,
+    width: u32 = 0,
+    cb: u8 = 2,
+    k2_gu: [2]u32 = .{ 0, 0 },
+    k2_d: [2]u32 = .{ 0, 0 },
+    tile_gu: Tile = glm_gateup,
+    tile_d: Tile = glm_down,
+};
+
+/// The k2 envelope a set of per-expert widths covers, as `prepare` records it (min, max).
+pub fn envelope(k2s_: []const u32) [2]u32 {
+    if (k2s_.len == 0) return .{ 0, 0 };
+    var lo = k2s_[0];
+    var hi = k2s_[0];
+    for (k2s_) |k| {
+        lo = @min(lo, k);
+        hi = @max(hi, k);
+    }
+    return .{ lo, hi };
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Grids, blocks and dynamic shared memory, one helper a kernel.
 // ---------------------------------------------------------------------------------------------------------------
@@ -628,6 +714,64 @@ test "the range instance covers the widths a group can mix" {
     try testing.expectEqual(@as(usize, 1), tileIndex(8, 4, 2).?);
     try testing.expectEqual(@as(usize, 2), tileIndex(4, 4, 2).?);
     try testing.expectEqual(@as(?usize, null), tileIndex(16, 4, 1));
+}
+
+test "strips puts each 128-column block's tiles in k order (linear.py:48)" {
+    // kt 2, nt 16 (two blocks), one word a tile: source [t][n] becomes [b][t][s], written out by hand.
+    var src: [32]u32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast(i);
+    var dst: [32]u32 = undefined;
+    try strips(&dst, &src, 2, 16, 1);
+    const want = [32]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31 };
+    try testing.expectEqualSlices(u32, &want, &dst);
+    // three words a tile: each tile stays contiguous, and the blocks and k tiles swap places
+    var src3: [96]u32 = undefined;
+    for (&src3, 0..) |*v, i| v.* = @intCast(i);
+    var dst3: [96]u32 = undefined;
+    try strips(&dst3, &src3, 2, 16, 3);
+    try testing.expectEqualSlices(u32, src3[0..3], dst3[0..3]); // block 0, k tile 0, sub-tile 0
+    try testing.expectEqualSlices(u32, src3[48..51], dst3[24..27]); // block 0, k tile 1 -> source (1, n 0)
+    try testing.expectEqualSlices(u32, src3[24..27], dst3[48..51]); // block 1, k tile 0 -> source (0, n 8)
+    try testing.expectError(error.Short, strips(dst3[0..95], &src3, 2, 16, 3));
+    try testing.expectError(error.UnexpectedTensor, strips(&dst3, &src3, 2, 12, 3)); // not whole 128-column blocks
+}
+
+test "bitsOf reads the width off the trellis, per tensor" {
+    // The pack's own headers: a 4-bit expert, a 6-bit q_proj, a 5-bit MTP pair.
+    try testing.expectEqual(@as(f64, 4), bitsOf(&.{ 160, 40, 64 }));
+    try testing.expectEqual(@as(f64, 6), bitsOf(&.{ 160, 768, 96 }));
+    try testing.expectEqual(@as(f64, 5), bitsOf(&.{ 160, 160, 80 }));
+    try testing.expectEqual(@as(?u32, 8), k2Of(bitsOf(&.{ 160, 40, 64 })));
+    try testing.expectEqual(@as(?u32, 12), k2Of(bitsOf(&.{ 160, 768, 96 })));
+    try testing.expectEqual(@as(?u32, 10), k2Of(bitsOf(&.{ 160, 160, 80 })));
+}
+
+test "the tile setting defaultTile picks is one the fatbin carries" {
+    // The pack's projection: D 2560 -> I 640 for gate and up, I 640 -> D 2560 for down.
+    const gu = try defaultTile(2560, 640, true);
+    try testing.expectEqual(glm_gateup, gu);
+    try testing.expect(tileIndex(gu.nt, gu.w, gu.pf) != null); // (8, 4, 1) is a compiled instance
+    const d = try defaultTile(640, 2560, false);
+    try testing.expectEqual(glm_down, d);
+    try testing.expect(tileIndex(d.nt, d.w, d.pf) != null);
+    // gate/up of a K GLM's own setting cannot divide falls back, still onto a compiled instance
+    const fb = try defaultTile(640, 2560, true);
+    try testing.expectEqual(@as(usize, 2), fb.sk);
+    try testing.expect(tileIndex(fb.nt, fb.w, fb.pf) != null);
+    // every candidate the reference lists resolves to one of the three settings in the symbol table
+    for ([_]Tile{ glm_gateup, glm_down, .{ .nt = 8, .w = 4, .sk = 2, .pf = 1 }, .{ .nt = 4, .w = 4, .sk = 2, .pf = 2 }, .{ .nt = 4, .w = 4, .sk = 1, .pf = 2 } }) |t| {
+        try testing.expect(tileIndex(t.nt, t.w, t.pf) != null);
+    }
+    try testing.expectError(error.NoTileSetting, defaultTile(80, 640, true));
+}
+
+test "an expert's trellis bytes and a layer's width envelope" {
+    // 4-bit experts at D 2560, I 640: (160 * 40) tiles * 64 words * 2 bytes = 819 200 B a projection.
+    try testing.expectEqual(@as(u64, 819_200), expertBytes(2560, 640, 8, 0, 0));
+    try testing.expectEqual(@as(u64, 2_457_600), expertBytes(2560, 640, 8, 8, 8));
+    try testing.expectEqual([2]u32{ 8, 12 }, envelope(&.{ 12, 8, 12, 8 })); // a layer mixing 4- and 6-bit experts
+    try testing.expectEqual([2]u32{ 10, 10 }, envelope(&.{10}));
+    try testing.expectEqual([2]u32{ 0, 0 }, envelope(&.{}));
 }
 
 test "the widths the loaders will derive resolve to a table row" {
