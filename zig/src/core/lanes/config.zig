@@ -40,6 +40,9 @@ pub const Model = struct {
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus a slack
     draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: the Constants' own)
+    draft_stops: bool = false, // the head stops each chain itself (a running-product rule): ask the most drafts
+    draft_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live
+    join_batch: bool = false, // a joining stream's first drafts may wait for the next round (the prompt's last row is kept a stream)
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
@@ -75,6 +78,9 @@ pub const Config = struct {
     batch_streams: u32,
     node_probabilities: bool,
     granted_depth: bool = false, // Model.granted_depth
+    head_stops: bool = false, // the head stops each chain itself: every ask is the most drafts the room allows
+    head_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live
+    join_batch: bool = false, // joiners' first drafts go out together before the next round (first tokens first)
     fill_lanes: u32 = 0, // rows a window may grow to with suffix-match branches (0: off; lanes/fill.zig)
     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
@@ -161,6 +167,9 @@ pub const Config = struct {
             .batch_streams = if (streams) (if (m.max_streams != 0) m.max_streams else 32) else 1,
             .node_probabilities = m.draft_probabilities or m.draft_confidence != null,
             .granted_depth = m.granted_depth and m.draft_probabilities,
+            .head_stops = m.draft_stops,
+            .head_stops_most = m.draft_stops_most,
+            .join_batch = m.join_batch,
             .draft_streams = m.draft_streams,
             .head_trees = m.head_trees,
             .join_tail = m.join_tail,
