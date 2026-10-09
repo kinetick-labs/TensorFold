@@ -241,7 +241,9 @@ fn download(a: Allocator, io: std.Io, client: *std.http.Client, out: *std.Io.Wri
     }
     try file.setLength(io, total);
     file.sync(io) catch {};
-    try std.Io.Dir.renameAbsolute(partial_path, final_path, io);
+    // `rename` through the cwd, not `renameAbsolute`: the paths come from the caller's cache root
+    // (a relative HF_HUB_CACHE is legal), so the pair need not be absolute; the syscall is the same.
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), partial_path, std.Io.Dir.cwd(), final_path, io);
     try out.print("  {s}: {d:.2} MiB\n", .{ e.path, @as(f64, @floatFromInt(total)) / (1 << 20) });
     return final_name;
 }

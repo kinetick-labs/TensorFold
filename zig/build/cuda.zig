@@ -191,6 +191,16 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     cli.addImport("nemotron", mods.nemotron);
     cli.addImport("flashnext", mods.flashnext);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+    // The checkpoint CLI (models, info, pull) against a synthetic cache and a fake hub: the same test root
+    // the Metal path wires (build.zig, `test-cli`), which the Linux host tests used to leave out.
+    const cli_checks = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/cli/tests.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "native_engines", .module = native }},
+    }) });
+    step.dependOn(&b.addRunArtifact(cli_checks).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
