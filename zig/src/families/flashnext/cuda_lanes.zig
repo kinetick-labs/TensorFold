@@ -1208,6 +1208,8 @@ pub const Toy = struct {
     const Held = struct { seq: *Seq, tokens: [max_rows]u32, n: usize };
 
     gpa: std.mem.Allocator,
+    /// the sequence rows this toy serves, as cuda_engine's Engine.max_len (cuda_native's Open.stream_bytes reads it)
+    max_len: usize = 0,
     stream: ?*anyopaque = null, // the engine's stream (cuda_native's records run on it)
     budget: struct { limit: usize } = .{ .limit = std.math.maxInt(usize) },
     round_windows: [max_streams]Held = undefined,
@@ -1238,9 +1240,9 @@ pub const Toy = struct {
 
     /// As cuda_engine's Engine.init, for cuda_native.openOn's tests.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: anytype, dir: []const u8, kernels: []const u8, o: anytype) !*Toy {
-        _ = .{ io, ctx, dir, kernels, o.context, o.mtp, o.rank, o.world, o.comm, o.yarn, o.depth, o.streams };
+        _ = .{ io, ctx, dir, kernels, o.mtp, o.rank, o.world, o.comm, o.yarn, o.depth, o.streams };
         const t = try gpa.create(Toy);
-        t.* = .{ .gpa = gpa };
+        t.* = .{ .gpa = gpa, .max_len = o.context + 1 };
         return t;
     }
     pub fn deinit(t: *Toy) void {

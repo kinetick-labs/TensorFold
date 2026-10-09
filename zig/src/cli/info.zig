@@ -30,8 +30,15 @@ pub fn run(a: Allocator, io: std.Io, out: *std.Io.Writer, env: ?*const std.proce
     };
     const weights = try hub.sizeOf(a, io, dir);
     try out.print("family: {s} ({s})\n", .{ family.title, family.model_type });
-    if (hub.quantization(a, io, dir)) |q| {
-        try out.print("format: {d}-bit, group {d}\n", .{ q.bits, q.group });
+    if (hub.format(a, io, dir)) |f| switch (f) {
+        .affine => |q| try out.print("format: {d}-bit, group {d}\n", .{ q.bits, q.group }),
+        .exl3 => |q| {
+            try out.print("format: exl3, codebook {s}", .{q.codebook});
+            if (q.bits) |b| try out.print(", mean {d:.2} bits/weight", .{b});
+            if (q.head_bits) |h| try out.print(", head {d}", .{h});
+            if (q.mtp_bits) |m| try out.print(", mtp {d}", .{m});
+            try out.writeAll("\n");
+        },
     } else {
         try out.print("format: full precision\n", .{});
     }
@@ -75,6 +82,17 @@ test "info prints family, format, context, weights and floor for a cached checkp
     try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ root, "models--Org--Draft/snapshots/rev2/config.json" }), .data = "{\"model_type\": \"gemma4\"}" });
     try std.testing.expectEqual(@as(u8, 1), try run(a, io, &refused.writer, null, root, "Org/Draft"));
     try std.testing.expect(has(refused.written(), "no registered Zig family serves model_type gemma4"));
+
+    // An ExLlamaV3 pack: the format line names the codebook and the two fixed heads off the config alone,
+    // while the per-tensor width stays a load-time read (format.py:bits_of).
+    try w.createDirPath(io, try std.fs.path.join(a, &.{ root, "models--Org--Exl3/snapshots/rev3" }));
+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ root, "models--Org--Exl3/snapshots/rev3/config.json" }), .data = "{\"model_type\": \"qwen4_exp\", \"quantization_config\": {\"quant_method\": \"exl3\", \"version\": \"1.4.4\", \"bits\": 4.05, \"head_bits\": 6, \"mtp_bits\": 4, \"codebook\": \"mul1\", \"out_scales\": \"always\"}}" });
+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ root, "models--Org--Exl3/snapshots/rev3/weights.safetensors" }), .data = &weights });
+
+    var exl3: std.Io.Writer.Allocating = .init(a);
+    try std.testing.expectEqual(@as(u8, 0), try run(a, io, &exl3.writer, null, root, "Org/Exl3"));
+    try std.testing.expect(has(exl3.written(), "family: Qwen3.8 Flash Next (qwen4_exp)"));
+    try std.testing.expect(has(exl3.written(), "format: exl3, codebook mul1, mean 4.05 bits/weight, head 6, mtp 4"));
 }
 
 fn has(text: []const u8, needle: []const u8) bool {

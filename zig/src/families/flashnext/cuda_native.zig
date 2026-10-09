@@ -20,10 +20,13 @@ const kvd = @import("cuda_state.zig");
 
 pub const model_type = "qwen4_exp";
 /// Weight formats as tensorfold.native.contract.weight_format names them: NVIDIA's ModelOpt NVFP4 export (top-10;
-/// its quant_algo MIXED_PRECISION, NVFP4 experts) and
-/// INT4-AutoRound's GPTQ int4 (azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, top-5); the engine reads either
-/// from the checkpoint's quantization_config (cuda_config.zig: quant_method "modelopt" or "gptq").
-pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-precision", "gptq-b4" };
+/// its quant_algo MIXED_PRECISION, NVFP4 experts), INT4-AutoRound's GPTQ int4
+/// (azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, top-5) and turboderp's ExLlamaV3 pack the rig serves
+/// (`exl3-b4-05`: quant_method "exl3", codebook mul1, mean 4.05 bpw); the engine reads the quant_method and the
+/// EXL3 header from the checkpoint's quantization_config (cuda_config.zig). The config and the per-tensor widths
+/// are read today; the EXL3 weight loaders are still landing, so this names the format the family reads, not one
+/// it can already serve end to end.
+pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-precision", "gptq-b4", "exl3-b4-05" };
 /// The checkpoint's native window; 1,048,576 with YaRN (work/PLAN.md, "1M context").
 pub const default_context: i64 = 262144;
 pub const prefill_step: u32 = 2048;
@@ -34,7 +37,6 @@ pub const prompt_rows: u32 = kvd.prefill_rows;
 /// `prompt_cache_gib`: the kept prompt states' budget (null: a quarter of the sequences' memory, 16 GiB at most;
 /// 0: no prompt reuse). `kv_dtype`: the attention caches' format (--kv-dtype bf16|fp8; both ranks must agree).
 pub const Options = struct { context: usize, drafts: bool, parallel: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: []const u8 = "", master_port: u16 = 29551, kv_dtype: kvd.KvDtype = .bf16, vision: bool = false };
-
 
 /// The engine takes image and video rows (Request.media: rotary positions MODE 2, features into the prompt rows).
 pub const media = true;

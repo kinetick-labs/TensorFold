@@ -41,7 +41,6 @@ pub fn cacheDir(a: Allocator, env: ?*const std.process.Environ.Map, override: ?[
     const home = get(env, "HOME") orelse "";
     if (get(env, "HF_HOME")) |h| return std.fs.path.join(a, &.{ h, "hub" });
     return std.fs.path.join(a, &.{ home, ".cache", "huggingface", "hub" });
-
 }
 
 /// The repo's cache folder name: models--org--name.
@@ -114,17 +113,54 @@ pub fn modelType(a: Allocator, io: std.Io, dir: []const u8) []const u8 {
     return if (t == .string) t.string else "unknown";
 }
 
-/// config.json's quantization: bits and group size, when the checkpoint is MLX-affine quantized.
-pub fn quantization(a: Allocator, io: std.Io, dir: []const u8) ?struct { bits: u64, group: u64 } {
+/// The quantization format a config.json declares, as the Zig families read it: MLX's affine
+/// `quantization` block, or an ExLlamaV3 `quantization_config` (quant_method "exl3").
+pub const Format = union(enum) {
+    affine: struct { bits: u64, group: u64 },
+    /// An EXL3 pack's *mean* width and two fixed heads; the real width is per tensor and comes off
+    /// each trellis shape at load (format.py:bits_of), so it is not a config field.
+    exl3: struct { codebook: []const u8, bits: ?f64, head_bits: ?i64, mtp_bits: ?i64 },
+};
+
+/// config.json's quantization, or null for an unquantized checkpoint. An `exl3` codebook string
+/// points into `text`, which the caller's allocator owns for as long as the `Format` is read.
+pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
     const text = readSmall(a, io, pathJoin(a, dir, "config.json") catch return null) orelse return null;
     var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const q = parsed.value.object.get("quantization") orelse return null;
-    if (q != .object) return null;
-    const bits = if (q.object.get("bits")) |b| (if (b == .integer) b.integer else return null) else return null;
-    const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else 32) else 32;
-    return .{ .bits = @intCast(bits), .group = @intCast(group) };
+    const root = parsed.value.object;
+    // ExLlamaV3: `quantization_config` (or `quantization`) carrying quant_method "exl3".
+    for ([_]?std.json.Value{ root.get("quantization_config"), root.get("quantization") }) |block| {
+        const q = block orelse continue;
+        if (q != .object) continue;
+        const method = q.object.get("quant_method") orelse continue;
+        if (method != .string or !std.ascii.eqlIgnoreCase(method.string, "exl3")) continue;
+        const codebook = if (q.object.get("codebook")) |c| (if (c == .string) c.string else "mul1") else "mul1";
+        const bits: ?f64 = if (q.object.get("bits")) |b|
+            (if (b == .float) b.float else if (b == .integer) @floatFromInt(b.integer) else null)
+        else
+            null;
+        return .{ .exl3 = .{
+            .codebook = codebook,
+            .bits = bits,
+            .head_bits = intOrNull(q.object.get("head_bits")),
+            .mtp_bits = intOrNull(q.object.get("mtp_bits")),
+        } };
+    }
+    // MLX affine: `quantization` with `bits` and `group_size`.
+    if (root.get("quantization")) |q| {
+        if (q != .object) return null;
+        const bits = if (q.object.get("bits")) |b| (if (b == .integer) b.integer else return null) else return null;
+        const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else 32) else 32;
+        return .{ .affine = .{ .bits = @intCast(bits), .group = @intCast(group) } };
+    }
+    return null;
+}
+
+fn intOrNull(v: ?std.json.Value) ?i64 {
+    const x = v orelse return null;
+    return if (x == .integer) x.integer else null;
 }
 
 /// Bytes of the files under `dir`, symlinks followed.
@@ -182,9 +218,9 @@ test "cache layout helpers read a synthetic cache" {
     const snapshot = (try cachedSnapshot(a, io, hub, "Org/Name")).?;
     try std.testing.expect(std.mem.endsWith(u8, snapshot, "abc123"));
     try std.testing.expectEqualStrings("qwen4_exp", modelType(a, io, snapshot));
-    const q = quantization(a, io, snapshot).?;
-    try std.testing.expectEqual(@as(u64, 6), q.bits);
-    try std.testing.expectEqual(@as(u64, 32), q.group);
+    const q = format(a, io, snapshot).?;
+    try std.testing.expectEqual(@as(u64, 6), q.affine.bits);
+    try std.testing.expectEqual(@as(u64, 32), q.affine.group);
     try std.testing.expect((try sizeOf(a, io, snapshot)) >= 4096);
     const missing = try cachedSnapshot(a, io, hub, "Org/Other");
     try std.testing.expect(missing == null);
