@@ -27,6 +27,7 @@ pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-pr
 /// The checkpoint's native window; 1,048,576 with YaRN (work/PLAN.md, "1M context").
 pub const default_context: i64 = 262144;
 pub const prefill_step: u32 = 2048;
+pub const prompt_rows: u32 = kvd.prefill_rows;
 
 /// `tp` 2: rank 0 serves and leads, rank 1 follows it over the link to `master`:`master_port` (cuda_link.zig).
 /// `parallel`: streams one shared forward holds (--parallel; the engine's Options.streams, the lanes' max_streams).
@@ -56,6 +57,8 @@ pub const Loaded = struct {
     backend: lanes.backend.Backend,
     facts: lanes.Model,
     rows: u32,
+    /// Device bytes each admitted stream allocates for its own sequence (caches, state, head caches).
+    stream_bytes: usize,
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     /// rank 1's loop: rank 0's requests in step until it stops
@@ -161,6 +164,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
         .backend = backend,
         .facts = own.lanes.facts(),
         .rows = if (o.drafts) @intCast(depth + 1) else 1,
+        .stream_bytes = own.e.seqBytes(own.e.max_len),
         .ctx = own,
         .deinit = Own.release,
         .follow = if (o.tp == 2 and o.rank == 1) Own.follow else null,
