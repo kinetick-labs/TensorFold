@@ -411,9 +411,8 @@ pub const LaneHost = struct {
         const began = job.began;
         // a backend that fills prompts between rounds starts this one and admits the next (prompts that arrive
         // together fill together); the fill hook reports it in
-        const filling = h.core.beginStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, @errorName(e));
+        const filling = h.core.beginStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
         if (filling) return true;
->>>>>>> theirs
         h.prefilled(job, began);
         if (h.deliver(job)) h.remove(job);
         return true;
