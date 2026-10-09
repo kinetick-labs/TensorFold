@@ -10,18 +10,25 @@ const launch = @import("launch.zig");
 
 pub const Node = abi.GraphNode;
 
+/// A check for the graph calls a caller recovers from (capture end, instantiate, upload): a warning, not an error.
+fn soft(d: *const Driver, res: abi.Result, what: []const u8) Error!void {
+    if (res == abi.success) return;
+    std.log.warn("{s}: {s} ({d}) {s}", .{ what, d.errorName(res), res, d.errorText(res) });
+    return if (res == 2) error.OutOfDeviceMemory else error.CudaFailed;
+}
+
 /// Starts capturing `stream`; every launch on it is recorded until `endCapture`, nothing runs.
 pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
     const source = @import("copy_source.zig");
     try source.captureBegin(stream, mode);
     errdefer source.captureEnd(stream);
-    try stream.d.check(stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
+    try soft(stream.d, stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
 }
 
 /// Ends the capture; an invalidated capture returns an error and no graph.
 pub fn endCapture(stream: Stream) Error!Graph {
     var g: abi.Graph = null;
-    try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+    try soft(stream.d, stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
     @import("copy_source.zig").captureEnd(stream);
     return .{ .d = stream.d, .handle = g };
 }
@@ -99,7 +106,7 @@ pub const Graph = struct {
 
     pub fn instantiate(self: Graph) Error!Exec {
         var e: abi.GraphExec = null;
-        try self.d.check(self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
+        try soft(self.d, self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
         return .{ .d = self.d, .handle = e };
     }
 };
@@ -115,7 +122,7 @@ pub const Exec = struct {
 
     /// Moves the graph's work to the device ahead of the first launch, so that launch pays no setup.
     pub fn upload(self: Exec, stream: Stream) Error!void {
-        try self.d.check(self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
+        try soft(self.d, self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
     }
 
     pub fn launchOn(self: Exec, stream: Stream) Error!void {
