@@ -43,7 +43,7 @@ const Stream = lanes.Stream;
 const Sampling = lanes.Sampling;
 const Allocator = std.mem.Allocator;
 
-pub const Op = enum(u8) { prefill = 1, first = 2, queue = 3, verify = 4, keep = 5, draft = 6, unspeculate = 7, release = 8, note = 9, prefill_begin = 10, prefill_step = 11, prefill_many = 12, _ };
+pub const Op = enum(u8) { prefill = 1, first = 2, queue = 3, verify = 4, keep = 5, draft = 6, unspeculate = 7, release = 8, note = 9, prefill_begin = 10, prefill_step = 11, _ };
 
 pub const StreamSpec = struct {
     key: u64,
@@ -103,11 +103,9 @@ pub const Call = union(enum) {
     release: u64,
     /// the lane backend's own message to rank 1 (rank 0's prompt-cache decisions), opaque here
     note: []const u8,
-    /// a prompt that fills between rounds: its start (prefill's fields), then slices of every filling stream
+    /// a prompt that fills between rounds: its start (prefill's fields) on its first slice, then the stream's key
     prefill_begin: StreamSpec,
-    prefill_step: []const u64,
-    /// a burst of prompts prefilled together (each stream's prefill fields)
-    prefill_many: []const StreamSpec,
+    prefill_step: u64,
 
     fn op(c: Call) Op {
         return switch (c) {
@@ -122,7 +120,6 @@ pub const Call = union(enum) {
             .note => .note,
             .prefill_begin => .prefill_begin,
             .prefill_step => .prefill_step,
-            .prefill_many => .prefill_many,
         };
     }
 };
@@ -210,10 +207,6 @@ pub fn encode(list: *std.ArrayList(u8), gpa: Allocator, call: Call) !void {
     try o.int(u8, @backingInt(call.op()));
     switch (call) {
         .prefill, .prefill_begin => |p| try o.spec(p),
-        .prefill_many => |ps| {
-            try o.int(u32, @intCast(ps.len));
-            for (ps) |p| try o.spec(p);
-        },
         .first => |f| {
             try o.int(u64, f.key);
             try o.int(u64, f.position);
@@ -247,7 +240,7 @@ pub fn encode(list: *std.ArrayList(u8), gpa: Allocator, call: Call) !void {
         },
         .unspeculate, .release => |key| try o.int(u64, key),
         .note => |bytes| try o.many(u8, bytes),
-        .prefill_step => |keys| try o.many(u64, keys),
+        .prefill_step => |key| try o.int(u64, key),
     }
 }
 
@@ -345,12 +338,7 @@ pub fn decode(arena: Allocator, bytes: []const u8) !Call {
     const call: Call = switch (op) {
         .prefill => .{ .prefill = try i.spec() },
         .prefill_begin => .{ .prefill_begin = try i.spec() },
-        .prefill_step => .{ .prefill_step = try i.many(u64) },
-        .prefill_many => blk: {
-            const ps = try arena.alloc(StreamSpec, try i.count());
-            for (ps) |*p| p.* = try i.spec();
-            break :blk .{ .prefill_many = ps };
-        },
+        .prefill_step => .{ .prefill_step = try i.int(u64) },
         .first => .{ .first = .{ .key = try i.int(u64), .position = try i.int(u64) } },
         .queue => .{ .queue = .{ .key = try i.int(u64), .feed = try i.feed(), .position = try i.int(u64) } },
         .verify => .{ .verify = try i.windows() },
@@ -979,9 +967,7 @@ pub const Leader = struct {
             .probabilities = if (v.probabilities != null) probabilitiesFn else null,
             .tree = if (v.tree != null) treeFn else null,
             .alternatives = if (v.alternatives != null) alternativesFn else null,
-            .prefill_begin = if (v.prefill_begin != null and v.prefill_step != null) prefillBeginFn else null,
-            .prefill_step = if (v.prefill_begin != null and v.prefill_step != null) prefillStepFn else null,
-            .prefill_many = if (v.prefill_many != null) prefillManyFn else null,
+            .prefill_step = if (v.prefill_step != null) prefillStepFn else null,
             .release = releaseFn,
         };
         return .{ .ptr = self, .vtable = &self.vtable };
@@ -1007,40 +993,20 @@ pub const Leader = struct {
         };
     }
 
-    fn prefillBeginFn(p: *anyopaque, s: *Stream) anyerror!void {
+    /// One slice of a stream's prompt (the inner backend's `prefill_step`): rank 1 hears the stream's spec on its
+    /// first slice (the pass's admission and agreements), then only the key, and runs its own slice.
+    fn prefillStepFn(p: *anyopaque, s: *Stream) anyerror!bool {
         const self = of(p);
-        try self.open.put(self.gpa, keyOf(s), {});
-        try self.send(.{ .prefill_begin = specOf(s) }, true);
-        self.arm(0);
-        defer self.disarm();
-        return self.inner.vtable.prefill_begin.?(self.inner.ptr, s);
-    }
-
-    fn prefillStepFn(p: *anyopaque, streams: []const *Stream, states: []be.FillState) anyerror!void {
-        const self = of(p);
-        const keys = try self.scratch().alloc(u64, streams.len);
-        for (keys, streams) |*k, s| k.* = keyOf(s);
-        try self.send(.{ .prefill_step = keys }, true);
-        self.arm(0);
-        defer self.disarm();
-        return self.inner.vtable.prefill_step.?(self.inner.ptr, streams, states);
-    }
-
-    fn prefillManyFn(p: *anyopaque, ss: []const *Stream) anyerror!void {
-        const self = of(p);
-        // an image or video prompt prefills alone: its table and features go by broadcast inside its own prefill
-        for (ss) |s| if (s.media != null) return error.BurstRefused;
-        const specs = try self.scratch().alloc(StreamSpec, ss.len);
-        var seconds: usize = 0;
-        for (specs, ss) |*sp, s| {
-            try self.open.put(self.gpa, keyOf(s), {});
-            sp.* = specOf(s);
-            seconds += s.prompt_len;
+        const key = keyOf(s);
+        if (!self.open.contains(key)) {
+            try self.open.put(self.gpa, key, {});
+            try self.send(.{ .prefill_begin = specOf(s) }, true);
+        } else {
+            try self.send(.{ .prefill_step = key }, true);
         }
-        try self.send(.{ .prefill_many = specs }, true);
-        self.arm(seconds / 400);
+        self.arm(0);
         defer self.disarm();
-        return self.inner.vtable.prefill_many.?(self.inner.ptr, ss);
+        return self.inner.vtable.prefill_step.?(self.inner.ptr, s);
     }
 
     fn prefillFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -1211,11 +1177,6 @@ pub const Follower = struct {
         self.calls += 1;
         if (self.watch) |w| w.arm(w.base_s + switch (call) {
             .prefill => |p| p.prompt.len / 400,
-            .prefill_many => |ps| blk: {
-                var rows: usize = 0;
-                for (ps) |p| rows += p.prompt.len;
-                break :blk rows / 400;
-            },
             else => 0,
         });
         defer if (self.watch) |w| w.disarm();
@@ -1272,23 +1233,13 @@ pub const Follower = struct {
         const b = self.inner;
         switch (call) {
             .prefill => |p| try b.prefill(try self.mirror(p)),
-            .prefill_many => |ps| {
-                const f = b.vtable.prefill_many orelse return error.NoBursts;
-                const ss = try a.alloc(*Stream, ps.len);
-                for (ss, ps) |*x, p| x.* = try self.mirror(p);
-                try f(b.ptr, ss);
-            },
             .prefill_begin => |p| {
-                const f = b.vtable.prefill_begin orelse return error.NoFills;
-                try f(b.ptr, try self.mirror(p));
-            },
-            .prefill_step => |keys| {
                 const f = b.vtable.prefill_step orelse return error.NoFills;
-                const ss = try a.alloc(*Stream, keys.len);
-                for (ss, keys) |*x, k| x.* = try self.stream(k);
-                const states = try a.alloc(be.FillState, keys.len);
-                @memset(states, .filling);
-                try f(b.ptr, ss, states);
+                _ = try f(b.ptr, try self.mirror(p));
+            },
+            .prefill_step => |key| {
+                const f = b.vtable.prefill_step orelse return error.NoFills;
+                _ = try f(b.ptr, try self.stream(key));
             },
             .first => |f| _ = try b.first(try self.stream(f.key), f.position),
             .queue => |q| _ = try b.queue(try self.stream(q.key), q.feed, q.position),
@@ -1377,15 +1328,8 @@ test "every call survives its frame bit for bit, and a cut frame is refused" {
         try std.testing.expect(c.prefill.sampling == null and !c.prefill.drafts and c.prefill.prompt.len == 0);
     }
     {
-        const specs = [_]StreamSpec{
-            .{ .key = 5, .max_new = 8, .drafts = true, .sampling = null, .prompt = &.{ 1, 2, 3 }, .eos = &.{9}, .chunks = &.{} },
-            .{ .key = 6, .max_new = 9, .drafts = false, .sampling = null, .prompt = &.{ 4, 5 }, .eos = &.{}, .chunks = &.{} },
-        };
-        const c = try roundTrip(ar, .{ .prefill_many = &specs });
-        try std.testing.expectEqual(@as(usize, 2), c.prefill_many.len);
-        try std.testing.expectEqual(@as(u64, 6), c.prefill_many[1].key);
-        try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, c.prefill_many[0].prompt);
-        try std.testing.expectEqualSlices(u32, &.{ 4, 5 }, c.prefill_many[1].prompt);
+        const c = try roundTrip(ar, .{ .prefill_step = 0x1234_5678_9abc });
+        try std.testing.expectEqual(@as(u64, 0x1234_5678_9abc), c.prefill_step);
     }
     {
         const c = try roundTrip(ar, .{ .first = .{ .key = 9, .position = 1 << 40 } });
@@ -1823,13 +1767,23 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices 
             for (&streams, prompts, 0..) |*s, p, i| s.* = try Stream.init(gpa, .{ .id = "s", .prompt = p, .max_new = 20 + 5 * @as(u32, @intCast(i)), .eos = &.{96} });
             defer for (&streams) |*s| s.deinit(gpa);
             // one fills alone, then the others arrive two steps apart while it decodes
-            _ = try engine.beginStream(&streams[0]);
+            var filling = [_]bool{ false, false, false };
+            var first = [_]bool{ true, true, true };
+            var filled: usize = 0;
+            filling[0] = true;
             var next: usize = 1;
             var steps: usize = 0;
-            while (engine.activeCount() > 0 or engine.fillingCount() > 0 or next < 3) : (steps += 1) {
+            while (next < 3 or engine.activeCount() > 0 or filled < 3) : (steps += 1) {
                 if (next < 3 and steps % 2 == 1) {
-                    _ = try engine.beginStream(&streams[next]);
+                    filling[next] = true;
                     next += 1;
+                }
+                for (&streams, &filling, &first) |*s, *f, *one| {
+                    if (!f.*) continue;
+                    if (try engine.fillStream(s, one.*)) {
+                        f.* = false;
+                        filled += 1;
+                    } else one.* = false;
                 }
                 try engine.step();
             }
