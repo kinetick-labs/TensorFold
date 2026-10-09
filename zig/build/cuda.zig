@@ -522,6 +522,16 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-info-config", "Info shares the checkpoint config reader and diagnostics").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli, .filters = &.{"issue 934:"} })).step);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = memory_cli, .filters = &.{"plan"} })).step); // plan's verdict tests in the plain `zig build test` gate
+    // The checkpoint CLI (models, info, pull) against a synthetic cache and a fake hub: the same test root
+    // the Metal path wires (build.zig, `test-cli`), which the Linux host tests used to leave out.
+    const cli_checks = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/cli/tests.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "native_engines", .module = native }},
+    }) });
+    step.dependOn(&b.addRunArtifact(cli_checks).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
