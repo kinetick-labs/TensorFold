@@ -244,6 +244,8 @@ const X3Scratch = struct {
     z: u64, // fp32: the most split-K partials a dense linear leaves
     ctr: u64, // int32: a dense linear's counters, the widest N; zeroed once, every launch re-zeroes its own slots
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
+    ple_dev: u64, // [max_rows * heads, WORDS] int16: the staged PLE rows as the table stores them (exl3_mm.Scratch.ple_dev)
+    ple_hb: u64, // [heads * DH] fp16: the mul1 codebook's per-head bias, the table's own file, uploaded once
     // the grouped experts' rows: P = x3_moe_window * slots
     mg: u64, // [P, D] fp16: the rotated gate input
     mu: u64, // [P, D] fp16: the rotated up input
@@ -284,6 +286,18 @@ const X3Scratch = struct {
             x3Fold(m.fc_e3, &kmax, &zmax, &ctrmax);
             x3Fold(m.fc_h3, &kmax, &zmax, &ctrmax);
         }
+        // the PLE branch's device buffers: the packed rows the table stores, and its per-head bias (exl3_mm.Scratch)
+        var plef: usize = 0;
+        var plew: usize = 0;
+        var pleh: usize = 0;
+        for (w.layers) |l| {
+            const p = l.ple orelse continue;
+            plef = @max(plef, p.ngram.heads);
+        }
+        if (w.table) |ng| {
+            if (ng.exl3) |e| plew = @max(plew, e.words);
+            pleh = ng.head_bias.len;
+        }
         const mrows = @min(max_rows, x3_moe_window);
         const slots = g.slots();
         const P = mrows * slots;
@@ -291,10 +305,11 @@ const X3Scratch = struct {
         const gu = exl3.defaultTile(g.hidden, g.moe_width, true) catch exl3.glm_gateup;
         const dn = exl3.defaultTile(g.moe_width, g.hidden, false) catch exl3.glm_down;
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
-        const sizes = [12]usize{
-            128 * kmax * 2,   @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
-            P * g.hidden * 2, P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
-            4,                @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
+        const sizes = [14]usize{
+            128 * kmax * 2,      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
+            P * g.hidden * 2,    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
+            4,                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
+            @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
         };
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
@@ -302,7 +317,7 @@ const X3Scratch = struct {
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer s.arena.buf.free();
         try s.arena.buf.fill8(0, null);
-        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem };
+        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.ple_dev, &s.ple_hb };
         for (ptrs, sizes) |p, n| p.* = s.arena.take(n);
         return s;
     }
@@ -650,6 +665,10 @@ pub const Forward = struct {
         try f.staged.record(s);
         if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows);
         errdefer if (f.x3) |*q| q.deinit();
+        if (f.x3) |*q| {
+            // the mul1 codebook's per-head bias: `_ple_rows` reads it as its HB operand, so it lives on the device too
+            if (f.w.table) |*ng| if (ng.head_bias.len > 0) try f.d.check(f.d.api.cuMemcpyHtoD_v2(q.ple_hb, @ptrCast(ng.head_bias.ptr), ng.head_bias.len), "cuMemcpyHtoD");
+        }
         var lin: usize = 0;
         var att: usize = 0;
         for (w.layers, 0..) |l, i| {
@@ -966,8 +985,8 @@ pub const Forward = struct {
 
     /// An EXL3 trellis projection's `m` rows (128 at a time): the rotated fp16 input, then the 3-bit matmul.
     pub fn x3mm(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_dtype: c_int, m: usize) !void {
-        const k3 = f.k3 orelse return error.NoExl3Kernels;
         const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        const k3 = f.k3 orelse return error.NoExl3Kernels;
         const st = exl3.strides(.strips, q.k, q.n, q.k2);
         const esz: usize = if (out_dtype == 2) 4 else 2;
         var r0: usize = 0;
@@ -1326,13 +1345,12 @@ pub const Forward = struct {
                 continue;
             }
             if (table.exl3) |e| {
-                // EXL3: the packed rows decoded on the host (Python _ple_rows), so pleBlock skips the decode kernel
+                // EXL3: the packed rows to the device, then `_ple_rows` decodes them there (Python exl3_mm.ple_rows)
+                const q = &(f.x3 orelse return error.NoExl3Scratch);
                 const words = std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * e.words * 2]);
                 try table.gatherExl3(nid, words);
-                const emb_at = f.pleEmbAt(rows_at, table);
-                const emb = std.mem.bytesAsSlice(u16, f.pin.bytes[emb_at..][0 .. R * heads * p.ngram.dims * 2]);
-                try table.decodePle(words, heads, p.ngram.dims, emb);
-                try f.upload(x.b.ple_emb, emb_at, R * heads * p.ngram.dims * 2);
+                try f.upload(q.ple_dev, rows_at, R * heads * e.words * 2);
+                try prompt.pleRows(f.t, q.ple_dev, q.ple_hb, x.b.ple_emb, R, e.words, e.bits, heads, p.ngram.dims);
                 continue;
             }
             const out = std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * table.width * 2]);
@@ -1574,12 +1592,6 @@ pub const Forward = struct {
         return .{ .bf16 = b.branch };
     }
 
-    /// The pinned buffer's decode region: past the ids (`max_rows * 4`) and the gathered rows alike.
-    fn pleEmbAt(f: *const Forward, rows_at: usize, table: *const W.NgramTable) usize {
-        const per = if (table.exl3) |e| e.words else table.width;
-        return std.mem.alignForward(usize, rows_at + f.pin_rows * @max(per, table.width) * 2, 256);
-    }
-
     /// ple_block: h += the n-gram embedding branch through the stream's conv tail (rows staged by `stage`).
     fn pleBlock(f: *Forward, p: *const W.Ple, segs: []const Seg, x: *const Bufs, R: usize) !void {
         const b = &x.b;
@@ -1602,8 +1614,28 @@ pub const Forward = struct {
                 try f.th.slotCopy(f.sc.xs_all + r * R * (half / 32) * 4, (half / 32) * 4, b.xs_ple + r * (half / 32) * 4, cm.world * (half / 32) * 4, (half / 32) * 4, R);
             }
         } else try f.t.pleEmbedBf16(b.ple_v, b.ple_emb, b.xs_ple, R, p.ngram.heads, p.ngram.dims, scale);
-        try f.mm(b.ple_emb, g.ple_dim, p.key, b.ple_keys, false, R);
-        try f.mm(b.ple_emb, g.ple_dim, p.value, b.ple_vals, false, R);
+        // the projections: bf16 rows through `mm`, the pack's fp16 ones through `_f16_mm` (128 rows a call)
+        const chunk: usize = 128;
+        switch (p.key) {
+            .b16 => |w| try f.mm(b.ple_emb, g.ple_dim, w, b.ple_keys, false, R),
+            .f16 => |w| {
+                var r0: usize = 0;
+                while (r0 < R) : (r0 += chunk) {
+                    const rows = @min(chunk, R - r0);
+                    try prompt.f16mm(f.t, b.ple_emb + r0 * g.ple_dim * 2, g.ple_dim, true, w.weight, f.sc.part, b.ple_keys + r0 * w.n * 2, false, rows, w.n, w.k);
+                }
+            },
+        }
+        switch (p.value) {
+            .b16 => |w| try f.mm(b.ple_emb, g.ple_dim, w, b.ple_vals, false, R),
+            .f16 => |w| {
+                var r0: usize = 0;
+                while (r0 < R) : (r0 += chunk) {
+                    const rows = @min(chunk, R - r0);
+                    try prompt.f16mm(f.t, b.ple_emb + r0 * g.ple_dim * 2, g.ple_dim, true, w.weight, f.sc.part, b.ple_vals + r0 * w.n * 2, false, rows, w.n, w.k);
+                }
+            },
+        }
         try f.t.pleGate(b.ple_keys, b.ple_vals, b.h, p.norm_key, p.norm_query, b.ple_gated, b.ple_pss, R, g.hidden, g.streams, f.eps);
         const Wd = g.wide();
         for (segs) |sg| {
