@@ -14,7 +14,7 @@ pub const env = "TF_FLASHNEXT_PROMPT_MM";
 
 const bf16 = "*bf16";
 const f32p = "*fp32";
-
+const f16p = "*fp16";
 /// Rows from which the in-program slices run: the wrappers' 128-row bucket (bf16.matmul's bm = 128 if m > 128).
 pub const min_rows = 129;
 /// `_b16mm_ks`'s row tiles a band (tools/zig/flashnext_prompt_spec.py GROUP).
@@ -62,6 +62,24 @@ pub fn b16(t: tri.Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, m:
     if (m < min_rows or sk < 2 or k % 64 != 0) return error.NotAPromptSplit;
     try run(t, "_b16mm_ks", .{ cdiv(m, 128) * cdiv(n, 64), 1, 1 }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", 128), ci("BLOCK_N", 64), ci("BK", 64), cb("F32", fp32), ci("GROUP", group) });
 }
+
+/// exl3_mm._f16_mm: x [M,K] @ w [N,K].T fp16 -> out. F32 rides the split: one slice stores, several leave partials.
+pub fn f16mm(t: tri.Tri, x: u64, x_stride: usize, x_fp16: bool, w: u64, part: u64, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
+    const sk = tri.f16SplitK(n, k);
+    if (k % 64 != 0 or (sk > 1 and k % (sk * 64) != 0)) return error.NotAPromptSplit;
+    const split = sk > 1;
+    try run(t, "_f16_mm", .{ cdiv(m, 16), cdiv(n, 64), sk }, &.{ aot.ptr("X", if (x_fp16) f16p else bf16, x), aot.ptr("W", f16p, w), aot.ptr("OUT", if (split) f32p else bf16, if (split) part else out), int("M", m), int("N", n), int("x_stride", x_stride), int("o_stride", n) }, &.{ ci("K", k), ci("KS", k / sk), ci("BM", 16), ci("BN", 64), ci("BK", 64), cb("F32", split) });
+    if (split) try reduce(t, part, out, fp32, m * n, sk);
+}
+
+/// exl3_mm._ple_rows: the packed rows decoded on the device, grid (rows, heads), into fp16 [rows, heads * DH].
+pub fn pleRows(t: tri.Tri, pk: u64, hb: u64, out: u64, rows: usize, words: usize, bits: usize, heads: usize, dh: usize) !void {
+    const k_inv: f32 = @as(f16, @bitCast(@as(u16, 0x1EEE)));
+    const k_bias: f32 = @as(f16, @bitCast(@as(u16, 0xC931)));
+    const block = std.math.ceilPowerOfTwo(usize, dh) catch return error.PleBlockTooLarge;
+    try run(t, "_ple_rows", .{ rows, heads, 1 }, &.{ aot.ptr("PK", "*i16", pk), aot.ptr("HB", f16p, hb), aot.ptr("OUT", f16p, out) }, &.{ ci("WORDS", words), ci("KB", bits), ci("HEADS", heads), ci("DH", dh), ci("BLOCK", block), aot.cf("K_INV", k_inv), aot.cf("K_BIAS", k_bias) });
+}
+
 
 /// nvfp4.matmul's bits for m >= min_rows and split K (the shared expert's tables).
 pub fn fp4(t: tri.Tri, x: u64, x_stride: usize, fp: tri.Fp4, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
