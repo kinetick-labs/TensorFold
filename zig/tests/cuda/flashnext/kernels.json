@@ -1,5 +1,5 @@
 {
- "generator": "tools/zig/flashnext_aot.py extract + derive",
+ "generator": "tools/zig/flashnext_aot.py extract + derive (repo spec verbatim, the EXL3 kernels appended)",
  "target": [
   "cuda",
   121,
@@ -63682,6 +63682,2711 @@
     2
    ],
    "rule": "kv8: _attn_prep on FP8 rows (from vision: _attn_prep MODE 2 (an image or video prompt's rotary table), length plain (from f7fa93c75f49e7433a0c85d4c6d2d5017d6e23010a34bd891aeae2c43c758d68))"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "02702ce39ddf084212c6aefeb1f402154df4fcbcaf51c33fe0ecc95cd018255b",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "N": {
+     "int": 512
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "7a409206a929ca38a07a8c1987ad939e00dfb3b08ea5ef276ebb9770bd9da31b"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "198eb6200cac242deb4614b9d48aa898511c997968e0a8e027f8d70554083613",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 6144
+    },
+    "N": {
+     "int": 2560
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "d09266c397be55022383e67b147a70e85120d8c56a21cdcb7da93029c95c6d26"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "21ecf27d3a8dd917468595c8dca4b57a56c7a2729e83283a75b0149c3d232890",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "N": {
+     "int": 6144
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "47973fae23af447c5bb2dcde588c38a3c406bd9b57ba3986a6a3d7507b0801a6"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "47462a582b5b1324674a2f9a1e30cdcb13cc73c65bed76762f79267959450861",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "N": {
+     "int": 10240
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "56f3a078ce1c445ba1a8c16be9c78c95181004ae005388fe2ff8abd9ef671713"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "57ed029c6fca1e9ef62232a0616347a71345e9cf3947a3c8736b4f330f53d2c5",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "N": {
+     "int": 2560
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "779f3223593b57eb0c358436fd5b022ee0765bc45b75938500611ac8c082c899"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "6883519f39daea9f093bbd56af705f1475f0c762c210a7beb5cb074aabc0c955",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "N": {
+     "int": 640
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "fa2aa908dc1eda12d37150d51864fb2e6e83fd5fda26012fc1f8928c64ddc363"
+  },
+  {
+   "function": "tensorfold.cuda.exl3.prefill._gemm",
+   "name": "_gemm",
+   "hash": "8a10b04c0c9a3fa6732177c4ba94193273412db6de4700a1b0831a604eeb5ab6",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/cuda/exl3/prefill.py",
+    "line": 19
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "H": "*bf16",
+    "SVH": "*fp16",
+    "BIAS": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "N": "constexpr",
+    "BM": "constexpr",
+    "BK": "constexpr",
+    "GROUP": "constexpr",
+    "HAS_BIAS": "constexpr",
+    "SCALE": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "H",
+    "SVH",
+    "BIAS",
+    "OUT",
+    "M",
+    "o_stride",
+    "K",
+    "N",
+    "BM",
+    "BK",
+    "GROUP",
+    "HAS_BIAS",
+    "SCALE"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "N": {
+     "int": 12288
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 64
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "bool": false
+    },
+    "SCALE": {
+     "float": 0.08838834764831845,
+     "fp64_bits": "0x3fb6a09e667f3bcd"
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SVH": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "N": [],
+    "BM": [],
+    "BK": [],
+    "GROUP": [],
+    "HAS_BIAS": [],
+    "SCALE": []
+   },
+   "options": {
+    "num_warps": 8,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "6eeff386aba8a94a2e0ec4b0533b3354221bf741f9d1f1c245a5eab7e316fb1f"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm",
+   "name": "_f16_mm",
+   "hash": "0ec7ad68136591994950d8ac26755a97fda74e0999ba1b96e1d04961d80849b5",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 69
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*fp16",
+    "OUT": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "x_stride": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "KS": "constexpr",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "N",
+    "x_stride",
+    "o_stride",
+    "K",
+    "KS",
+    "BM",
+    "BN",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "KS": {
+     "int": 320
+    },
+    "BM": {
+     "int": 16
+    },
+    "BN": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "KS": [],
+    "BM": [],
+    "BN": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "f97568a1af67063263b1646886a256f6e19579c941c4edd8acb93bf8bb51f53a"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm",
+   "name": "_f16_mm",
+   "hash": "86b387fca828cc4140e77b946ebd25994a6dbc63114d2bbb346c3aaadb47a9f6",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 69
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "OUT": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "x_stride": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "KS": "constexpr",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "N",
+    "x_stride",
+    "o_stride",
+    "K",
+    "KS",
+    "BM",
+    "BN",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "KS": {
+     "int": 640
+    },
+    "BM": {
+     "int": 16
+    },
+    "BN": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "KS": [],
+    "BM": [],
+    "BN": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "301997c83fcd596429ce0e34035f2c887233d4cc554eca8f18263187915b04fa"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm",
+   "name": "_f16_mm",
+   "hash": "8c1dcb2baceda60cc36fd460ca3f3e8d2c8f59e814b8c63e54b4fe126b269701",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 69
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*fp16",
+    "OUT": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "x_stride": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "KS": "constexpr",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "N",
+    "x_stride",
+    "o_stride",
+    "K",
+    "KS",
+    "BM",
+    "BN",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 10240
+    },
+    "KS": {
+     "int": 640
+    },
+    "BM": {
+     "int": 16
+    },
+    "BN": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [],
+    "K": [],
+    "KS": [],
+    "BM": [],
+    "BN": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "e60c778ca1e006a34ae9e95ba82e0258f2ed0e3519c79763d5e4da65ad5fb051"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm",
+   "name": "_f16_mm",
+   "hash": "aaca3217d7b484ab864ad42878baf95a5f555587829df1ce578fc7482b44383a",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 69
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "N": "i32",
+    "x_stride": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "KS": "constexpr",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "N",
+    "x_stride",
+    "o_stride",
+    "K",
+    "KS",
+    "BM",
+    "BN",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 320
+    },
+    "KS": {
+     "int": 320
+    },
+    "BM": {
+     "int": 16
+    },
+    "BN": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "KS": [],
+    "BM": [],
+    "BN": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "e70afc6c134f7b2df897827488ff3c34dbfed6b88b64403ed82f9a54c22c3326"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm",
+   "name": "_f16_mm",
+   "hash": "d8d573cc5c0136a120ecb5e3b62de45932d837f44f7739bfff218e64d495d3c3",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 69
+   },
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "N": "i32",
+    "x_stride": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "KS": "constexpr",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "N",
+    "x_stride",
+    "o_stride",
+    "K",
+    "KS",
+    "BM",
+    "BN",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 2560
+    },
+    "KS": {
+     "int": 2560
+    },
+    "BM": {
+     "int": 16
+    },
+    "BN": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "KS": [],
+    "BM": [],
+    "BN": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "5696a3c8fcc2e3a885070e6eba5a0416a41b206e0097b8a1e8374c8a3fea8785"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm",
+   "name": "_f16_mm",
+   "hash": "ef095d014a56e19defa2f6f6014c2e5348a4e1b6c4349462b75e10c6fc6848df",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 69
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*fp16",
+    "OUT": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "x_stride": "i32",
+    "o_stride": "i32",
+    "K": "constexpr",
+    "KS": "constexpr",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "N",
+    "x_stride",
+    "o_stride",
+    "K",
+    "KS",
+    "BM",
+    "BN",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "K": {
+     "int": 10240
+    },
+    "KS": {
+     "int": 320
+    },
+    "BM": {
+     "int": 16
+    },
+    "BN": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "o_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [],
+    "KS": [],
+    "BM": [],
+    "BN": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "e488725feb8abe3c09a13f60192b38a987bcffe7ae282c51f53b4c5e5e04cbab"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.exl3_mm._ple_rows",
+   "name": "_ple_rows",
+   "hash": "ab3dcb9a54773a89e24842def8dace7aacfe9b21dc3570ad7316d529cab84f2b",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/exl3_mm.py",
+    "line": 282
+   },
+   "signature": {
+    "PK": "*i16",
+    "HB": "*fp16",
+    "OUT": "*fp16",
+    "WORDS": "constexpr",
+    "KB": "constexpr",
+    "HEADS": "constexpr",
+    "DH": "constexpr",
+    "BLOCK": "constexpr",
+    "K_INV": "constexpr",
+    "K_BIAS": "constexpr"
+   },
+   "params": [
+    "PK",
+    "HB",
+    "OUT",
+    "WORDS",
+    "KB",
+    "HEADS",
+    "DH",
+    "BLOCK",
+    "K_INV",
+    "K_BIAS"
+   ],
+   "constexprs": {
+    "WORDS": {
+     "int": 61
+    },
+    "KB": {
+     "int": 6
+    },
+    "HEADS": {
+     "int": 16
+    },
+    "DH": {
+     "int": 160
+    },
+    "BLOCK": {
+     "int": 256
+    },
+    "K_INV": {
+     "float": 0.00676727294921875,
+     "fp64_bits": "0x3f7bb80000000000"
+    },
+    "K_BIAS": {
+     "float": -10.3828125,
+     "fp64_bits": "0xc024c40000000000"
+    }
+   },
+   "attrs": {
+    "PK": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "HB": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WORDS": [],
+    "KB": [],
+    "HEADS": [],
+    "DH": [],
+    "BLOCK": [],
+    "K_INV": [],
+    "K_BIAS": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "8164187fa502c254a5d237ef02fd09372e75d06e52a45c831a63a058314e4aff"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._hc_reduce_act",
+   "name": "_hc_reduce_act",
+   "hash": "8382188a77b441107810da74a983f5c0999714fbbc948d2ecbd6c3d67b1ef399",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 174
+   },
+   "signature": {
+    "PART": "*fp32",
+    "ACT": "*bf16",
+    "XS": "*fp32",
+    "INJ": "*bf16",
+    "SK": "constexpr",
+    "M": "i32",
+    "S": "constexpr",
+    "LOW": "constexpr",
+    "LOWP": "constexpr",
+    "HAS_INJ": "constexpr",
+    "NDN": "constexpr"
+   },
+   "params": [
+    "PART",
+    "ACT",
+    "XS",
+    "INJ",
+    "SK",
+    "M",
+    "S",
+    "LOW",
+    "LOWP",
+    "HAS_INJ",
+    "NDN"
+   ],
+   "constexprs": {
+    "SK": {
+     "int": 32
+    },
+    "S": {
+     "int": 4
+    },
+    "LOW": {
+     "int": 320
+    },
+    "LOWP": {
+     "int": 512
+    },
+    "HAS_INJ": {
+     "bool": false
+    },
+    "NDN": {
+     "int": 320
+    }
+   },
+   "attrs": {
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "ACT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "XS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "INJ": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SK": [],
+    "M": [],
+    "S": [],
+    "LOW": [],
+    "LOWP": [],
+    "HAS_INJ": [],
+    "NDN": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "3a237902ba2e821fbe1402d41cc6cb28d7c059df0622a359f94fd260a28eaf8f"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._hc_reduce_act",
+   "name": "_hc_reduce_act",
+   "hash": "b0c640ddaec16fe7819c9c176f8b6e6914033d78003d6cba37ca658cf9e52a21",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 174
+   },
+   "signature": {
+    "PART": "*fp32",
+    "ACT": "*bf16",
+    "XS": "*fp32",
+    "INJ": "*bf16",
+    "SK": "constexpr",
+    "M": "constexpr",
+    "S": "constexpr",
+    "LOW": "constexpr",
+    "LOWP": "constexpr",
+    "HAS_INJ": "constexpr",
+    "NDN": "constexpr"
+   },
+   "params": [
+    "PART",
+    "ACT",
+    "XS",
+    "INJ",
+    "SK",
+    "M",
+    "S",
+    "LOW",
+    "LOWP",
+    "HAS_INJ",
+    "NDN"
+   ],
+   "constexprs": {
+    "SK": {
+     "int": 32
+    },
+    "M": {
+     "int": 1
+    },
+    "S": {
+     "int": 4
+    },
+    "LOW": {
+     "int": 320
+    },
+    "LOWP": {
+     "int": 512
+    },
+    "HAS_INJ": {
+     "bool": false
+    },
+    "NDN": {
+     "int": 320
+    }
+   },
+   "attrs": {
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "ACT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "XS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "INJ": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SK": [],
+    "M": [],
+    "S": [],
+    "LOW": [],
+    "LOWP": [],
+    "HAS_INJ": [],
+    "NDN": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "f529c23e916b45ffd1ead9c72dfdaf2d837990230c9846ee2ee53e0808862fe3"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._hc_reduce_act",
+   "name": "_hc_reduce_act",
+   "hash": "b4d986b965936a9fb80c2fa12710c7e737f912346c80eadc2e3ff2e651b08bed",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 174
+   },
+   "signature": {
+    "PART": "*fp32",
+    "ACT": "*bf16",
+    "XS": "*fp32",
+    "INJ": "*bf16",
+    "SK": "constexpr",
+    "M": "i32",
+    "S": "constexpr",
+    "LOW": "constexpr",
+    "LOWP": "constexpr",
+    "HAS_INJ": "constexpr",
+    "NDN": "constexpr"
+   },
+   "params": [
+    "PART",
+    "ACT",
+    "XS",
+    "INJ",
+    "SK",
+    "M",
+    "S",
+    "LOW",
+    "LOWP",
+    "HAS_INJ",
+    "NDN"
+   ],
+   "constexprs": {
+    "SK": {
+     "int": 16
+    },
+    "S": {
+     "int": 4
+    },
+    "LOW": {
+     "int": 320
+    },
+    "LOWP": {
+     "int": 512
+    },
+    "HAS_INJ": {
+     "bool": true
+    },
+    "NDN": {
+     "int": 324
+    }
+   },
+   "attrs": {
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "ACT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "XS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "INJ": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SK": [],
+    "M": [],
+    "S": [],
+    "LOW": [],
+    "LOWP": [],
+    "HAS_INJ": [],
+    "NDN": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "bf72f74e13c13d9ed3018096639c72127e9ecf218ad914709ca6a00abc212a56"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._hc_reduce_act",
+   "name": "_hc_reduce_act",
+   "hash": "fb862c305c5fb8c1c5fde84576989f8f6aff9a10ab9760e9e1ff564f1f28dca3",
+   "source": {
+    "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 174
+   },
+   "signature": {
+    "PART": "*fp32",
+    "ACT": "*bf16",
+    "XS": "*fp32",
+    "INJ": "*bf16",
+    "SK": "constexpr",
+    "M": "constexpr",
+    "S": "constexpr",
+    "LOW": "constexpr",
+    "LOWP": "constexpr",
+    "HAS_INJ": "constexpr",
+    "NDN": "constexpr"
+   },
+   "params": [
+    "PART",
+    "ACT",
+    "XS",
+    "INJ",
+    "SK",
+    "M",
+    "S",
+    "LOW",
+    "LOWP",
+    "HAS_INJ",
+    "NDN"
+   ],
+   "constexprs": {
+    "SK": {
+     "int": 16
+    },
+    "M": {
+     "int": 1
+    },
+    "S": {
+     "int": 4
+    },
+    "LOW": {
+     "int": 320
+    },
+    "LOWP": {
+     "int": 512
+    },
+    "HAS_INJ": {
+     "bool": true
+    },
+    "NDN": {
+     "int": 324
+    }
+   },
+   "attrs": {
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "ACT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "XS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "INJ": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SK": [],
+    "M": [],
+    "S": [],
+    "LOW": [],
+    "LOWP": [],
+    "HAS_INJ": [],
+    "NDN": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cubin_sha256": "609d8a0f0c7ac41978bb6c2c093342db7e936822ef81786d9f7080775acb4bab"
   }
  ]
 }
