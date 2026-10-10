@@ -203,6 +203,14 @@ pub fn b16SplitK(n: usize, k: usize) usize {
     return sk;
 }
 
+/// exl3_mm.f16_split: K slices for an (n, k) fp16 matrix — a function of the shape (target 96, 64-wide K blocks).
+pub fn f16SplitK(n: usize, k: usize) usize {
+    const tiles = cdiv(n, 64);
+    var sk: usize = 1;
+    while (sk < 32 and tiles * sk < 96 and k % (sk * 2 * 64) == 0 and k / (sk * 2) >= 256) sk *= 2;
+    return sk;
+}
+
 /// The fp32 scratch bf16.matmul's split K needs for `m` rows (0 without a split).
 pub fn b16PartBytes(m: usize, n: usize, k: usize) usize {
     const sk = b16SplitK(n, k);

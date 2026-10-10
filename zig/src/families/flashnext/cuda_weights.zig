@@ -60,6 +60,10 @@ pub const Options = struct {
 
 /// A bf16 matrix [n, k] as stored (Python bf16._Routed, its B16 at `.b`: named "<path>.b.weight").
 pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0 };
+/// A linear the pack leaves in fp16 (exl3_mm.F16): this face keeps fp16, where `Rows`' converts it to bf16.
+pub const F16 = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0 };
+/// A PLE projection's two possible bits: bf16 rows, or the fp16 face `pleW` picks by the header's dtype.
+pub const PleW = union(enum) { b16: Rows, f16: F16 };
 /// One dense EXL3 layer on the device (Python linear.py:Exl3Linear): the trellis' int32 words in the strips layout
 /// the dense kernels read (linear.py:48), the fp16 input/output scales, an optional fp16 bias, and the plan, width
 /// and codebook id a launch takes. `bits`/`k2` are the trellis shape's width, never the header's mean.
@@ -104,7 +108,7 @@ pub const Gdn = struct { proj: Rows = .{}, conv: u64 = 0, a_log: u64 = 0, dt_bia
 pub const Attn = struct { proj: Rows = .{}, q_scale: u64 = 0, k_scale: u64 = 0, iq_scale: u64 = 0, ik_scale: u64 = 0, o: Rows = .{}, proj8: ?fp8.Linear = null, o8: ?fp8.Linear = null, q3: ?X3 = null, k3: ?X3 = null, v3: ?X3 = null, iq3: ?X3 = null, o3: ?X3 = null };
 /// INT4-AutoRound's healed shared expert: block FP8 gate|up rows [2 w, D] and down [D, w] (w its rank's width).
 pub const Shared8 = struct { gu: fp8.Linear, down: fp8.Linear, width: u32 };
-pub const Ple = struct { key: Rows = .{}, value: Rows = .{}, norm_key: u64 = 0, norm_query: u64 = 0, norm_conv: u64 = 0, conv: u64 = 0, ngram: ngram.NGram };
+pub const Ple = struct { key: PleW = .{ .b16 = .{} }, value: PleW = .{ .b16 = .{} }, norm_key: u64 = 0, norm_query: u64 = 0, norm_conv: u64 = 0, conv: u64 = 0, ngram: ngram.NGram };
 pub const Layer = struct { index: i32, linear: bool, attn_hc: Hc = .{}, mlp_hc: Hc = .{}, gdn: ?Gdn = null, attn: ?Attn = null, moe: MoE = .{}, ple: ?Ple = null };
 pub const Mtp = struct { norm_e: u64 = 0, norm_h: u64 = 0, fc_e: Rows = .{}, fc_h: Rows = .{}, layer: Layer, mixer: Hc = .{}, fc_e3: ?X3 = null, fc_h3: ?X3 = null };
 /// qmm.Q4 in the lane matmul's frag layout: int32 [npad/64][k/32][8][32], bf16 scales and biases [k/32, npad].
@@ -195,45 +199,7 @@ pub const NgramTable = struct {
             for (dst, 0..) |*d, j| d.* = std.mem.readInt(u16, src[2 * j ..][0..2], .little);
         }
     }
-
-    /// Python exl3_mm.ple_rows: the packed rows to bf16 `out` as the packed matmul casts them; host only, no kernel.
-    pub fn decodePle(t: *const NgramTable, rows: []align(1) const u16, heads: usize, dh: usize, out: []align(1) u16) !void {
-        const e = t.exl3 orelse return error.NotExl3Table;
-        const kb: usize = e.bits;
-        if (kb == 0 or kb > 8) return error.UnsupportedQuantization;
-        // `rows` is the flat word array (`words` int16 a row): the row count is its length over `words`, not its length
-        const n = rows.len / e.words;
-        if (rows.len % e.words != 0 or n % heads != 0 or out.len != n * dh) return error.NgramOutLength;
-        const bias = std.mem.bytesAsSlice(f16, t.head_bias[0 .. heads * dh * 2]);
-        const k_inv: f32 = @as(f16, @bitCast(@as(u16, 0x1EEE)));
-        const k_bias: f32 = @as(f16, @bitCast(@as(u16, 0xC931)));
-        for (0..n / heads) |r| for (0..heads) |h| {
-            const base = (r * heads + h) * e.words;
-            const scale: f32 = @as(f16, @bitCast(rows[base]));
-            for (0..dh) |i| {
-                var state: u64 = 0;
-                for (0..16) |m| {
-                    const q = m / kb;
-                    const pos: usize = if (i >= q) i - q else i + dh - q;
-                    const sb = pos * kb + (m % kb);
-                    const word: u64 = rows[base + 1 + (sb >> 4)];
-                    state |= ((word >> @intCast(sb & 15)) & 1) << @intCast(m);
-                }
-                const prod: u64 = state *% 0x83DCD12D;
-                const hs = (prod & 255) + ((prod >> 8) & 255) + ((prod >> 16) & 255) + ((prod >> 24) & 255);
-                const cbf: f16 = @floatCast(@as(f32, @floatFromInt(1024 + hs)) * k_inv + k_bias);
-                const v16: f16 = @floatCast(@as(f32, @floatCast(cbf)) * scale + @as(f32, bias[h * dh + i]));
-                out[(r * heads + h) * dh + i] = bf16Of(@floatCast(v16));
-            }
-        };
-    }
 };
-
-/// f32 -> bf16 bits, round to nearest even (the cast the packed matmul applies to its fp16 input).
-fn bf16Of(v: f32) u16 {
-    const u: u32 = @bitCast(v);
-    return @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
-}
 
 /// The n-gram table's GPU gather (zig/kernels/cuda/fn_pack.cu): a window's global row ids (device int64
 /// [tokens][ids_stride], every head's) -> `out` bf16 bits [tokens][heads * width] for the rank's heads, the host
@@ -861,6 +827,21 @@ const Loader = struct {
 
     fn b16(L: *Loader, path: []const u8, name: []const u8, n: usize, k: usize) !Rows {
         return L.face(path, &.{.{ .t = try L.linear(name, n, k) }});
+    }
+
+    /// A PLE projection the pack leaves fp16 (exl3_mm.F16) or bf16: the face keeps whichever the header declares.
+    fn pleW(L: *Loader, path: []const u8, name: []const u8, n: usize, k: usize) !PleW {
+        var b: [192]u8 = undefined;
+        const t = try L.linear(name, n, k);
+        if (t.dtype == .bf16) return .{ .b16 = try L.face(try std.fmt.bufPrint(&b, "{s}.b.weight", .{path}), &.{.{ .t = t }}) };
+        const ptr = try L.out.begin(try std.fmt.bufPrint(&b, "{s}.f16.weight", .{path}), "float16", &.{ n, k });
+        const host = try L.staging(n * k * 2);
+        for (0..n) |row| {
+            @memcpy(host[row * k * 2 ..][0 .. k * 2], t.bytes[row * k * 2 ..][0 .. k * 2]);
+        }
+        try L.out.put(host);
+        try L.out.end();
+        return .{ .f16 = .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k) } };
     }
 
     // -- the blocks --
@@ -1684,8 +1665,8 @@ const Loader = struct {
         }
         var pb: [192]u8 = undefined;
         const sd = c.streams * c.hidden;
-        p.key = try L.b16(try std.fmt.bufPrint(&pb, "{s}.key.b.weight", .{path}), try L.nameOf("{s}.key_proj", .{name}), sd, c.ple_dim);
-        p.value = try L.b16(try std.fmt.bufPrint(&pb, "{s}.value.b.weight", .{path}), try L.nameOf("{s}.value_proj", .{name}), c.hidden, c.ple_dim);
+        p.key = try L.pleW(try std.fmt.bufPrint(&pb, "{s}.key", .{path}), try L.nameOf("{s}.key_proj", .{name}), sd, c.ple_dim);
+        p.value = try L.pleW(try std.fmt.bufPrint(&pb, "{s}.value", .{path}), try L.nameOf("{s}.value_proj", .{name}), c.hidden, c.ple_dim);
         p.norm_key = try L.cscale(try std.fmt.bufPrint(&pb, "{s}.norm_key", .{path}), try L.nameOf("{s}.norm_key.weight", .{name}), sd);
         p.norm_query = try L.cscale(try std.fmt.bufPrint(&pb, "{s}.norm_query", .{path}), try L.nameOf("{s}.norm_query.weight", .{name}), sd);
         p.norm_conv = try L.cscale(try std.fmt.bufPrint(&pb, "{s}.norm_conv", .{path}), try L.nameOf("{s}.norm_conv.weight", .{name}), sd);
