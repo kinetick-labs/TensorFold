@@ -2029,11 +2029,14 @@ pub const Forward = struct {
             const xin = b.mixed + at * D * 2;
             const y = b.moe_y + at * slots * D * es;
             try exl3.group(k3, pick, xs.mids, xs.mcnt, xs.mmem, R, slots, E, maxu, f.s);
+            try f.mark(.topk_plan);
             try exl3.rotInExperts(k3, true, xin, @intCast(D), pick, ex.suh_g, ex.suh_u, xs.mg, xs.mu, R, D, slots, E, f.s);
             try exl3.grouped(k3, set_gu, rng_gu, xs.mg, xs.mu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, D, I, P, gu.sk, maxu, slots, E, 2, f.s);
             try exl3.gateupEpilogue(k3, xs.mz, pick, ex.svh_g, ex.svh_u, ex.suh_d, xs.md, R, slots, P, I, gu.sk, E, std.math.inf(f32), 0, f.s);
+            try f.mark(.experts_gate_up);
             try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, maxu, slots, E, 1, f.s);
             try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
+            try f.mark(.experts_down);
         }
     }
 
