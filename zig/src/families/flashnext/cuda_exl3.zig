@@ -118,6 +118,61 @@ pub fn defaultTile(k: usize, n: usize, gateup: bool) !Tile {
     return error.NoTileSetting;
 }
 
+// The tile sweep: TF_FLASHNEXT_X3_TILE names a variant for the grouped GEMM's gate/up and down classes; unset is today.
+
+/// A tile variant a sweep may name: the same (nt, w, sk, pf) `defaultTile` returns, in the reference's spelling.
+pub const Variant = struct { nt: usize, w: usize, sk: usize, pf: usize };
+
+/// id 0, GLM's gate/up tile (experts.py:134): today's gate/up default, and the pack's expected best.
+pub const v_glm_gu: Variant = .{ .nt = 8, .w = 4, .sk = 4, .pf = 1 };
+/// id 1, GLM's down tile (experts.py:134): today's down default (one K split, the reference's pick for I -> D).
+pub const v_glm_dn: Variant = .{ .nt = 8, .w = 4, .sk = 1, .pf = 1 };
+/// id 2, the reference's first fallback when GLM's tile does not divide (experts.py:134): two K splits, one in flight.
+pub const v_narrow: Variant = .{ .nt = 8, .w = 4, .sk = 2, .pf = 1 };
+/// id 3, the reference's (8, 4, 2) instance at one K split; upstream's prefill tiles keep 2 k tiles in flight.
+pub const v_pf2: Variant = .{ .nt = 8, .w = 4, .sk = 1, .pf = 2 };
+/// id 4, the reference's (8, 4, 2) instance at two K splits: its narrow-N fallback with two tiles in flight.
+pub const v_pf2_sk2: Variant = .{ .nt = 8, .w = 4, .sk = 2, .pf = 2 };
+/// id 5, the reference's 4-tile-warp setting (experts.py:134), 2 in flight: half the columns a warp, more overlap.
+pub const v_nt4: Variant = .{ .nt = 4, .w = 4, .sk = 2, .pf = 2 };
+/// id 6, the 4-tile-warp setting at one K split, two tiles in flight (no measured effect known).
+pub const v_nt4_sk1: Variant = .{ .nt = 4, .w = 4, .sk = 1, .pf = 2 };
+/// id 7, 4 tiles a warp, one in flight, a 4-way split: upstream's one-tile-a-warp regime (x3gm GM_GU2/GU3, NG 16).
+pub const v_nt4_pf1: Variant = .{ .nt = 4, .w = 4, .sk = 4, .pf = 1 };
+
+/// The variants the switch's ids index; the parent sweeps. Upstream's own tile retune is +4-12% prefill there.
+pub const variants = [_]Variant{ v_glm_gu, v_glm_dn, v_narrow, v_pf2, v_pf2_sk2, v_nt4, v_nt4_sk1, v_nt4_pf1 };
+
+/// The switch's name (the repo's TF_FLASHNEXT_* idiom).
+const tile_env = "TF_FLASHNEXT_X3_TILE";
+
+/// The variant the switch names for a class: "<gu>[,<dn>]", ids into `variants`; one id means both; unset is null.
+pub fn tileVariant(v: ?[]const u8, gateup: bool) !?Variant {
+    const text = v orelse return null;
+    if (text.len == 0) return null;
+    var it = std.mem.tokenizeScalar(u8, text, ',');
+    const gu = it.next() orelse return null;
+    const dn = it.next() orelse gu;
+    const id = std.fmt.parseInt(usize, if (gateup) gu else dn, 10) catch return error.NoTileVariant;
+    if (id >= variants.len) return error.NoTileVariant;
+    const t = variants[id];
+    if (tileIndex(t.nt, t.w, t.pf) == null) return error.NoTileKernel;
+    return t;
+}
+
+/// A variant's Tile for one shape: (K/16) | (sk * w) and (N/16) | nt, else NoTileShape, never launched wrong.
+pub fn variantTile(t: Variant, k: usize, n: usize) !Tile {
+    if (k % (16 * t.sk * t.w) != 0 or n % (16 * t.nt) != 0) return error.NoTileShape;
+    return .{ .nt = t.nt, .w = t.w, .sk = t.sk, .pf = t.pf };
+}
+
+/// The tile a class's grouped GEMM takes: the switch's variant when set, else `defaultTile`'s shape walk, unchanged.
+pub fn tile(k: usize, n: usize, gateup: bool) !Tile {
+    const v: ?[]const u8 = if (std.c.getenv(tile_env)) |e| std.mem.span(e) else null; // a bad id/kernel/shape errors
+    if (try tileVariant(v, gateup)) |t| return variantTile(t, k, n);
+    return defaultTile(k, n, gateup);
+}
+
 /// Trellis bytes one expert's gate, up and down read: (D*I/256) * (k2g + k2u + k2d) * 16 (experts.py:120).
 pub fn expertBytes(dims: usize, width: usize, k2_g: u32, k2_u: u32, k2_d: u32) u64 {
     return @as(u64, @intCast(dims * width / 256)) * (k2_g + k2_u + k2_d) * 16;
@@ -197,6 +252,11 @@ pub fn groupShared(rows: usize, slots: usize) usize {
     return rows * slots * @sizeOf(c_int);
 }
 
+/// The largest window the grouping buffer fits: groupShared(rows, slots) <= k.group_smem_max, never below 128.
+pub fn groupWindowMax(k: *const Kernels, slots: usize) usize {
+    return @max(@as(usize, k.group_smem_max) / groupShared(1, slots), 128);
+}
+
 /// gateup_epilogue_kernel (experts.cu:116) and down_epilogue_kernel (:161): grid (rows*slots, width/128), block 32.
 pub fn epilogueGrid(rows: usize, slots: usize, width: usize) [2]usize {
     return .{ rows * slots, width / 128 };
@@ -236,10 +296,11 @@ pub const k2s = [3]u32{ 8, 10, 12 };
 pub const wks = [3]usize{ 2, 4, 8 };
 
 /// (tiles a warp, warps a program, tiles in flight) the reference's grouped_launch picks from (experts_grouped.cuh:336).
-pub const tile_settings = [3]struct { nt: usize, w: usize, pf: usize }{
+pub const tile_settings = [4]struct { nt: usize, w: usize, pf: usize }{
     .{ .nt = 8, .w = 4, .pf = 1 },
     .{ .nt = 8, .w = 4, .pf = 2 },
     .{ .nt = 4, .w = 4, .pf = 2 },
+    .{ .nt = 4, .w = 4, .pf = 1 }, // (4, 4, 1): completes the NT 4/8 x PF 1/2 grid the reference's candidates cover
 };
 
 /// The k2 ranges a compiled instance covers: (8, 8) exactly, else (2, 10) when it fits, else (2, 16).
@@ -308,22 +369,50 @@ pub const sym = struct {
     pub const down_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp20down_epilogue_kernelEPKfPKiPK6__halfPfiiii";
     pub const combine = "_ZN10tf_fn_exl311tf_exl3_exp14combine_kernelEPKfS2_Pfii";
     pub const down_combine = "_ZN10tf_fn_exl311tf_exl3_exp19down_combine_kernelEPKfPKiPK6__halfPfS2_S8_iiiii";
-    /// tf_exl3x (experts_grouped.cuh): [tile setting][k2 range]
-    pub const grouped = [3][3][:0]const u8{
+    /// tf_exl3x (experts_grouped.cuh): [tile setting][k2 range], MTL 1 (one 16-member tile a program).
+    pub const grouped = [4][3][:0]const u8{
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+    };
+    /// tf_exl3x: the wide member-pass arm (MTL 8, 128 members a program), same table order, mul1 only, opt-in.
+    pub const grouped_wide = [4][3][:0]const u8{
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
     };
     /// tf_exl3x: the width's dequantize-to-dense (the grouped path's own decoder)
@@ -346,7 +435,9 @@ pub const Kernels = struct {
     down_epilogue: cuda.Function,
     combine: cuda.Function,
     down_combine: cuda.Function,
-    grouped: [3][3]cuda.Function,
+    grouped: [4][3]cuda.Function,
+    /// the wide arm's instances: null when the embedded fatbin predates them, so the default path still loads
+    grouped_wide: [4][3]?cuda.Function,
     dequant: [3]cuda.Function,
     /// dynamic shared memory group_kernel was opted into (the device's ceiling less its static use)
     group_smem_max: u32,
@@ -369,6 +460,9 @@ pub const Kernels = struct {
         k.down_combine = try k.module.function(sym.down_combine);
         for (sym.grouped, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped[i][j] = try k.module.function(s);
+        };
+        for (sym.grouped_wide, 0..) |row, i| for (row, 0..) |s, j| {
+            k.grouped_wide[i][j] = k.module.function(s) catch null;
         };
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
         // group_kernel's grouping buffer: R*slots ints, which passes 48 KiB once a call has enough routed slots.
@@ -549,9 +643,25 @@ pub fn downCombine(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts
     try cuda.launch.launch(k.down_combine, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
 }
 
-/// The grouped expert GEMM: up to 16 members a program, per-expert trellis pointers and widths.
+/// The wide member-pass arm's member-tile count: 8 tiles of 16 = 128 member rows a program.
+pub const wide_member_tiles: usize = 8;
+
+/// The opt-in switch's reading: unset or "0" is off, anything else on (the repo's getenv idiom).
+fn wideFlag(v: ?[]const u8) bool {
+    return if (v) |s| !std.mem.eql(u8, s, "0") else false;
+}
+
+/// Whether the wide arm runs: TF_FLASHNEXT_X3_WIDE_MEMBERS, off by default (-15%: 658.5 vs 775.0 tok/s, same sha).
+pub fn wideMembers() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_WIDE_MEMBERS")) |e| std.mem.span(e) else null;
+    return wideFlag(v);
+}
+
+/// The grouped expert GEMM: 16 members a program, or 128 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
-    const mtiles = (maxm + 15) / 16;
+    const wide = wideMembers();
+    const mtl: usize = if (wide) wide_member_tiles else 1;
+    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
     const t = tile_settings[setting];
     const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
     var a: cuda.Args = .{};
@@ -571,7 +681,7 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(sk));
     a.add(int(maxm));
     a.add(int(slots));
-    const f = k.grouped[setting][range];
+    const f = if (wide) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else k.grouped[setting][range];
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) } }, s, &a);
 }
 
@@ -590,6 +700,17 @@ pub fn dequant(k: *const Kernels, k2: u32, words: u64, out: u64, kk: usize, n: u
 // ---------------------------------------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the wide member-pass arm is off unless the switch is set" {
+    try testing.expect(!wideFlag(null));              // unset: the 16-member path
+    try testing.expect(!wideFlag("0"));               // the repo's explicit off
+    try testing.expect(wideFlag("1"));
+    try testing.expect(wideFlag("anything"));
+    try testing.expectEqual(@as(usize, 8), wide_member_tiles);
+    // maxm 200: the 16-member path runs 13 member-tile programs, the wide arm 2 groups of 128 rows
+    try testing.expectEqual(@as(usize, 13), (200 + 15) / 16);
+    try testing.expectEqual(@as(usize, 2), (200 + 16 * 8 - 1) / (16 * 8));
+}
 
 test "plan matches linear.py across the pack's shapes" {
     // Expected values from linear.py's own plan() (the reference file, executed as it stands).
@@ -768,6 +889,29 @@ test "the tile setting defaultTile picks is one the fatbin carries" {
         try testing.expect(tileIndex(t.nt, t.w, t.pf) != null);
     }
     try testing.expectError(error.NoTileSetting, defaultTile(80, 640, true));
+}
+
+test "the tile sweep names a variant the fatbin carries, and never falls back silently" {
+    // unset or blank: defaultTile's shape walk, exactly today's choice
+    try testing.expectEqual(@as(?Variant, null), try tileVariant(null, true));
+    try testing.expectEqual(@as(?Variant, null), try tileVariant("", false));
+    // every row resolves to a setting tile_settings lists, so the fatbin carries its (nt, w, pf) constexprs
+    for (variants) |t| try testing.expect(tileIndex(t.nt, t.w, t.pf) != null);
+    // one id names both classes, "gu,dn" names each, and a trailing field is ignored past the second
+    try testing.expectEqual(v_glm_gu, (try tileVariant("0", true)).?);
+    try testing.expectEqual(v_glm_gu, (try tileVariant("0", false)).?);
+    try testing.expectEqual(v_glm_gu, (try tileVariant("0,1", true)).?);
+    try testing.expectEqual(v_glm_dn, (try tileVariant("0,1", false)).?);
+    try testing.expectEqual(v_nt4_pf1, (try tileVariant("7,7", true)).?);
+    // an id past the table is loud, never a silent fall back onto the defaults
+    try testing.expectError(error.NoTileVariant, tileVariant("8", true));
+    try testing.expectError(error.NoTileVariant, tileVariant("x", false));
+    // the defaults the switch reproduces: gu -> GLM's gate/up tile, dn -> GLM's down tile, for the pack's shapes
+    try testing.expectEqual(glm_gateup, try variantTile(v_glm_gu, 2560, 640));
+    try testing.expectEqual(glm_down, try variantTile(v_glm_dn, 640, 2560));
+    // a variant that does not divide the shape (640/16 = 40, not a multiple of sk*w = 16) is loud, not a fall back
+    try testing.expectError(error.NoTileShape, variantTile(v_nt4_pf1, 640, 512));
+    try testing.expectEqual(@as(usize, 4), (try variantTile(v_glm_gu, 2560, 512)).sk);
 }
 
 test "an expert's trellis bytes and a layer's width envelope" {
