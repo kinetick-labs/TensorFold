@@ -6,7 +6,7 @@ binary, not the Python runtime. It is the Zig counterpart of the public Python r
 [`sxuff/qwen38-flash-next-dgx-spark`](https://github.com/sxuff/qwen38-flash-next-dgx-spark): same
 family, same checkpoint, a different engine with the same mechanisms under Zig names.
 
-Default operating point: **262,144-token window, MTP depth 6, bf16 KV, two streams, CUDA graphs on**.
+Default operating point: **262,144-token window, MTP depth 15, product stop at -0.4, bf16 KV, two streams, CUDA graphs on**.
 
 **Scope.** Text only. The Zig engine has no vision turn: it does not load the checkpoint's vision
 tower and exposes no image or video input. The vision weights (`vision_k6.safetensors` in the pack, a
@@ -22,10 +22,11 @@ Quantization:     4.05bpw_h6_ng6
 Engine:           Zig (tensorfold-native), Zig 0.17.0
 Hardware:         one GB10, 128 GB unified memory
 Context:          262,144 tokens
-MTP:              depth 6, confidence 0.70 (TF_FLASHNEXT_DEPTH, TF_FLASHNEXT_CONFIDENCE)
+MTP:              depth 15, running-product stop at -0.4 (TF_FLASHNEXT_DEPTH, TF_FLASHNEXT_CONFIDENCE)
 KV cache:         bf16 (default)
 Streams:          2 (--parallel 2)
-N-gram table:     rows gathered per prompt chunk, no prefetch stage (TF_FLASHNEXT_PREFILL_ROWS)
+Experts window:   2048 rows (TF_FLASHNEXT_X3_MOE_WINDOW)
+N-gram table:     rows gathered per prompt chunk, no prefetch stage (TF_FLASHNEXT_PREFILL_ROWS, default 2048)
 CUDA graphs:      on by default (TF_FLASHNEXT_GRAPH_LOG counts them)
 Vision:           not supported (text only)
 API:              OpenAI-compatible, bound to 127.0.0.1
@@ -121,9 +122,12 @@ For GB10 (`sm_121`) the relevant directory is `share/tensorfold/cuda/sm121/`.
 
 ## 3. Serving
 
-sxuff's profile is a set of service settings; in the Zig engine each maps to a variable or flag. The
-**depth and confidence are read from the environment**, not from the server flags — the native CUDA
-Flash Next path builds its options from `TF_FLASHNEXT_DEPTH` and `TF_FLASHNEXT_CONFIDENCE`
+sxuff's profile is a set of service settings; in the Zig engine each maps to a variable or flag.
+**This recipe serves the engine's own defaults**: depth 15 and the running-product stop at -0.4.
+The table is how sxuff's depth 6 / 0.70 profile maps onto those variables. Depth and confidence
+are read from the
+environment, not from the server flags — the native CUDA Flash Next path builds its options from
+`TF_FLASHNEXT_DEPTH` and `TF_FLASHNEXT_CONFIDENCE`
 (`zig/src/families/flashnext/cuda_native.zig:91`, `cuda_engine.zig:62`); the parsed `--mtp-drafts` /
 `--mtp-confidence` server flags are not wired to this family.
 
@@ -143,19 +147,25 @@ Confidence detail: the checkpoint's packed profile is the MTP-6 / 0.70 rule. `cu
 keeps that value as `default_confidence = 0.70`, but the **served** default is the running-product
 stop rule (`served_confidence = -0.4`, `cuda_engine.zig:47`). A positive `TF_FLASHNEXT_CONFIDENCE`
 selects Python's per-draft rule, so `TF_FLASHNEXT_CONFIDENCE=0.70` reproduces sxuff's threshold;
-leaving it unset serves the product rule instead.
+leaving it unset serves the product rule instead. `default_depth = 6` (`cuda_engine.zig:39`) is the
+options-struct default; `cuda_native.zig:91` passes 15 when `TF_FLASHNEXT_DEPTH` is unset, and that
+is the depth a serve actually runs.
 
-Two further defaults worth knowing: `TF_FLASHNEXT_PRODUCT_STREAMS=2` (the stop rule the server uses
-while at most two streams are live; a different concept from `--parallel 2`) and
-`TF_FLASHNEXT_X3_MOE_WINDOW=2048` (the grouped-experts window; `cuda_forward.zig:336`).
+Two further defaults worth knowing: `TF_FLASHNEXT_PRODUCT_STREAMS=2` (the product rule while at most
+two streams are live, then `wide_confidence` 0.5; a different concept from `--parallel 2`;
+`cuda_engine.zig:53`) and `TF_FLASHNEXT_X3_MOE_WINDOW=2048` (the grouped-experts window;
+`cuda_forward.zig:335`).
 
-Complete command (from the clone root, or from the unpacked archive's `bin/`):
+The command below is the served operating point behind the **50.4 tok/s** decode and **2.22
+tokens/round** figures. Unset variables resolve to the same values.
 
 ```bash
-export TF_FLASHNEXT_DEPTH=6
-export TF_FLASHNEXT_CONFIDENCE=0.70
+export TF_FLASHNEXT_DEPTH=15
+export TF_FLASHNEXT_CONFIDENCE=-0.4
+export TF_FLASHNEXT_PRODUCT_STREAMS=2
+export TF_FLASHNEXT_X3_MOE_WINDOW=2048
 # optional: confirm the decode/verify graphs are being captured
-export TF_FLASHNEXT_GRAPH_LOG=1
+# export TF_FLASHNEXT_GRAPH_LOG=1
 
 zig-out/native/bin/tensorfold-native serve /home/jct-spark/models/exl3-405 \
   --host 127.0.0.1 --port 8001 --name bench \
@@ -170,19 +180,24 @@ they are required for vision, which this engine lacks); one stream also serves t
 
 ## 4. Measured figures
 
-All figures below were taken on one GB10 (sm_121) with the checkpoint and settings above, through the
-Zig server. Treat each as a band, not a specification.
+Decode and draft-acceptance figures below were taken on one GB10 (sm_121) with the checkpoint and
+the serve command above, through the Zig server. Treat each as a band, not a specification. The
+Fibonacci prompt is `tools/bench_openai.py`'s `fibonacci-raw`: "Write a short Python function that
+computes the Fibonacci sequence and explain it." Decode tok/s is `(completion tokens - 1) / (last
+token time - first token time)`, the median of three repetitions, temperature 0. One request is one
+live stream, so the stop stays the running product (`p1 * ... * pj >= 0.4`) rather than
+`wide_confidence` 0.5.
 
 | Metric | Value | Method | Reserve |
 | --- | ---: | --- | --- |
-| Decode, Fibonacci prompt | 50.4 tok/s | MTP depth 6, short prompt, temperature 0, median of three repetitions | One GB10, greedy, short prompt only |
-| Decode, chat prompt | 42.7 tok/s | same method | as above |
+| Decode, Fibonacci prompt | 50.4 tok/s | depth 15, product stop -0.4, experts window 2048, temperature 0, median of three | One GB10, `--context 262144`, `--parallel 2`, bf16 KV, graphs on |
+| Decode, chat prompt | 42.7 tok/s | same serve and timing | as above |
 | Prefill | 770–780 tok/s | ~14,400-token prompt with `TF_FLASHNEXT_PREFILL_ROWS=4096` | Chunk rows 4096, above the one-GPU default 2048 |
-| Draft acceptance | 56.7 % | MTP depth 6, tokens emitted per round 2.22 | Drafts only; the kept tokens are the target's either way |
+| Draft acceptance | 56.7 % | same serve; 2.22 tokens emitted a round | Measured acceptance, not a ceiling |
 | Served output after the rebase | bit-identical | `token_sha afccd937e6ac` matched before and after the rebase | One prompt |
 
-The engine is expected to emit at most `depth + 1` rows a window; a 2.22-token average round is the
-measured outcome of the acceptance rule, not a configured ceiling.
+A window holds at most `depth + 1` = 16 rows. 2.22 tokens a round is the measured outcome of the
+product stop, not a configured ceiling.
 
 **Not comparable to sxuff's 75.68 tok/s.** That figure is the Python recipe's short-prompt decode on
 **40,960-token context, text only, one stream**; this page's operating point is **262,144** and two
