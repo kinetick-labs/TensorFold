@@ -835,10 +835,11 @@ const Loader = struct {
         const t = try L.linear(name, n, k);
         if (t.dtype == .bf16) return .{ .b16 = try L.face(try std.fmt.bufPrint(&b, "{s}.b.weight", .{path}), &.{.{ .t = t }}) };
         const ptr = try L.out.begin(try std.fmt.bufPrint(&b, "{s}.f16.weight", .{path}), "float16", &.{ n, k });
+        // linear() required a packed [n, k] fp16 tensor. Those bytes are one contiguous payload, so one memcpy
+        // is the same bytes the per-row copy wrote.
         const host = try L.staging(n * k * 2);
-        for (0..n) |row| {
-            @memcpy(host[row * k * 2 ..][0 .. k * 2], t.bytes[row * k * 2 ..][0 .. k * 2]);
-        }
+        if (t.bytes.len < host.len) return error.UnexpectedTensor;
+        @memcpy(host, t.bytes[0..host.len]);
         try L.out.put(host);
         try L.out.end();
         return .{ .f16 = .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k) } };
