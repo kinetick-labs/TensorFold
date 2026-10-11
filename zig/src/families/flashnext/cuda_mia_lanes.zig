@@ -185,6 +185,22 @@ pub fn Lanes(comptime E: type) type {
         }
 
         pub fn backend(self: *Self) be.Backend {
+            // The vtable must be comptime-known, in rodata: a single literal carrying a runtime field
+            // (`if (@hasDecl(E,"fillBegin") and self.sliced)`) is not comptime, so `&.{...}` points at a
+            // temporary of THIS frame and dangles once backend() returns (the caller then jumps through a
+            // zeroed/garbage slot). So each branch below is a fully comptime literal and only the choice is runtime.
+            if (@hasDecl(E, "fillBegin") and self.sliced) return .{ .ptr = self, .vtable = &.{
+                .prefill = prefillFn,
+                .prefill_step = prefillStepFn,
+                .first = firstFn,
+                .queue = queueFn,
+                .read = readFn,
+                .verify = verifyFn,
+                .keep = keepFn,
+                .draft = draftFn,
+                .tree = heldFn,
+                .release = releaseFn,
+            } };
             return .{ .ptr = self, .vtable = &.{
                 .prefill = prefillFn,
                 .first = firstFn,
@@ -195,7 +211,6 @@ pub fn Lanes(comptime E: type) type {
                 .draft = draftFn,
                 .tree = heldFn,
                 .release = releaseFn,
-                .prefill_step = if (@hasDecl(E, "fillBegin") and self.sliced) prefillStepFn else null,
             } };
         }
 
@@ -261,12 +276,12 @@ pub fn Lanes(comptime E: type) type {
         fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
             const self = of(ptr);
             self.fillLate();
-            const l = self.lanes.get(s) orelse return error.UnknownStream;
-            if (l.fill == null) {
-                // the first slice: the admission and agreements, its resume made, the first segment started
-                try prefillBeginFn(ptr, s);
-            }
+            // the first slice: no lane yet (or one whose fill has not begun), so prefillBeginFn's admission makes
+            // it and starts the first segment; a later slice finds the lane with its fill in progress
+            const begun = self.lanes.get(s);
+            if (begun == null or begun.?.fill == null) try prefillBeginFn(ptr, s);
             try self.agree(null); // the ranks only meet before the slices' collectives
+            const l = self.lanes.get(s) orelse return error.UnknownStream;
             const f = &(l.fill orelse return error.NotFilling);
             const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
             if (!done) return false;
