@@ -340,15 +340,15 @@ pub fn x3MoeWindow() usize {
 }
 
 fn x3MoeWindowEnv() ?[]const u8 {
-    const state = struct {
+    const held = struct {
         var text: ?[]const u8 = null;
         var read: bool = false;
     };
-    if (!state.read) {
-        state.text = if (std.c.getenv("TF_FLASHNEXT_X3_MOE_WINDOW")) |p| std.mem.span(p) else null;
-        state.read = true;
+    if (!held.read) {
+        held.text = if (std.c.getenv("TF_FLASHNEXT_X3_MOE_WINDOW")) |p| std.mem.span(p) else null;
+        held.read = true;
     }
-    return state.text;
+    return held.text;
 }
 
 /// Rows the grouped-expert scratch must hold. The pass uses min(the env window, the shared-memory cap), and the cap
