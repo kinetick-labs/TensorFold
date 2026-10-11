@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 
 import numpy as np
 
@@ -245,3 +246,123 @@ def a_bytes_reread(per_split: int, mtl: int, NT: int) -> int:
     """The A bytes the re-reading arm's loop structure loads a program: a member row's slice once a n tile."""
 
     return mtl * 16 * staged_words(per_split) * 4 * NT
+
+
+# the gm arm (upstream's gm_kernel ported): members the mma B operand staged, weights the mma A operand, columns split.
+
+# trace_gm_pass reproduces fold_grouped_trace's per-element reduction tree, hence the default arm's fp32 bits.
+
+GM_BM = 128          # NG * 8 member rows a program (NG 16, one Hadamard block: 128 columns)
+
+
+def _gm_column_owner(nt: int, mtl: int) -> dict:
+    """Which warp owns each column tile: warp c owns tiles [c*mtl, (c+1)*mtl) (upstream's `slice`), a partition."""
+
+    owner = {}
+    for c in range(WARPS):
+        for i in range(c * mtl, (c + 1) * mtl):
+            assert i < nt, ("tile past the block", i, nt)
+            owner[i] = c
+    assert sorted(owner) == list(range(nt)), ("a tile is owned twice or never", sorted(owner))
+    return owner
+
+
+def _gm_chains(KT: int, SK: int, nt0: int, i: int, h: int) -> tuple:
+    """The chains one output element sums, in the epilogue's own order: split ascending, then warp ascending."""
+
+    per_split = KT // SK
+    per_warp = per_split // WARPS
+    out = []
+    for s in range(SK):
+        for w in range(WARPS):
+            kt0 = s * per_split + w * per_warp
+            out.append((s, w, tuple((kt0 + it, nt0 + i, h) for it in range(per_warp))))
+    return tuple(out)
+
+
+_gm_chains_cached = lru_cache(maxsize=None)(_gm_chains)
+
+
+def trace_gm_pass(members: np.ndarray, ucount: int, K: int, N: int, P: int, SK: int, slots: int, mats: int,
+                  NT: int, mtl: int, bm: int = GM_BM) -> dict:
+    """The gm arm as this tree runs it: `bm` member rows the B operand (staged), weights the A operand, split."""
+
+    maxm = members.shape[1]
+    KT, MG = K // TILE, (maxm + bm - 1) // bm
+    _gm_column_owner(NT, mtl)
+    out: dict = {}
+    for u in range(members.shape[0]):
+        if u >= ucount:
+            continue
+        for by in range(N // (TILE * NT)):
+            nt0 = by * NT
+            for mat in range(mats):
+                for mg in range(MG):
+                    rows = _rows(members, u, mg * bm, bm, maxm, slots)
+                    if rows[0] < 0:
+                        continue
+                    for row in range(bm):
+                        r = rows[row]
+                        if r < 0:
+                            continue
+                        for col in range(NT * TILE):
+                            i, h = col // TILE, (col % TILE) // 8
+                            key = (mat, r, nt0 * TILE + col)
+                            assert key not in out, ("stored twice", key)
+                            out[key] = (int(r), _gm_chains_cached(KT, SK, nt0, i, h))
+    return out
+
+
+def fold_grouped_trace(members: np.ndarray, ucount: int, K: int, N: int, P: int, SK: int, slots: int, mats: int,
+                       NT: int) -> dict:
+    """The default arm's Z folded as its epilogues do: one value an element, chains in split-then-warp order."""
+
+    z = trace_grouped(members, ucount, K, N, P, SK, slots, mats, NT)
+    out: dict = {}
+    for addr, (row, chains) in z.items():
+        column = addr % N
+        r = (addr // N) % P
+        ms = addr // N // P
+        split, mat = ms % SK, ms // SK
+        entry = out.get((mat, r, column))
+        if entry is None:
+            entry = (row, [])
+            out[(mat, r, column)] = entry
+        for w, ch in chains:
+            entry[1].append((split, w, ch))
+    return {k: (r, tuple(c)) for k, (r, c) in out.items()}
+
+
+def trace_gm_single_chain(members: np.ndarray, ucount: int, K: int, N: int, P: int, SK: int, slots: int, mats: int,
+                          NT: int, mtl: int, bm: int = GM_BM) -> dict:
+    """Negative control: gm_kernel's own rule gives one ascending k chain an element -- NOT the default arm's tree."""
+
+    maxm = members.shape[1]
+    KT = K // TILE
+    _gm_column_owner(NT, mtl)
+    out: dict = {}
+    for u in range(members.shape[0]):
+        if u >= ucount:
+            continue
+        for by in range(N // (TILE * NT)):
+            nt0 = by * NT
+            for mat in range(mats):
+                for mg in range((maxm + bm - 1) // bm):
+                    rows = _rows(members, u, mg * bm, bm, maxm, slots)
+                    if rows[0] < 0:
+                        continue
+                    for row in range(bm):
+                        r = rows[row]
+                        if r < 0:
+                            continue
+                        for col in range(NT * TILE):
+                            i, h = col // TILE, (col % TILE) // 8
+                            key = (mat, r, nt0 * TILE + col)
+                            out[key] = (int(r), ((0, 0, tuple((kt, nt0 + i, h) for kt in range(KT))),))
+    return out
+
+
+def gm_a_global_bytes(rows: int, K: int) -> int:
+    """The A tile one 128-column block streams: a member row's whole K once a block, never once a (k x n) tile."""
+
+    return rows * K * 2
