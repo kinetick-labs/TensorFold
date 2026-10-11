@@ -246,7 +246,7 @@ const X3Scratch = struct {
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
     ple_dev: u64, // [max_rows * heads, WORDS] int16: the staged PLE rows as the table stores them (exl3_mm.Scratch.ple_dev)
     ple_hb: u64, // [heads * DH] fp16: the mul1 codebook's per-head bias, the table's own file, uploaded once
-    // the grouped experts' rows: P = x3_moe_window * slots
+    // the grouped experts' rows: P = x3MoeWindow() * slots
     mg: u64, // [P, D] fp16: the rotated gate input
     mu: u64, // [P, D] fp16: the rotated up input
     md: u64, // [P, I] fp16: the SwiGLU's rotated down input
@@ -254,7 +254,7 @@ const X3Scratch = struct {
     my: u64, // [P, D] fp32: a window's per-slot rows
     mids: u64, // [maxu] int32
     mcnt: u64, // [1] int32
-    mmem: u64, // [maxu, x3_moe_window] int32
+    mmem: u64, // [maxu, x3MoeWindow()] int32
 
     fn deinit(x: *X3Scratch) void {
         x.arena.buf.free();
@@ -298,12 +298,19 @@ const X3Scratch = struct {
             if (ng.exl3) |e| plew = @max(plew, e.words);
             pleh = ng.head_bias.len;
         }
-        const mrows = @min(max_rows, x3_moe_window);
+        const mrows = @min(max_rows, x3MoeWindow());
         const slots = g.slots();
         const P = mrows * slots;
         const maxu = @min(P, g.experts);
-        const gu = exl3.defaultTile(g.hidden, g.moe_width, true) catch exl3.glm_gateup;
-        const dn = exl3.defaultTile(g.moe_width, g.hidden, false) catch exl3.glm_down;
+        // the sweep switch's variant when set (a bad one fails here, not silently), else the shape walk's GLM tile
+        const gu = exl3.tile(g.hidden, g.moe_width, true) catch |e| switch (e) {
+            error.NoTileSetting => exl3.glm_gateup,
+            else => return e,
+        };
+        const dn = exl3.tile(g.moe_width, g.hidden, false) catch |e| switch (e) {
+            error.NoTileSetting => exl3.glm_down,
+            else => return e,
+        };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
         const sizes = [14]usize{
             128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
@@ -324,7 +331,11 @@ const X3Scratch = struct {
 };
 
 /// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
-pub const x3_moe_window = 1024;
+pub fn x3MoeWindow() usize {
+    // TF_FLASHNEXT_X3_MOE_WINDOW (default 2048: +7.0-7.6% over 1024 at identical bits) trades scratch for fewer passes.
+    const v = std.c.getenv("TF_FLASHNEXT_X3_MOE_WINDOW") orelse return 2048;
+    return @max(@min(std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2048, 16384), 128);
+}
 
 /// A trellis matrix `a`'s share of an EXL3 scratch's sizes: the widest K, the most split-K partials and counters.
 fn x3Fold(a: ?W.X3, kmax: *usize, zmax: *usize, ctrmax: *usize) void {
@@ -2044,16 +2055,18 @@ pub const Forward = struct {
         const E = g.experts;
         const slots = top + 1;
         if (ex.width != I or ex.dims != D) return error.ExpertShape;
-        const gu = exl3.defaultTile(D, I, true) catch return error.NoTileSetting;
-        const dn = exl3.defaultTile(I, D, false) catch return error.NoTileSetting;
+        const gu = try exl3.tile(D, I, true);
+        const dn = try exl3.tile(I, D, false);
         const set_gu = exl3.tileIndex(gu.nt, gu.w, gu.pf) orelse return error.NoTileSetting;
         const set_d = exl3.tileIndex(dn.nt, dn.w, dn.pf) orelse return error.NoTileSetting;
         const rng_gu = exl3.rangeIndex(ex.k2_gu[0], ex.k2_gu[1]);
         const rng_d = exl3.rangeIndex(ex.k2_d[0], ex.k2_d[1]);
         const es: usize = if (x.y_f32) 4 else 2;
+        // Clamp once: rows*slots*4 <= group_smem_max. Rows change passes not bits; the halving replay was unsound.
+        const win = @min(x3MoeWindow(), exl3.groupWindowMax(k3, slots));
         var r0: usize = 0;
-        while (r0 < n) : (r0 += x3_moe_window) {
-            const R = @min(x3_moe_window, n - r0);
+        while (r0 < n) {
+            const R = @min(win, n - r0);
             const P = R * slots;
             const maxu = @min(P, E);
             const at = a0 + r0;
@@ -2069,6 +2082,7 @@ pub const Forward = struct {
             try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, maxu, slots, E, 1, f.s);
             try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
             try f.mark(.experts_down);
+            r0 += R;
         }
     }
 
