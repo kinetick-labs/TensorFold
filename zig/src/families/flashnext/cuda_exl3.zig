@@ -168,9 +168,21 @@ pub fn variantTile(t: Variant, k: usize, n: usize) !Tile {
 
 /// The tile a class's grouped GEMM takes: the switch's variant when set, else `defaultTile`'s shape walk, unchanged.
 pub fn tile(k: usize, n: usize, gateup: bool) !Tile {
-    const v: ?[]const u8 = if (std.c.getenv(tile_env)) |e| std.mem.span(e) else null; // a bad id/kernel/shape errors
-    if (try tileVariant(v, gateup)) |t| return variantTile(t, k, n);
+    if (try tileVariant(tileEnvText(), gateup)) |t| return variantTile(t, k, n); // a bad id/kernel/shape errors
     return defaultTile(k, n, gateup);
+}
+
+/// TF_FLASHNEXT_X3_TILE, read once. A forward asks per MoE layer, and the text does not change during the process.
+fn tileEnvText() ?[]const u8 {
+    const state = struct {
+        var text: ?[]const u8 = null;
+        var read: bool = false;
+    };
+    if (!state.read) {
+        state.text = if (std.c.getenv(tile_env)) |p| std.mem.span(p) else null;
+        state.read = true;
+    }
+    return state.text;
 }
 
 /// Trellis bytes one expert's gate, up and down read: (D*I/256) * (k2g + k2u + k2d) * 16 (experts.py:120).
@@ -992,6 +1004,13 @@ test "bitsOf reads the width off the trellis, per tensor" {
     try testing.expectEqual(@as(?f64, null), bitsOf(&.{ 160, 40, 63 }));
     try testing.expectEqual(@as(?f64, null), bitsOf(&.{ 160, 40, 61 })); // the n-gram table's row: 61 is odd
     try testing.expectEqual(@as(?f64, null), bitsOf(&.{}));
+}
+
+test "tile keeps the setting it read" {
+    const gu = try tile(2560, 640, true);
+    try testing.expectEqual(gu, try tile(2560, 640, true));
+    const dn = try tile(640, 2560, false);
+    try testing.expectEqual(dn, try tile(640, 2560, false));
 }
 
 test "the tile setting defaultTile picks is one the fatbin carries" {
