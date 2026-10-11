@@ -438,6 +438,12 @@ pub const sym = struct {
             "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
     };
+    /// tf_exl3x: the staged gm arm (128 members a program, the member rows the B operand), opt-in (TF_FLASHNEXT_X3_GM).
+    pub const grouped_gm = [3][:0]const u8{
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi8ELi8ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi10ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi16ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+    };
     /// tf_exl3x: the width's dequantize-to-dense (the grouped path's own decoder)
     pub const dequant = [3][:0]const u8{
         "_ZN10tf_fn_exl38tf_exl3x14dequant_kernelILi2ELi8EEEvPKjP6__halfii",
@@ -463,11 +469,15 @@ pub const Kernels = struct {
     grouped_wide: [4][3]?cuda.Function,
     /// the decode ablation's instances: null when the embedded fatbin predates them (a timing probe, off by default)
     grouped_abl: [4][3]?cuda.Function,
+    /// the staged gm arm's instances: null when the embedded fatbin predates them (opt-in, off by default)
+    grouped_gm: [3]?cuda.Function,
     dequant: [3]cuda.Function,
     /// dynamic shared memory group_kernel was opted into (the device's ceiling less its static use)
     group_smem_max: u32,
     /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
     wide_smem_max: u32,
+    /// the gm arm's dynamic ceiling (the device's opt-in less its static use), for the staged member ring
+    gm_smem_max: u32,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -494,6 +504,7 @@ pub const Kernels = struct {
         for (sym.grouped_abl, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped_abl[i][j] = k.module.function(s) catch null;
         };
+        for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
         // group_kernel's grouping buffer: R*slots ints, which passes 48 KiB once a call has enough routed slots.
         // experts.cu:296 lifts the limit against the device's own opt-in ceiling less the kernel's static use.
@@ -507,6 +518,12 @@ pub const Kernels = struct {
         for (k.grouped_wide) |row| for (row) |maybe| {
             if (maybe) |f| try f.allowDynamicShared(k.wide_smem_max);
         };
+        // the gm arm stages its member ring in dynamic shared: opt the staged instances in against the same ceiling
+        const gstatic: usize = if (k.grouped_gm[0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
+        k.gm_smem_max = @intCast(ceiling -| gstatic);
+        for (k.grouped_gm) |maybe| {
+            if (maybe) |f| try f.allowDynamicShared(k.gm_smem_max);
+        }
         return k;
     }
 
@@ -693,7 +710,6 @@ pub fn wideStageSmem(per_split: usize, w: usize) usize {
 fn wideFlag(v: ?[]const u8) bool {
     return if (v) |s| !std.mem.eql(u8, s, "0") else false;
 }
-
 /// Whether the wide arm runs: TF_FLASHNEXT_X3_WIDE_MEMBERS, off by default (the staged A tile arm, unmeasured).
 pub fn wideMembers() bool {
     const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_WIDE_MEMBERS")) |e| std.mem.span(e) else null;
@@ -706,17 +722,39 @@ pub fn ablateDecode() bool {
     return wideFlag(v);
 }
 
+/// Whether the staged gm arm runs: TF_FLASHNEXT_X3_GM, off by default (upstream's gm_kernel ported as an opt-in arm).
+pub fn gmMembers() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_GM")) |e| std.mem.span(e) else null;
+    return wideFlag(v);
+}
+
+/// The gm arm's setting: NT 8 / W 8 / KS 2 / NSA 4, and SUBW 4 (the shipped warp count, so its 4 k sub-ranges).
+pub const gm_nt: usize = 8;
+pub const gm_warps: usize = 8;
+pub const gm_ks: usize = 2;
+pub const gm_nsa: usize = 4;
+pub const gm_subw: usize = 4;
+
+/// The gm arm's dynamic shared: NSA stages of 128 rows of the stage's KS k tiles (swizzled); run is in registers.
+pub fn gmStageSmem(ks: usize) usize {
+    return gm_nsa * (128 * ks * 16 * 2);
+}
+/// The gm arm's dynamic shared a block: KS 2 stages of 128 rows.
+pub fn gmSmem() usize {
+    return gmStageSmem(gm_ks);
+}
+/// The gm arm runs where the shipped arm uses SUBW 4 warps and its sub-range per_split/SUBW is a whole KS-tile count.
+pub fn gmShapeOk(kk: usize, n: usize, sk: usize, shipped_w: usize) bool {
+    if (shipped_w != gm_subw or sk == 0 or n % (16 * gm_nt) != 0 or kk % 16 != 0) return false;
+    if (kk / 16 % sk != 0) return false;
+    const per_split = kk / 16 / sk;
+    if (per_split % gm_subw != 0) return false;
+    return (per_split / gm_subw) % gm_ks == 0;
+}
+
 /// The grouped expert GEMM: 16 members a program, or 32 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
-    const wide = wideMembers();
-    const abl = !wide and ablateDecode();
     const t = tile_settings[setting];
-    // the staged arm runs only where its A tile fits the device opt-in; a wider split (sk 1 or 2) falls back to MTL 1
-    const stage = wideStageSmem(kk / 16 / sk, t.w);
-    const staged = wide and stage <= k.wide_smem_max;
-    const mtl: usize = if (staged) wide_member_tiles else 1;
-    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
-    const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
     var a: cuda.Args = .{};
     a.add(x0);
     a.add(x1);
@@ -734,6 +772,22 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(sk));
     a.add(int(maxm));
     a.add(int(slots));
+    // The staged gm arm (opt-in): member rows the B operand, decoded weights the A operand; wins over the wide arm.
+    const gm = gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
+    if (gm) {
+        const f = k.grouped_gm[range] orelse return error.NoGmKernel;
+        const mtiles = (maxm + 127) / 128;
+        const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
+        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
+    }
+    const wide = wideMembers();
+    const abl = !wide and ablateDecode();
+    // the staged arm runs only where its A tile fits the device opt-in; a wider split (sk 1 or 2) falls back to MTL 1
+    const stage = wideStageSmem(kk / 16 / sk, t.w);
+    const staged = wide and stage <= k.wide_smem_max;
+    const mtl: usize = if (staged) wide_member_tiles else 1;
+    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
+    const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
     const f = if (staged) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else if (abl) (k.grouped_abl[setting][range] orelse return error.NoAblKernel) else k.grouped[setting][range];
     const sh: u32 = if (staged) @intCast(stage) else 0;
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) }, .shared = sh }, s, &a);
