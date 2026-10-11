@@ -453,12 +453,17 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqualStrings("x", (try parse(a, &.{ "m", "--drafter", "x" }, &u)).drafter.?);
     try std.testing.expectEqual(@as(u8, 0), (try parse(a, &.{ "m", "--drafter-bits", "0" }, &u)).drafter_bits);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-bits", "8" }, &u));
-    const two = try parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1", "--master-port", "29551" }, &u);
-    try std.testing.expectEqual(@as(u32, 2), two.tp);
-    try std.testing.expectEqual(@as(u32, 1), two.rank);
-    try std.testing.expectEqualStrings("10.0.22.1", two.master);
-    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2" }, &u)); // no --master
-    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--rank", "1" }, &u)); // rank 1 of 1
+    // two-rank options: only where the backend's `serves` advertises them (native/cuda.zig lists --tp and friends)
+    if (servedBy(native_serves, "--tp")) {
+        const two = try parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1", "--master-port", "29551" }, &u);
+        try std.testing.expectEqual(@as(u32, 2), two.tp);
+        try std.testing.expectEqual(@as(u32, 1), two.rank);
+        try std.testing.expectEqualStrings("10.0.22.1", two.master);
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2" }, &u)); // no --master
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--rank", "1" }, &u)); // rank 1 of 1
+    } else {
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1" }, &u));
+    }
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
