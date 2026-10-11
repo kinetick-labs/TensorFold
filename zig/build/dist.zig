@@ -51,6 +51,8 @@ pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.O
         return;
     }
     const fatbin_check = if (fatbins) |dir| cuda.checkDistFatbins(b, dir, privacy) else null;
+    step.dependOn(cuda.kernelSpecCheck(b));
+    if (aot) |dir| step.dependOn(cuda.kernelCaptureCheck(b, dir));
     const sdk = sdk_override orelse if (b.graph.host.result.os.tag == .macos)
         std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\r\n")
     else {
