@@ -50,6 +50,15 @@ fn getenv(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(std.c.getenv(name) orelse return null);
 }
 
+/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
+/// The family's `open` takes a real directory (the pre-rebase contract); when upstream's `aot.pick` reports
+/// our own kernels (.native, no captured set) the driver still hands it the directory it always computed.
+fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
+    if (getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, dir);
+    const exe = try std.process.executableDirPathAlloc(io, a);
+    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
+}
+
 /// A variable's whole number: null when unset or empty, an error for anything else that is not one.
 fn envNumber(text: ?[]const u8) error{Invalid}!?u32 {
     const t = std.mem.trim(u8, text orelse return null, " ");
@@ -504,8 +513,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         fo.master = o.master;
         fo.master_port = o.master_port;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, fo) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels orelse try kernelDir(a, io, capability), fo) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels orelse "its own", @errorName(e) });
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
@@ -545,7 +554,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             h.store = store;
         }
     }
-    h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}", .{
+    h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (@hasField(@TypeOf(loaded), "learn_bytes") and loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
