@@ -22,6 +22,9 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
 };
 
 pub const backends: []const []const u8 = &.{"cuda"};
+/// The serve flags this backend serves past the common ones; cli.zig reads them from the root (engines.serves).
+/// Two-rank serve (--tp/--rank/--master/--master-port, the Flash Next link) and the GPU engine's --policy.
+pub const serves: []const []const u8 = &.{ "--tp", "--rank", "--master", "--master-port", "--policy" };
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
@@ -376,22 +379,10 @@ const Host = struct {
                     x.inner.vtable.release(x.inner.ptr, s);
                 }
             }.f,
-            .prefill_begin = if (v.prefill_begin != null) struct {
-                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
-                    const x = bind(p);
-                    return x.inner.vtable.prefill_begin.?(x.inner.ptr, s);
-                }
-            }.f else null,
             .prefill_step = if (v.prefill_step != null) struct {
-                fn f(p: *anyopaque, ss: []const *lanes.Stream, states: []lanes.backend.FillState) anyerror!void {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
                     const x = bind(p);
-                    return x.inner.vtable.prefill_step.?(x.inner.ptr, ss, states);
-                }
-            }.f else null,
-            .prefill_many = if (v.prefill_many != null) struct {
-                fn f(p: *anyopaque, ss: []const *lanes.Stream) anyerror!void {
-                    const x = bind(p);
-                    return x.inner.vtable.prefill_many.?(x.inner.ptr, ss);
+                    return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
                 }
             }.f else null,
         };
@@ -545,11 +536,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     // a family that hands over its raw state target instead (Nemotron): states kept and resumed on the family's grid,
     // where a cache-off pass cuts; the head reads one token on
-    if (!@hasField(@TypeOf(loaded), "cache")) if (cache > 0) {
-        const pc = api.prompt_cache;
-        const store = try gpa.create(pc.Store);
-        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{ .lookahead = 1, .planned = true, .grid = F.prompt_rows }, cache);
-        h.store = store;
+    if (!@hasField(@TypeOf(loaded), "cache")) {
+        if (cache > 0) {
+            const pc = api.prompt_cache;
+            const store = try gpa.create(pc.Store);
+            store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{ .lookahead = 1, .planned = true, .grid = F.prompt_rows }, cache);
+            h.store = store;
+        }
     }
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}", .{
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (@hasField(@TypeOf(loaded), "learn_bytes") and loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
@@ -560,20 +553,22 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         store.deinit();
         gpa.destroy(store);
     };
-    if (@hasField(@TypeOf(loaded), "learns")) if (loaded.learns != null) {
-        const Slide = nemotron_slide.Adapter(F.slide);
-        h.dir = try gpa.dupe(u8, o.dir);
-        const s = try gpa.create(Slide);
-        s.* = Slide.init(gpa, io, F.learnModel(loaded.ctx, h.dir));
-        h.slide = s;
-        h.slide_free = struct {
-            fn f(al: Allocator, p: *anyopaque) void {
-                const x: *Slide = @ptrCast(@alignCast(p));
-                x.deinit();
-                al.destroy(x);
-            }
-        }.f;
-        h.learn = s.hook();
+    if (@hasField(@TypeOf(loaded), "learns")) {
+        if (loaded.learns != null) {
+            const Slide = nemotron_slide.Adapter(F.slide);
+            h.dir = try gpa.dupe(u8, o.dir);
+            const s = try gpa.create(Slide);
+            s.* = Slide.init(gpa, io, F.learnModel(loaded.ctx, h.dir));
+            h.slide = s;
+            h.slide_free = struct {
+                fn f(al: Allocator, p: *anyopaque) void {
+                    const x: *Slide = @ptrCast(@alignCast(p));
+                    x.deinit();
+                    al.destroy(x);
+                }
+            }.f;
+            h.learn = s.hook();
+        }
     }
     errdefer if (h.slide) |s| {
         h.slide_free.?(gpa, s);
