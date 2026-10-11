@@ -415,6 +415,29 @@ pub const sym = struct {
             "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
     };
+    /// tf_exl3x: the decode ablation (grouped_abl_kernel, timing probe only, garbage output), same table order, MTL 1.
+    pub const grouped_abl = [4][3][:0]const u8{
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+    };
     /// tf_exl3x: the width's dequantize-to-dense (the grouped path's own decoder)
     pub const dequant = [3][:0]const u8{
         "_ZN10tf_fn_exl38tf_exl3x14dequant_kernelILi2ELi8EEEvPKjP6__halfii",
@@ -438,6 +461,8 @@ pub const Kernels = struct {
     grouped: [4][3]cuda.Function,
     /// the wide arm's instances: null when the embedded fatbin predates them, so the default path still loads
     grouped_wide: [4][3]?cuda.Function,
+    /// the decode ablation's instances: null when the embedded fatbin predates them (a timing probe, off by default)
+    grouped_abl: [4][3]?cuda.Function,
     dequant: [3]cuda.Function,
     /// dynamic shared memory group_kernel was opted into (the device's ceiling less its static use)
     group_smem_max: u32,
@@ -463,6 +488,9 @@ pub const Kernels = struct {
         };
         for (sym.grouped_wide, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped_wide[i][j] = k.module.function(s) catch null;
+        };
+        for (sym.grouped_abl, 0..) |row, i| for (row, 0..) |s, j| {
+            k.grouped_abl[i][j] = k.module.function(s) catch null;
         };
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
         // group_kernel's grouping buffer: R*slots ints, which passes 48 KiB once a call has enough routed slots.
@@ -657,9 +685,16 @@ pub fn wideMembers() bool {
     return wideFlag(v);
 }
 
+/// Whether the grouped GEMM runs the decode ablation (TF_EXL3_ABL_DECODE): a timing probe, off by default.
+pub fn ablateDecode() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_EXL3_ABL_DECODE")) |e| std.mem.span(e) else null;
+    return wideFlag(v);
+}
+
 /// The grouped expert GEMM: 16 members a program, or 128 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
     const wide = wideMembers();
+    const abl = !wide and ablateDecode();
     const mtl: usize = if (wide) wide_member_tiles else 1;
     const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
     const t = tile_settings[setting];
@@ -681,7 +716,7 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(sk));
     a.add(int(maxm));
     a.add(int(slots));
-    const f = if (wide) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else k.grouped[setting][range];
+    const f = if (wide) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else if (abl) (k.grouped_abl[setting][range] orelse return error.NoAblKernel) else k.grouped[setting][range];
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) } }, s, &a);
 }
 
@@ -710,6 +745,11 @@ test "the wide member-pass arm is off unless the switch is set" {
     // maxm 200: the 16-member path runs 13 member-tile programs, the wide arm 2 groups of 128 rows
     try testing.expectEqual(@as(usize, 13), (200 + 15) / 16);
     try testing.expectEqual(@as(usize, 2), (200 + 16 * 8 - 1) / (16 * 8));
+}
+
+test "the decode ablation shares the wide arm's opt-in reading" {
+    try testing.expect(!wideFlag(null) and !wideFlag("0")); // unset / "0": grouped_kernel, the default path
+    try testing.expect(wideFlag("1")); // set: grouped_abl_kernel, the timing probe
 }
 
 test "plan matches linear.py across the pack's shapes" {

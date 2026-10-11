@@ -16,6 +16,7 @@
 // resolves the kernels by the mangled names recorded in cuda_kernels.zig (cuobjdump -symbols of this fatbin).
 
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -900,6 +901,16 @@ __device__ __forceinline__ void decode_tile(const uint32_t (&w)[Fmt<K2>::LW], co
     b1[1] = cb_pair<CB>(st[6], st[7]);
 }
 
+// Timing probe only (TF_EXL3_ABL_DECODE): the trellis decode's arithmetic out, every loaded word still feeding b0/b1.
+template <int K2>
+__device__ __forceinline__ void decode_tile_abl(const uint32_t (&w)[Fmt<K2>::LW], uint32_t (&b0)[2], uint32_t (&b1)[2]) {
+    uint32_t x = 0;
+#pragma unroll
+    for (int l = 0; l < Fmt<K2>::LW; ++l) x ^= w[l];   // the loads stay live: the result uses every word (no dead load)
+    b0[0] = x; b0[1] = x ^ 0x0101u;
+    b1[0] = x ^ 0x0202u; b1[1] = x ^ 0x0404u;
+}
+
 __device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
@@ -924,7 +935,7 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
 }
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
-template <int CB, int K2, int NT, int PF>
+template <int CB, int K2, int NT, int PF, int ABL = 0>
 __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
                                            const half* x0, const half* x1, bool ok0, bool ok1, int lane,
                                            float (&acc)[NT][2][4]) {
@@ -960,7 +971,8 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
 #pragma unroll
                 for (int i = 0; i < NT; ++i) {
                     uint32_t b0[2], b1[2];
-                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+                    if constexpr (ABL) decode_tile_abl<K2>(w[i], b0, b1);
+                    else decode_tile<CB, K2>(w[i], map, lane, b0, b1);
                     mma16816(acc[i][0], a, b0);
                     mma16816(acc[i][1], a, b1);
                 }
@@ -970,7 +982,7 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
 }
 
 // The wide arm's k loop: one decode a (n tile, k tile) feeds the MTL member tiles' mma passes (upstream's gm_kernel).
-template <int CB, int K2, int PF, int MTL>
+template <int CB, int K2, int PF, int MTL, int ABL = 0>
 __device__ __forceinline__ void warp_tile_wide(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt,
                                                const half* const (&xb0)[MTL], const half* const (&xb1)[MTL],
                                                const bool (&ok0)[MTL], const bool (&ok1)[MTL], int live, int lane,
@@ -995,7 +1007,8 @@ __device__ __forceinline__ void warp_tile_wide(const uint32_t* __restrict__ T, i
                 for (int l = 0; l < LW; ++l) w[l] = pf[d][l];
                 if (it + PF < nkt) load_words<K2>(pf[d], tp + (size_t)(it + PF) * kstride, lane);
                 uint32_t b0[2], b1[2];
-                decode_tile<CB, K2>(w, map, lane, b0, b1);      // the one decode the MTL passes below share
+                if constexpr (ABL) decode_tile_abl<K2>(w, b0, b1);
+                else decode_tile<CB, K2>(w, map, lane, b0, b1);
                 const int k = (kt0 + it) * 16;
 #pragma unroll
                 for (int tt = 0; tt < MTL; ++tt) {
@@ -1200,6 +1213,190 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 }
 
+// Timing probe only (TF_EXL3_ABL_DECODE): grouped_kernel with the trellis decode's arithmetic replaced by a passthrough
+template <int CB, int NT, int W, int PF, int LO, int HI, int MTL>
+__global__ void __launch_bounds__(W * 32) grouped_abl_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    const int u = blockIdx.x;
+    if (u >= ucount[0]) return;
+    const int MTG = (maxm + 16 * MTL - 1) / (16 * MTL);
+    const int mg = blockIdx.z % MTG;
+    const int split = (blockIdx.z / MTG) % SK;
+    const int mat = blockIdx.z / MTG / SK;
+    const half* X = mat ? X1 : X0;
+    const int e = uids[u];
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KT = K >> 4, NTILES = N >> 4;
+    const int per_split = KT / SK, per_warp = per_split / W;
+    const int kt0 = split * per_split + warp * per_warp;
+    const int nt0 = blockIdx.y * NT;
+
+    // Deferred: upstream stages these rows in a swizzled cp.async A-tile (B via ldsm4); here they are global reads.
+    __shared__ int rows_sh[16 * MTL];
+    for (int i = threadIdx.x; i < 16 * MTL; i += W * 32) {
+        const int m = mg * 16 * MTL + i;
+        const int code = m < maxm ? members[u * maxm + m] : -1;
+        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    if (rows_sh[0] < 0) return;                           // members come first, so this group is empty
+
+    if constexpr (MTL > 1) {
+        // The wide arm: MTL member tiles a program, their rows in shared, one decode a (n, k) tile for all of them.
+        int live = 0;
+#pragma unroll
+        for (int tt = 0; tt < MTL; ++tt)
+            if (rows_sh[tt * 16] >= 0) live = tt + 1;     // members ascend, so the first dead row ends the group
+        __shared__ float redw[W][16 * MTL][16];
+        const half* xb0[MTL];
+        const half* xb1[MTL];
+        bool ok0[MTL], ok1[MTL];
+#pragma unroll
+        for (int tt = 0; tt < MTL; ++tt) {
+            const int r0 = rows_sh[tt * 16 + g], r1 = rows_sh[tt * 16 + g + 8];
+            xb0[tt] = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+            xb1[tt] = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
+            ok0[tt] = r0 >= 0;
+            ok1[tt] = r1 >= 0;
+        }
+        for (int i = 0; i < NT; ++i) {
+            if (i) __syncthreads();                       // redw is reused: the previous n tile's store has read it
+            float acc[MTL][2][4];
+#pragma unroll
+            for (int tt = 0; tt < MTL; ++tt)
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[tt][h][c] = 0.f;
+            switch (k2) {
+#define TF_EXL3W_CASE(K2_)                                                                                      \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            warp_tile_wide<CB, K2_, PF, MTL, 1>(T, NTILES, kt0, per_warp, nt0 + i, xb0, xb1, ok0, ok1, live, lane,  \
+                                             acc);                                                              \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+                TF_EXL3W_CASE(2)
+                TF_EXL3W_CASE(3)
+                TF_EXL3W_CASE(4)
+                TF_EXL3W_CASE(5)
+                TF_EXL3W_CASE(6)
+                TF_EXL3W_CASE(7)
+                TF_EXL3W_CASE(8)
+                TF_EXL3W_CASE(9)
+                TF_EXL3W_CASE(10)
+                TF_EXL3W_CASE(11)
+                TF_EXL3W_CASE(12)
+                TF_EXL3W_CASE(13)
+                TF_EXL3W_CASE(14)
+                TF_EXL3W_CASE(15)
+                TF_EXL3W_CASE(16)
+#undef TF_EXL3W_CASE
+                default:
+                    __trap();
+            }
+            // this n tile's MTL member tiles through shared memory, warps added in order
+#pragma unroll
+            for (int tt = 0; tt < MTL; ++tt) {
+                if (tt < live) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int col = h * 8 + 2 * t;
+                        redw[warp][tt * 16 + g][col] = acc[tt][h][0];
+                        redw[warp][tt * 16 + g][col + 1] = acc[tt][h][1];
+                        redw[warp][tt * 16 + g + 8][col] = acc[tt][h][2];
+                        redw[warp][tt * 16 + g + 8][col + 1] = acc[tt][h][3];
+                    }
+                }
+            }
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < 16 * live * 16; idx += W * 32) {
+                const int tt = idx / 256, rl = (idx / 16) % 16, col = idx % 16;
+                const int r = rows_sh[tt * 16 + rl];
+                if (r < 0) continue;
+                float s = redw[0][tt * 16 + rl][col];
+#pragma unroll
+                for (int w = 1; w < W; ++w) s += redw[w][tt * 16 + rl][col];
+                Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + i * 16 + col] = s;
+            }
+        }
+    } else {
+    __shared__ float red[W][16][NT * 16];
+    for (int tt = 0; tt < MTL; ++tt) {
+        if (rows_sh[tt * 16] < 0) break;                  // members ascend, so the first dead row ends the group
+        if (tt) __syncthreads();                          // red is reused: the previous tile's store has read it
+        const int r0 = rows_sh[tt * 16 + g], r1 = rows_sh[tt * 16 + g + 8];
+        const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+        const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
+
+    float acc[NT][2][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+
+    switch (k2) {
+#define TF_EXL3X_CASE(K2_)                                                                                      \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            warp_tiles<CB, K2_, NT, PF, 1>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        TF_EXL3X_CASE(2)
+        TF_EXL3X_CASE(3)
+        TF_EXL3X_CASE(4)
+        TF_EXL3X_CASE(5)
+        TF_EXL3X_CASE(6)
+        TF_EXL3X_CASE(7)
+        TF_EXL3X_CASE(8)
+        TF_EXL3X_CASE(9)
+        TF_EXL3X_CASE(10)
+        TF_EXL3X_CASE(11)
+        TF_EXL3X_CASE(12)
+        TF_EXL3X_CASE(13)
+        TF_EXL3X_CASE(14)
+        TF_EXL3X_CASE(15)
+        TF_EXL3X_CASE(16)
+#undef TF_EXL3X_CASE
+        default:
+            __trap();
+    }
+
+        // warps' partial sums through shared memory, added in warp order
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = i * 16 + h * 8 + 2 * t;
+                red[warp][g][col] = acc[i][h][0];
+                red[warp][g][col + 1] = acc[i][h][1];
+                red[warp][g + 8][col] = acc[i][h][2];
+                red[warp][g + 8][col + 1] = acc[i][h][3];
+            }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+            const int row = idx / (NT * 16), col = idx % (NT * 16);
+            const int r = rows_sh[tt * 16 + row];
+            if (r < 0) continue;
+            float s = red[0][row][col];
+#pragma unroll
+            for (int w = 1; w < W; ++w) s += red[w][row][col];
+            Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+        }
+    }
+    }
+}
+
 // W_q [K, N] fp16 of one matrix through the same lane decode (tests; not on the forward path).
 template <int CB, int K2>
 __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int K, int N) {
@@ -1242,10 +1439,17 @@ template <int CB, int MTL>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MTG = (a.maxm + 16 * MTL - 1) / (16 * MTL);
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MTG));
+    const char* abl_e = getenv("TF_EXL3_ABL_DECODE");
+    const bool abl = abl_e != nullptr && abl_e[0] != '0';   // timing probe: unset or "0" is off (the repo's getenv idiom)
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, MTL><<<grid, W_ * 32, 0, stream>>>(                              \
-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots)
+    if (abl)                                                                                                    \
+        grouped_abl_kernel<CB, NT_, W_, PF_, LO_, HI_, MTL><<<grid, W_ * 32, 0, stream>>>(                      \
+            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,    \
+            a.maxm, a.slots);                                                                                   \
+    else                                                                                                        \
+        grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, MTL><<<grid, W_ * 32, 0, stream>>>(                          \
+            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,    \
+            a.maxm, a.slots)
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
