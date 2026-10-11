@@ -1791,8 +1791,8 @@ test "prompts filling in slices between rounds equal serial decoding, the prompt
     defer for (&streams) |*s| s.deinit(gpa);
     streams[0].reuse = .{ .marks = &.{ 100, 250 }, .hook = .{ .ptr = &store, .at = KeepAll.hook } };
     // the first stream fills alone; the others arrive while it decodes
-    var filling = [_]bool{false} ** streams.len;
-    var first = [_]bool{true} ** streams.len;
+    var filling: [streams.len]bool = @splat(false);
+    var first: [streams.len]bool = @splat(true);
     filling[0] = true;
     var next: usize = 1;
     var steps: usize = 0;
