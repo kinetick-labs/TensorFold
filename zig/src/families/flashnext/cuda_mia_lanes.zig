@@ -14,6 +14,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const decode = @import("cuda_decode.zig");
+const tel = @import("cuda_telemetry.zig");
 
 const be = lanes.backend;
 
@@ -169,6 +170,7 @@ pub fn Lanes(comptime E: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            tel.shutdown();
             var it = self.lanes.valueIterator();
             while (it.next()) |l| {
                 self.stopFill(l.*);
@@ -790,17 +792,42 @@ pub fn Lanes(comptime E: type) type {
             try self.agree(null);
             const e = self.e;
             const n = windows.len;
+            const watch = tel.on() and !rankOff(e);
+            var t0: std.Io.Timestamp = .zero;
+            if (watch) {
+                tel.beginVerify();
+                if (comptime @hasField(@TypeOf(e.*), "io")) {
+                    t0 = tel.now(e.io);
+                    tel.markGap(.verify, t0);
+                }
+            }
             e.verifyMany(wins[0..n]) catch |err| return self.lost("a round's forward", err);
             self.round += 1;
             for (windows, out, ls[0..n], 0..) |w, o, l, i| {
                 const rows = w.rows();
                 e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows]) catch |err| return self.lost("a window's draws", err);
                 @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
+                if (watch) {
+                    const spec = rows - 1;
+                    var acc: usize = 0;
+                    while (acc < spec and ids[i][acc + 1] == o.sampled[acc]) : (acc += 1) {}
+                    tel.noteWindow(w.stream, acc, spec);
+                }
                 l.held_n = 0;
                 l.pending_rows = rows;
                 l.index = i;
                 l.round = self.round;
                 self.opened.append(self.gpa, l) catch |err| return self.lost("a window's bookkeeping", err);
+            }
+            if (watch) {
+                var ms: f64 = 0;
+                if (comptime @hasField(@TypeOf(e.*), "io")) {
+                    const t1 = tel.now(e.io);
+                    ms = tel.span(t0, t1);
+                    tel.park(t1);
+                }
+                const gpu = if (comptime @hasField(@TypeOf(e.*), "f")) if (e.f.prof) |p| p.gapMs(.gap_verify) else null else null;
+                tel.endVerify(ms, gpu);
             }
         }
 
@@ -852,6 +879,10 @@ pub fn Lanes(comptime E: type) type {
             };
             try self.agree(null);
             const e = self.e;
+            if (tel.on() and !rankOff(e)) {
+                tel.prepare(requests.len);
+                for (requests, 0..) |r, i| tel.bind(i, r.stream, r.depth);
+            }
             var reqs: [max_streams]E.DraftReq = undefined;
             var firsts: [max_streams][1]u32 = undefined;
             var ls: [max_streams]*Lane = undefined;
@@ -1109,6 +1140,11 @@ fn Costing(comptime E: type) type {
             return msSince(io, t0);
         }
     };
+}
+
+fn rankOff(e: anytype) bool {
+    if (comptime !@hasField(@TypeOf(e.*), "rank")) return false;
+    return e.rank != 0;
 }
 
 fn passNow(e: anytype) std.Io.Timestamp {

@@ -177,11 +177,49 @@ export TF_FLASHNEXT_PRODUCT_STREAMS=2
 export TF_FLASHNEXT_X3_MOE_WINDOW=2048
 # optional: confirm the decode/verify graphs are being captured
 # export TF_FLASHNEXT_GRAPH_LOG=1
+# optional: one tf-draft line per round (grep tf-draft). Off leaves tokens unchanged.
+# export TF_FLASHNEXT_TELEMETRY=1
 
 zig-out/native/bin/tensorfold-native serve /home/jct-spark/models/exl3-405 \
   --host 127.0.0.1 --port 8001 --name bench \
   --context 262144 --parallel 2 --kv-dtype bf16
 ```
+
+### Draft-chain telemetry
+
+`TF_FLASHNEXT_TELEMETRY=1` logs the draft chain. Unset (or any value other than `1`) the engine does
+not time, allocate, or print for this, and the served tokens stay on `token_sha afccd937e6ac`. The
+flag is read once, after the startup cost measurement, so that measurement is the table `depth()` uses.
+
+Grep `tf-draft`. Rank 0 prints one line per stream per round:
+
+```text
+tf-draft round i=0 asked=15 held=8 acc=3 out=4 win=8 why=head_stops stop=product verify_ms=4.210 draft_ms=1.500 gap_verify_ms=0.040 gap_draft_ms=0.020 p=0.910,0.400 lvl=1.000,0.500
+```
+
+| Field | Meaning |
+| --- | --- |
+| `asked` / `held` | Drafts `depth()` asked for, and how many the head kept |
+| `why` | Why that many were asked: `head_stops`, `rate`, `probe`, `plain`, `copy`, `forced`, `budget`, `empty`, `room`, `finished`, `nodes` |
+| `stop` | Why the chain stopped: `confidence` (per-draft rule), `product` (running product), `depth` (asked cap), `absorb` (nothing drafted) |
+| `p` | Temperature-1 probability of each sampled level, including the one that failed the rule |
+| `acc` / `out` / `win` | Drafts accepted in the verify just run, tokens emitted (`acc + 1`), and speculative rows in that window |
+| `verify_ms` / `lvl` | Host time of the verify, and of each draft level, beside the existing `gap_verify` / `gap_draft` marks. The sample already waits for the GPU, so no extra sync is added. When `TF_FLASHNEXT_PROFILE=1` has those marks attached, the GPU event interval replaces the host gap |
+| `gap_verify_ms` / `gap_draft_ms` | Host gap before that phase |
+
+The first `depth()` call also prints the startup cost table it reads:
+
+```text
+tf-draft costs family=1:5.200,2:6.100 mtp_step_ms=0.410 prior=0.820,0.760 head_stops=1 most=15 plain_guard=0
+```
+
+Every 32 stream-rounds, and again at shutdown:
+
+```text
+tf-draft sum at=32 rounds=32 tok_per_round=2.219 acc=0.900,0.710 n=32,20 hist=1:1,2:4,3:20,4:7 ms_per_round=18.400 verify_ms=4.200 draft_ms=14.200
+```
+
+`tok_per_round` is tokens emitted per stream-round. `acc` is acceptance by level (hits over levels the chain reached). `hist` counts rounds by tokens emitted. `ms_per_round` is verify plus draft host time per forward. `at=stop` is the shutdown line.
 
 The endpoint is bound to `127.0.0.1:8001`; this recipe does not publish an unauthenticated API. The
 server refuses at startup when two streams at a 262,144-token window do not fit the memory budget
