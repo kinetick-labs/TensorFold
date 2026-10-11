@@ -177,3 +177,71 @@ def decode_sites_member_pass(members: np.ndarray, ucount: int, K: int, N: int, P
                             sites[(nt0 + i, split * per_split + it)] += 1
                 decodes[(u, by, bz)] = sites
     return decodes
+
+
+def stage_stride(per_split: int) -> int:
+    """The staged row stride in 32-bit words: the split's k slice (16 k a word) padded to 4 mod 32."""
+
+    words = per_split * 8
+    return words + ((4 + 32 - (words & 31)) & 31)
+
+
+def staged_words(per_split: int) -> int:
+    """The valid words one member row's staged slice holds; the pad past it is address space, never read."""
+
+    return per_split * 8
+
+
+def staged_lane_words(kt: int, t: int) -> tuple:
+    """The two staged words a lane (g, t) reads for member rows g and g+8 of one k tile: the second is eight k on."""
+
+    kw = kt * 8 + t
+    return (kw, kw + 4)
+
+
+def reread_lane_words(kt: int, t: int) -> tuple:
+    """The same slice words the re-reading arm's load_pair takes from global: half k + 2t and k + 2t + 8."""
+
+    return ((kt * 16 + 2 * t) // 2, (kt * 16 + 2 * t + 8) // 2)
+
+
+def trace_member_pass_staged(members: np.ndarray, ucount: int, K: int, N: int, P: int, SK: int, slots: int, mats: int,
+                             NT: int, mtl: int) -> tuple:
+    """The staged wide arm: rows staged once a block, the same per-tile mma and store; returns (Z, A global bytes)."""
+
+    maxm = members.shape[1]
+    MG = (maxm + TILE * mtl - 1) // (TILE * mtl)
+    KT, z, cache = K // TILE, {}, {}
+    per_split = KT // SK
+    gbytes = 0
+    for u in range(members.shape[0]):
+        if u >= ucount:
+            continue
+        for by in range(N // (TILE * NT)):
+            nt0 = by * NT
+            for bz in range(mats * SK * MG):
+                mg, split, mat = bz % MG, (bz // MG) % SK, bz // MG // SK
+                rows = _rows(members, u, mg * mtl * TILE, mtl * TILE, maxm, slots)
+                if rows[0] < 0:
+                    continue
+                live = 0
+                for t in range(mtl):
+                    if rows[t * TILE] >= 0:
+                        live = t + 1
+                gbytes += 16 * live * staged_words(per_split) * 4      # one global read a live row, 4 bytes a word
+                for t in range(live):
+                    for idx in range(TILE * NT * TILE):
+                        row, col = idx // (NT * TILE), idx % (NT * TILE)
+                        r = rows[t * TILE + row]
+                        if r < 0:
+                            continue
+                        i, h = col // TILE, (col % TILE) // 8
+                        _store(z, mat, split, P, N, r, nt0 * TILE + col,
+                               _warps(cache, split, nt0, i, h, KT, SK), SK)
+    return z, gbytes
+
+
+def a_bytes_reread(per_split: int, mtl: int, NT: int) -> int:
+    """The A bytes the re-reading arm's loop structure loads a program: a member row's slice once a n tile."""
+
+    return mtl * 16 * staged_words(per_split) * 4 * NT
