@@ -1464,7 +1464,7 @@ const Rank1 = struct {
         defer l.close();
         var frames: Frames = .{ .gpa = gpa, .link = l };
         defer frames.deinit();
-        var f = Follower.init(gpa, if (r.sliced) r.target.backendSliced() else r.target.backend(), frames.channel());
+        var f = Follower.init(gpa, if (r.sliced) r.target.stepped() else r.target.backend(), frames.channel());
         defer f.deinit();
         f.run() catch |e| {
             r.err = e;
@@ -1792,22 +1792,22 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices 
             return out;
         }
     };
-    var alone: fake.Fake = .{ .gpa = gpa, .slice = 3 };
+    var alone: fake.Fake = .{ .gpa = gpa };
     defer alone.deinit();
-    const want = try Drive.run(alone.backend());
+    const want = try Drive.run(alone.stepped());
     defer for (want) |w| gpa.free(w);
 
     const server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
     defer server.close();
-    var rank1: Rank1 = .{ .target = .{ .gpa = gpa, .slice = 3 }, .sliced = true };
+    var rank1: Rank1 = .{ .target = .{ .gpa = gpa }, .sliced = true };
     defer rank1.target.deinit();
     const t = try std.Thread.spawn(.{}, Rank1.run, .{ &rank1, io, server.port() });
-    var rank0: fake.Fake = .{ .gpa = gpa, .slice = 3 };
+    var rank0: fake.Fake = .{ .gpa = gpa };
     defer rank0.deinit();
     const l = try server.accept(5000);
     defer l.close();
     var frames: Frames = .{ .gpa = gpa, .link = l };
-    var leader = Leader.init(gpa, rank0.backendSliced(), frames.channel());
+    var leader = Leader.init(gpa, rank0.stepped(), frames.channel());
     const got = Drive.run(leader.backend()) catch |e| {
         leader.deinit();
         t.join();
@@ -1818,8 +1818,8 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices 
     t.join();
     if (rank1.err) |e| return e;
     for (want, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
-    try std.testing.expect(rank0.fill_steps > 0);
-    try std.testing.expectEqual(rank0.fill_steps, rank1.target.fill_steps);
+    try std.testing.expect(rank0.prefill_count > 0);
+    try std.testing.expectEqual(rank0.prefill_count, rank1.target.prefill_count);
     try std.testing.expectEqualSlices(u32, rank0.drawn.items, rank1.target.drawn.items);
     try std.testing.expectEqual(@as(u64, 0), rank1.failed);
 }
