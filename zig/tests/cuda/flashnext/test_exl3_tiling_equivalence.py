@@ -163,3 +163,49 @@ def test_staged_member_pass_stores_the_same_bits(mats: int, K: int, N: int, SK: 
         assert gbytes % one_tile == 0
         # the re-reading arm pays that slice once a (n tile): mtl tiles x NT n tiles a program
         assert EMU.a_bytes_reread(per_split, 2, 8) == one_tile * 2 * 8
+
+
+# the gm arm: members the B operand (staged, 128 a pass), weights the A operand, columns split across the warps
+
+# (NT, mtl) the 4 warps cover: 8 column tiles two each, or 4 tiles one each (upstream's slice split)
+GM_TILES = [(8, 2), (4, 1)]
+
+# the gm tests run a smaller member set (the staged pass walks 128 rows a program, so the naive model is heavy)
+GM_R = 48
+GM_COUNTS = [0, 1, 15, 16, 17, 33, 48]
+
+
+@pytest.mark.parametrize("nt,mtl", GM_TILES)
+@pytest.mark.parametrize("mats,K,N,SK", SHAPES)
+def test_gm_arm_stores_the_same_bits_as_the_default(nt: int, mtl: int, mats: int, K: int, N: int, SK: int) -> None:
+    """The gm arm stores exactly the default arm's Z: per element the split-major, warp-sub-chain-in-order reduction."""
+
+    members = _members(len(GM_COUNTS), GM_COUNTS, GM_R, SLOTS, 777 + nt * 10 + mtl)
+    P = GM_R * SLOTS
+    for ucount in (len(GM_COUNTS), len(GM_COUNTS) - 3):
+        gm = EMU.trace_gm_pass(members, ucount, K, N, P, SK, SLOTS, mats, nt, mtl)
+        folded = EMU.fold_grouped_trace(members, ucount, K, N, P, SK, SLOTS, mats, nt)
+        assert gm == folded                       # the same element, same chains, same order -> same bits
+        assert len(gm) == sum(min(c, GM_R) for c in GM_COUNTS[:ucount]) * N * mats
+
+
+@pytest.mark.parametrize("nt,mtl", GM_TILES)
+@pytest.mark.parametrize("mats,K,N,SK", SHAPES)
+def test_the_faithful_single_chain_is_not_the_default_tree(nt: int, mtl: int, mats: int, K: int, N: int, SK: int) -> None:
+    """The negative control: gm_kernel's own rule (one ascending chain an element) is a DIFFERENT reduction tree."""
+
+    members = _members(len(GM_COUNTS), GM_COUNTS, GM_R, SLOTS, 555 + nt * 10 + mtl)
+    P = GM_R * SLOTS
+    single = EMU.trace_gm_single_chain(members, len(GM_COUNTS), K, N, P, SK, SLOTS, mats, nt, mtl)
+    folded = EMU.fold_grouped_trace(members, len(GM_COUNTS), K, N, P, SK, SLOTS, mats, nt)
+    assert single != folded
+    assert set(single) == set(folded)              # same elements stored, different chains -> different fp32 sum
+
+
+def test_gm_a_tile_reads_a_member_row_once_a_block() -> None:
+    """The gm ring stages k a stage, so a 128-member block reads a row's whole K once, not once a n tile."""
+
+    for _mats, K, _N, _SK in SHAPES:
+        once = EMU.gm_a_global_bytes(EMU.GM_BM, K)
+        assert once == EMU.GM_BM * K * 2
+        assert once < EMU.GM_BM * K * 2 * 8         # not the 8x the hoisted arm's NT n tiles paid
