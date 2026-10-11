@@ -184,34 +184,42 @@ pub fn Lanes(comptime E: type) type {
             self.late.deinit(self.gpa);
         }
 
+        /// Both lane tables. `stepped` is comptime, so each result is a container const in rodata. A runtime
+        /// condition inside one `&.{...}` literal would point at this frame and dangle after backend() returns.
+        fn laneVtable(comptime stepped: bool) be.Backend.VTable {
+            return .{
+                .prefill = prefillFn,
+                .prefill_step = if (stepped) prefillStepFn else null,
+                .first = firstFn,
+                .queue = queueFn,
+                .read = readFn,
+                .verify = verifyFn,
+                .keep = keepFn,
+                .draft = draftFn,
+                .tree = heldFn,
+                .release = releaseFn,
+            };
+        }
+
+        const stepped_vtable = laneVtable(true);
+        const plain_vtable = laneVtable(false);
+
+        comptime {
+            if (stepped_vtable.prefill_step == null or plain_vtable.prefill_step != null) @compileError("lane vtable step flag");
+            if (stepped_vtable.prefill != plain_vtable.prefill or
+                stepped_vtable.first != plain_vtable.first or
+                stepped_vtable.queue != plain_vtable.queue or
+                stepped_vtable.read != plain_vtable.read or
+                stepped_vtable.verify != plain_vtable.verify or
+                stepped_vtable.keep != plain_vtable.keep or
+                stepped_vtable.draft != plain_vtable.draft or
+                stepped_vtable.tree != plain_vtable.tree or
+                stepped_vtable.release != plain_vtable.release) @compileError("lane vtables diverged");
+        }
+
         pub fn backend(self: *Self) be.Backend {
-            // The vtable must be comptime-known, in rodata: a single literal carrying a runtime field
-            // (`if (@hasDecl(E,"fillBegin") and self.sliced)`) is not comptime, so `&.{...}` points at a
-            // temporary of THIS frame and dangles once backend() returns (the caller then jumps through a
-            // zeroed/garbage slot). So each branch below is a fully comptime literal and only the choice is runtime.
-            if (@hasDecl(E, "fillBegin") and self.sliced) return .{ .ptr = self, .vtable = &.{
-                .prefill = prefillFn,
-                .prefill_step = prefillStepFn,
-                .first = firstFn,
-                .queue = queueFn,
-                .read = readFn,
-                .verify = verifyFn,
-                .keep = keepFn,
-                .draft = draftFn,
-                .tree = heldFn,
-                .release = releaseFn,
-            } };
-            return .{ .ptr = self, .vtable = &.{
-                .prefill = prefillFn,
-                .first = firstFn,
-                .queue = queueFn,
-                .read = readFn,
-                .verify = verifyFn,
-                .keep = keepFn,
-                .draft = draftFn,
-                .tree = heldFn,
-                .release = releaseFn,
-            } };
+            const table = if (@hasDecl(E, "fillBegin") and self.sliced) &stepped_vtable else &plain_vtable;
+            return .{ .ptr = self, .vtable = table };
         }
 
         // -- prompts filling between rounds (the lanes core's prefill_begin / prefill_step) --------------------
