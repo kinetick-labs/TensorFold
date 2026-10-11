@@ -77,6 +77,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
+    // A spec whose captured `_ple_rows` is missing, or whose cubin hashes disagree, fails the build.
+    b.getInstallStep().dependOn(kernelSpecCheck(b));
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     const dump_options = b.addOptions();
     dump_options.addOption(bool, "enabled", opts.test_dump);
@@ -241,6 +243,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     @import("runtime_libraries.zig").tests(b, step);
     const host = b.graph.host;
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_kernels.zig"), .target = host }) })).step);
+    step.dependOn(kernelSpecCheck(b));
     const cuda = runtime(b, host, .debug, &.{});
     b.step("test-nccl-version-host", "Shared NCCL minimum without a communicator or GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"NCCL minimum:"} })).step);
     // H3's library opens its checkpoint with mmap: not Windows
@@ -541,6 +545,28 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
 
 /// SASS targets every release fatbin holds: Ampere (sm_80, sm_86), RTX 50/PRO Blackwell (sm_120), GB10 (sm_121).
 pub const release_sms = "80,86,120,121";
+
+fn kernelTool(b: *std.Build) *std.Build.Step.Run {
+    const tool = b.addExecutable(.{ .name = "check-kernels", .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_kernels.zig"), .target = b.graph.host }) });
+    return b.addRunArtifact(tool);
+}
+
+/// kernels.json names a captured `_ple_rows` and its hashes agree with each other.
+pub fn kernelSpecCheck(b: *std.Build) *std.Build.Step {
+    const check = kernelTool(b);
+    check.addFileArg(b.path("zig/tests/cuda/flashnext/kernels.json"));
+    return &check.step;
+}
+
+/// The same spec against a capture directory: each cubin's bytes, and `_ple_rows` in every set.
+pub fn kernelCaptureCheck(b: *std.Build, dir: []const u8) *std.Build.Step {
+    const check = kernelTool(b);
+    check.addFileArg(b.path("zig/tests/cuda/flashnext/kernels.json"));
+    check.addArg(dir);
+    // The directory is named, not copied in: a later cubin edit must still be hashed.
+    check.has_side_effects = true;
+    return &check.step;
+}
 
 /// Validate the complete named input set, including images unused by today's server, and each file's release targets.
 pub fn checkDistFatbins(b: *std.Build, dir: []const u8, privacy_tool: *std.Build.Step.Compile) *std.Build.Step {
