@@ -110,13 +110,26 @@ pub const Prof = struct {
         p.n += 1;
     }
 
+    /// Milliseconds of the latest interval that ends on `part` (a `gap_*` mark is the host wait before that phase).
+    /// Null when the mark is absent or the events are not complete. Does not synchronize or drain.
+    pub fn gapMs(p: *Prof, part: Part) ?f64 {
+        var i = p.n;
+        while (i > 1) {
+            i -= 1;
+            if (p.labels[i] != part) continue;
+            const ms = cuda.Event.elapsedMs(p.events[i - 1], p.events[i]) catch return null;
+            return ms;
+        }
+        return null;
+    }
+
     /// Reads the recorded intervals into `sums` (waits for the last event); the last mark opens the next run.
     pub fn drain(p: *Prof) !void {
         if (p.n == 0) return;
         try p.events[p.n - 1].synchronize();
         for (1..p.n) |i| {
             const ms = try cuda.Event.elapsedMs(p.events[i - 1], p.events[i]);
-            p.sums[@intFromBool(p.in_mtp[i])][@intFromEnum(p.labels[i])] += ms;
+            p.sums[@intFromBool(p.in_mtp[i])][@backingInt(p.labels[i])] += ms;
             if (p.in_mtp[i]) p.by_level[@min(p.levels[i], max_levels - 1)] += ms;
         }
         // keep the last event as the next interval's start
