@@ -110,3 +110,56 @@ def test_hoist_decodes_once_a_k_tile_whatever_the_member_width() -> None:
             live = next(iter(pt.values()))                             # every live member tile decodes the site once
             assert set(pt.values()) == {live}
             assert sum(pt.values()) == live * len(sites)
+
+
+# --- the G=2 staged A tile (cuda_exl3.zig wideStageSmem, fn_exl3.cu warp_tile_stage) ---
+
+
+@pytest.mark.parametrize("per_split", [1, 8, 20, 40, 80, 100])
+def test_the_staged_fragment_is_the_global_read(per_split: int) -> None:
+    """The word a lane reads from the staged row is the word load_pair reads from the global row, for every k tile."""
+
+    for kt in range(per_split):
+        for t in range(4):
+            assert EMU.staged_lane_words(kt, t) == EMU.reread_lane_words(kt, t)
+
+
+@pytest.mark.parametrize("per_split", [20, 40, 80])
+def test_the_staged_stride_banks_each_lane_apart(per_split: int) -> None:
+    """The padded row stride is 4 mod 32, so the 32 lanes' fragment word lands on 32 distinct banks."""
+
+    sw = EMU.stage_stride(per_split)
+    assert sw % 32 == 4
+    assert sw >= EMU.staged_words(per_split) and sw - EMU.staged_words(per_split) < 32
+    for kt in range(per_split):
+        for col in EMU.staged_lane_words(kt, 0):
+            banks = [(g * sw + col + t) % 32 for g in range(8) for t in range(4)]
+            assert len(set(banks)) == 32
+
+
+def test_the_staged_tile_reads_a_member_row_once_a_block() -> None:
+    """G=2 reads each member row's split slice once a block; the re-reading arm reads the same slice once a n tile."""
+
+    mtl, NT = 2, 8
+    for per_split, staged in ((40, 40960), (20, 20480)):
+        once = mtl * 16 * EMU.staged_words(per_split) * 4
+        assert once == staged                                     # 32 rows x the split's slice
+        assert EMU.a_bytes_reread(per_split, mtl, NT) == staged * NT
+
+
+@pytest.mark.parametrize("mats,K,N,SK", SHAPES)
+def test_staged_member_pass_stores_the_same_bits(mats: int, K: int, N: int, SK: int) -> None:
+    """The staged wide arm stores upstream's bits, and its A loads are one read a live member row (the re-read ends)."""
+
+    members = _members(len(COUNTS), COUNTS, R, SLOTS, 300 + mats * 7 + K)
+    P = R * SLOTS
+    per_split = K // 16 // SK
+    for ucount in (len(COUNTS), len(COUNTS) - 3):
+        up = EMU.trace_grouped(members, ucount, K, N, P, SK, SLOTS, mats, 8)
+        z, gbytes = EMU.trace_member_pass_staged(members, ucount, K, N, P, SK, SLOTS, mats, 8, 2)
+        assert z == up
+        # one 16-row tile's split slice, read once a block: whole tiles only, dead rows in a live tile included
+        one_tile = 16 * EMU.staged_words(per_split) * 4
+        assert gbytes % one_tile == 0
+        # the re-reading arm pays that slice once a (n tile): mtl tiles x NT n tiles a program
+        assert EMU.a_bytes_reread(per_split, 2, 8) == one_tile * 2 * 8

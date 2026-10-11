@@ -1024,6 +1024,50 @@ __device__ __forceinline__ void warp_tile_wide(const uint32_t* __restrict__ T, i
     }
 }
 
+
+// The wide arm's staged k loop: one decode a (n tile, k tile) feeds the MTL member tiles' mma, A read from shared.
+template <int CB, int K2, int PF, int MTL>
+__device__ __forceinline__ void warp_tile_stage(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt,
+                                                const uint32_t* __restrict__ As, int sw, int ktrel, int live, int lane,
+                                                float (&acc)[MTL][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt) * TW + lane;
+    const int g = lane >> 2, t = lane & 3;
+
+    uint32_t pf[PF][LW];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < nkt) load_words<K2>(pf[d], tp + d * kstride, lane);
+
+    for (int ib = 0; ib < nkt; ib += PF) {
+#pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int it = ib + d;
+            if (it < nkt) {
+                uint32_t w[LW];
+#pragma unroll
+                for (int l = 0; l < LW; ++l) w[l] = pf[d][l];
+                if (it + PF < nkt) load_words<K2>(pf[d], tp + (size_t)(it + PF) * kstride, lane);
+                uint32_t b0[2], b1[2];
+                decode_tile<CB, K2>(w, map, lane, b0, b1);
+                const int kw = (ktrel + it) * 8 + t;                     // this lane's word in the member row's slice
+#pragma unroll
+                for (int tt = 0; tt < MTL; ++tt) {
+                    if (tt < live) {
+                        const uint32_t* r0 = As + (size_t)(tt * 16 + g) * sw + kw;
+                        const uint32_t* r1 = As + (size_t)(tt * 16 + g + 8) * sw + kw;
+                        uint32_t a[4] = { r0[0], r1[0], r0[4], r1[4] };      // the +8 columns sit four words on
+                        mma16816(acc[tt][0], a, b0);
+                        mma16816(acc[tt][1], a, b1);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // The K2 values an instance covering [LO, HI] compiles (half-bits 2..16).
 __host__ __device__ constexpr bool k2_supported(int k2) {
     return k2 >= 2 && k2 <= 16;
@@ -1064,23 +1108,26 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     if (rows_sh[0] < 0) return;                           // members come first, so this group is empty
 
     if constexpr (MTL > 1) {
-        // The wide arm: MTL member tiles a program, their rows in shared, one decode a (n, k) tile for all of them.
+        // The wide arm: MTL member tiles a program, their A rows staged in shared once a block, one decode a tile.
+        extern __shared__ __align__(16) unsigned char tf_exl3_wsmem[];
+        const int words = per_split * 8;                        // the split's k slice in words: 16 k a word
+        const int sw = words + ((4 + 32 - (words & 31)) & 31);
+        // sw is 4 mod 32: a lane's four staged fragment words take 32 distinct banks
+        uint32_t* As = reinterpret_cast<uint32_t*>(tf_exl3_wsmem);
+        float (*redw)[16 * MTL][16] = reinterpret_cast<float (*)[16 * MTL][16]>(As + (size_t)16 * MTL * sw);
         int live = 0;
 #pragma unroll
         for (int tt = 0; tt < MTL; ++tt)
             if (rows_sh[tt * 16] >= 0) live = tt + 1;     // members ascend, so the first dead row ends the group
-        __shared__ float redw[W][16 * MTL][16];
-        const half* xb0[MTL];
-        const half* xb1[MTL];
-        bool ok0[MTL], ok1[MTL];
-#pragma unroll
-        for (int tt = 0; tt < MTL; ++tt) {
-            const int r0 = rows_sh[tt * 16 + g], r1 = rows_sh[tt * 16 + g + 8];
-            xb0[tt] = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
-            xb1[tt] = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
-            ok0[tt] = r0 >= 0;
-            ok1[tt] = r1 >= 0;
+        const int kbase = split * per_split * 16;
+        for (int rrow = 0; rrow < 16 * live; ++rrow) {
+            const int r = rows_sh[rrow];
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(X + (size_t)(r < 0 ? 0 : r) * K + kbase);
+            uint32_t* dst = As + (size_t)rrow * sw;
+            for (int w = threadIdx.x; w < words; w += W * 32) dst[w] = (r >= 0) ? src[w] : 0u;
         }
+        __syncthreads();                                   // every warp reads the staged rows below
+        const int ktrel = warp * per_warp;                 // this warp's k tiles relative to the split's first
         for (int i = 0; i < NT; ++i) {
             if (i) __syncthreads();                       // redw is reused: the previous n tile's store has read it
             float acc[MTL][2][4];
@@ -1094,8 +1141,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #define TF_EXL3W_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tile_wide<CB, K2_, PF, MTL>(T, NTILES, kt0, per_warp, nt0 + i, xb0, xb1, ok0, ok1, live, lane,  \
-                                             acc);                                                              \
+            warp_tile_stage<CB, K2_, PF, MTL>(T, NTILES, kt0, per_warp, nt0 + i, As, sw, ktrel, live, lane,     \
+                                              acc);                                                             \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -1486,8 +1533,8 @@ namespace tf_exl3x {
 template void grouped_launch<0, 1>(const GroupedArgs&, cudaStream_t);
 template void grouped_launch<1, 1>(const GroupedArgs&, cudaStream_t);
 template void grouped_launch<2, 1>(const GroupedArgs&, cudaStream_t);
-// The wide member-pass arm (MTL 8, 128 members a program), mul1 only: off by default (cuda_exl3.zig's switch).
-template void grouped_launch<2, 8>(const GroupedArgs&, cudaStream_t);
+// The wide member-pass arm (MTL 2, 32 members a program, rows staged in dynamic shared): mul1, opt-in, off by default.
+template void grouped_launch<2, 2>(const GroupedArgs&, cudaStream_t);
 template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
 template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
 template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);

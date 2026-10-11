@@ -392,27 +392,27 @@ pub const sym = struct {
             "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
     };
-    /// tf_exl3x: the wide member-pass arm (MTL 8, 128 members a program), same table order, mul1 only, opt-in.
+    /// tf_exl3x: the wide member-pass arm (MTL 2, 32 members a program, rows staged in dynamic shared), mul1, opt-in.
     pub const grouped_wide = [4][3][:0]const u8{
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
     };
     /// tf_exl3x: the decode ablation (grouped_abl_kernel, timing probe only, garbage output), same table order, MTL 1.
@@ -466,6 +466,8 @@ pub const Kernels = struct {
     dequant: [3]cuda.Function,
     /// dynamic shared memory group_kernel was opted into (the device's ceiling less its static use)
     group_smem_max: u32,
+    /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
+    wide_smem_max: u32,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -499,6 +501,12 @@ pub const Kernels = struct {
         const statics: usize = @intCast(try k.group.attribute(.shared_size_bytes));
         k.group_smem_max = @intCast(ceiling -| statics);
         try k.group.allowDynamicShared(k.group_smem_max);
+        // the wide arm stages its A tile in dynamic shared: opt the staged instances in against the same ceiling
+        const wstatic: usize = if (k.grouped_wide[0][0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
+        k.wide_smem_max = @intCast(ceiling -| wstatic);
+        for (k.grouped_wide) |row| for (row) |maybe| {
+            if (maybe) |f| try f.allowDynamicShared(k.wide_smem_max);
+        };
         return k;
     }
 
@@ -671,15 +679,22 @@ pub fn downCombine(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts
     try cuda.launch.launch(k.down_combine, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
 }
 
-/// The wide member-pass arm's member-tile count: 8 tiles of 16 = 128 member rows a program.
-pub const wide_member_tiles: usize = 8;
+/// The wide member-pass arm's member-tile count: 2 tiles of 16 = 32 member rows a program, their rows staged.
+pub const wide_member_tiles: usize = 2;
+
+/// The wide arm's dynamic shared: MTL*16 rows of the split's k slice (stride 4 mod 32), then the reduction buffer.
+pub fn wideStageSmem(per_split: usize, w: usize) usize {
+    const words = per_split * 8;
+    const sw = words + ((4 + 32 - (words & 31)) & 31);
+    return 16 * wide_member_tiles * sw * 4 + w * 16 * wide_member_tiles * 16 * 4;
+}
 
 /// The opt-in switch's reading: unset or "0" is off, anything else on (the repo's getenv idiom).
 fn wideFlag(v: ?[]const u8) bool {
     return if (v) |s| !std.mem.eql(u8, s, "0") else false;
 }
 
-/// Whether the wide arm runs: TF_FLASHNEXT_X3_WIDE_MEMBERS, off by default (-15%: 658.5 vs 775.0 tok/s, same sha).
+/// Whether the wide arm runs: TF_FLASHNEXT_X3_WIDE_MEMBERS, off by default (the staged A tile arm, unmeasured).
 pub fn wideMembers() bool {
     const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_WIDE_MEMBERS")) |e| std.mem.span(e) else null;
     return wideFlag(v);
@@ -691,13 +706,16 @@ pub fn ablateDecode() bool {
     return wideFlag(v);
 }
 
-/// The grouped expert GEMM: 16 members a program, or 128 in the wide arm (tf_exl3x, opt-in and off by default).
+/// The grouped expert GEMM: 16 members a program, or 32 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
     const wide = wideMembers();
     const abl = !wide and ablateDecode();
-    const mtl: usize = if (wide) wide_member_tiles else 1;
-    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
     const t = tile_settings[setting];
+    // the staged arm runs only where its A tile fits the device opt-in; a wider split (sk 1 or 2) falls back to MTL 1
+    const stage = wideStageSmem(kk / 16 / sk, t.w);
+    const staged = wide and stage <= k.wide_smem_max;
+    const mtl: usize = if (staged) wide_member_tiles else 1;
+    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
     const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
     var a: cuda.Args = .{};
     a.add(x0);
@@ -716,8 +734,9 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(sk));
     a.add(int(maxm));
     a.add(int(slots));
-    const f = if (wide) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else if (abl) (k.grouped_abl[setting][range] orelse return error.NoAblKernel) else k.grouped[setting][range];
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) } }, s, &a);
+    const f = if (staged) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else if (abl) (k.grouped_abl[setting][range] orelse return error.NoAblKernel) else k.grouped[setting][range];
+    const sh: u32 = if (staged) @intCast(stage) else 0;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) }, .shared = sh }, s, &a);
 }
 
 /// The experts' dequantize-to-dense: W_q fp16 [K, N] of one matrix (the tests' path).
@@ -737,14 +756,23 @@ pub fn dequant(k: *const Kernels, k2: u32, words: u64, out: u64, kk: usize, n: u
 const testing = std.testing;
 
 test "the wide member-pass arm is off unless the switch is set" {
-    try testing.expect(!wideFlag(null));              // unset: the 16-member path
-    try testing.expect(!wideFlag("0"));               // the repo's explicit off
+    try testing.expect(!wideFlag(null)); // unset: the 16-member path
+    try testing.expect(!wideFlag("0")); // the repo's explicit off
     try testing.expect(wideFlag("1"));
     try testing.expect(wideFlag("anything"));
-    try testing.expectEqual(@as(usize, 8), wide_member_tiles);
-    // maxm 200: the 16-member path runs 13 member-tile programs, the wide arm 2 groups of 128 rows
+    try testing.expectEqual(@as(usize, 2), wide_member_tiles);
+    // maxm 200: the 16-member path runs 13 member-tile programs, the wide arm 7 groups of 32 rows
     try testing.expectEqual(@as(usize, 13), (200 + 15) / 16);
-    try testing.expectEqual(@as(usize, 2), (200 + 16 * 8 - 1) / (16 * 8));
+    try testing.expectEqual(@as(usize, 7), (200 + 16 * 2 - 1) / (16 * 2));
+}
+
+test "the staged A tile is sized from the split and padded off the row banks" {
+    // moe gate/up: K 2560, sk 4 -> per_split 40 -> 320 words a row, +4 so a lane's four words take 32 banks
+    try testing.expectEqual(@as(usize, 49664), wideStageSmem(40, 4));
+    // moe down: K 640, sk 2 -> per_split 20 -> 160 words a row
+    try testing.expectEqual(@as(usize, 29184), wideStageSmem(20, 4));
+    // the row stride is 4 mod 32 for the served split (the pad is address space, never read)
+    try testing.expectEqual(@as(usize, 4), (40 * 8 + ((4 + 32 - (40 * 8 & 31)) & 31)) % 32);
 }
 
 test "the decode ablation shares the wide arm's opt-in reading" {
