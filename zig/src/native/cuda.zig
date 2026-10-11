@@ -51,13 +51,27 @@ fn getenv(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(std.c.getenv(name) orelse return null);
 }
 
-/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
-/// The family's `open` takes a real directory (the pre-rebase contract); when upstream's `aot.pick` reports
-/// our own kernels (.native, no captured set) the driver still hands it the directory it always computed.
-fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
-    if (getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, dir);
+/// The kernel directory a family's open loads when `aot.pick` reports no captured set. `TENSORFOLD_CUDA_KERNELS`
+/// names that folder; unset and `native` are `share/tensorfold/cuda/sm<capability>` beside the binary. A path that
+/// is not a directory sets `problem` and returns null, so the server prints the sentence instead of a raw error.
+fn kernelDir(a: Allocator, io: std.Io, capability: u32, problem: *[]const u8) !?[]const u8 {
+    const dir = try kernelDirPath(a, io, capability);
+    var opened = std.Io.Dir.cwd().openDir(io, dir, .{}) catch {
+        defer a.free(dir);
+        problem.* = try std.fmt.allocPrint(a, "kernel directory {s} does not exist: set TENSORFOLD_CUDA_KERNELS to a captured set's folder (aot.json and cubins/), or install share/tensorfold/cuda/sm{d} beside the binary", .{ dir, capability });
+        return null;
+    };
+    opened.close(io);
+    return dir;
+}
+
+fn kernelDirPath(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
+    if (getenv("TENSORFOLD_CUDA_KERNELS")) |dir| if (!std.mem.eql(u8, dir, "native")) return a.dupe(u8, dir);
     const exe = try std.process.executableDirPathAlloc(io, a);
-    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
+    defer a.free(exe);
+    var sm: [16]u8 = undefined;
+    const cap = std.fmt.bufPrint(&sm, "sm{d}", .{capability}) catch unreachable;
+    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", cap });
 }
 
 /// A variable's whole number: null when unset or empty, an error for anything else that is not one.
@@ -417,8 +431,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         fo.master = o.master;
         fo.master_port = o.master_port;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels orelse try kernelDir(a, io, capability), fo) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels orelse "its own", @errorName(e) });
+    const kernel_dir = if (kernels) |dir| dir else (try kernelDir(a, io, capability, problem)) orelse return null;
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernel_dir, fo) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernel_dir, @errorName(e) });
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
@@ -673,4 +688,43 @@ test "the residency gate keeps a checkpoint shard and drops the memory-mapped n-
     const mpath = try std.fs.path.join(a, &.{ dir, "model-00003.safetensors" });
     defer a.free(mpath);
     try std.testing.expect(!mappedNotResident(a, io, mpath));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: i32) i32;
+extern "c" fn unsetenv(name: [*:0]const u8) i32;
+
+fn putKernelEnv(value: ?[*:0]const u8) void {
+    if (value) |v| {
+        _ = setenv("TENSORFOLD_CUDA_KERNELS", v, 1);
+    } else _ = unsetenv("TENSORFOLD_CUDA_KERNELS");
+}
+
+test "kernelDir accepts a real directory and names one that is not there" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const saved = if (getenv("TENSORFOLD_CUDA_KERNELS")) |v| try a.dupeSentinel(u8, v, 0) else null;
+    defer if (saved) |v| {
+        putKernelEnv(v);
+        a.free(v);
+    } else putKernelEnv(null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(dir);
+    const dir_z = try a.dupeSentinel(u8, dir, 0);
+    defer a.free(dir_z);
+    putKernelEnv(dir_z);
+    var problem: []const u8 = "";
+    const got = (try kernelDir(a, io, 121, &problem)).?;
+    defer a.free(got);
+    try std.testing.expectEqualStrings(dir, got);
+    try std.testing.expectEqual(@as(usize, 0), problem.len);
+    const missing = try std.fmt.allocPrintSentinel(a, "{s}-missing", .{dir}, 0);
+    defer a.free(missing);
+    putKernelEnv(missing);
+    try std.testing.expect((try kernelDir(a, io, 121, &problem)) == null);
+    defer if (problem.len > 0) a.free(problem);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "does not exist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, problem, missing) != null);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "sm121") != null);
 }
