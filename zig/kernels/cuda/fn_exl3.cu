@@ -1073,6 +1073,236 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
     return k2 >= 2 && k2 <= 16;
 }
 
+// upstream's gm_kernel (x3gm.cu), ported as an opt-in arm (TF_FLASHNEXT_X3_GM): the 128 member rows are the mma B
+
+// operand, staged in shared through a cp.async ring and XOR-swizzled for ldsm4; the decoded weights are the mma A
+
+// operand (upstream's decode_a); the block's tiles are split across the warps, so a weight tile is decoded once for
+
+// 128 members. The split's k is walked in the shipped arm's k sub-ranges, so the epilogue folds its tree -- the
+
+// bits are the default arm's (tools/zig/x3_exl3_sched.py trace_gm_pass vs fold_grouped_trace).
+
+__device__ __forceinline__ void gm_cp_async16(void* smem, const void* gmem, bool ok) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void gm_cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void gm_cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void gm_ldsm4(uint32_t (&a)[4], const void* p) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(s));
+}
+// the 16-byte chunk c of member row r in a stage (CPR chunks a row): 8 rows of an ldmatrix phase in 8 bank groups
+template <int CPR>
+__device__ __forceinline__ int gm_swz(int r, int c) {
+    static_assert(CPR == 8 || CPR == 4, "rows of 64 or 32 halves");
+    return CPR == 8 ? (c ^ (r & 7)) : (c ^ ((r >> 1) & 3));
+}
+
+// The gm arm's per-stage member bytes (BM rows of the stage's KS k tiles, swizzled).
+template <int KS>
+__host__ __device__ constexpr int gm_lmem() {
+    return 128 * KS * 16 * 2;
+}
+// upstream's MINB: two CTAs an SM when the ring fits twice, the block <= 8 warps and a lane <= 64 accumulator slots.
+
+// This arm keeps TWO live accumulator sets a lane (the sub-range's work and the split's run the shipped tree folds
+
+// it into), MTL*NG*4 registers each, so the <= 64-slot case never holds at NG 16: MINB is 1 for the served pair.
+template <int W, int NT, int KS, int NSA>
+__host__ __device__ constexpr int gm_minb() {
+    constexpr int ACC = 2 * (NT / W) * 16 * 4;
+    constexpr int CAP = 65536 / (2 * W * 32);   // registers a lane when two CTAs an SM
+    return 2 * ((size_t)NSA * gm_lmem<KS>() + 1536) <= 102400 && W * 32 <= 256 && ACC + 64 <= CAP ? 2 : 1;
+}
+
+// One program's item (member group, 128-column block, split, matrix) at width K2: gm_kernel's body.
+
+// SUBW is the SHIPPED arm's warp count, hence its k sub-range count; the gm arm's 8 warps own the 8 tiles one each.
+template <int CB, int K2, int NT, int W, int KS, int NSA, int SUBW>
+__device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32_t* __restrict__ T,
+                                        float* __restrict__ Z, unsigned char* smem, const int* rows_sh, int cnt,
+                                        int nt0, int split, int per_split, int sub_len, int NTILES, int mat, int P,
+                                        int N, int K, int warp, int lane) {
+    constexpr int BM = 128, MTL = NT / W, NG = 16, CPR = KS * 2, LDA = KS * 16;
+    constexpr int LMEM = BM * LDA * (int)sizeof(half), TW = Fmt<K2>::TW;
+    const int g = lane >> 2, t = lane & 3;
+    const int lr = (lane & 7) + ((lane >> 4) << 3), lc = (lane >> 3) & 1;
+    const int slice = warp;                                  // the columns this warp owns: MTL tiles from slice*MTL
+    const int S = per_split / KS;
+    const int cnt16 = (cnt + 15) & ~15;
+    const LaneMap<K2> map(lane);
+    // run: the split's k is walked in the SUBW shipped sub-ranges, each partial (work) folding in as it closes.
+    float run[MTL][NG][4], work[MTL][NG][4];
+#pragma unroll
+    for (int l = 0; l < MTL; ++l)
+#pragma unroll
+        for (int n = 0; n < NG; ++n)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) run[l][n][c] = work[l][n][c] = 0.f;
+
+    auto load_stage = [&](int s) {
+        half* ra = reinterpret_cast<half*>(smem + (size_t)(s % NSA) * LMEM);
+        const int k0 = (split * per_split + s * KS) * 16;
+        for (int i = threadIdx.x; i < BM * CPR; i += W * 32) {
+            const int r = i / CPR, c = i % CPR;
+            if (r < cnt16) {
+                const int row = rows_sh[r];
+                const half* src = X + (size_t)(row < 0 ? 0 : row) * (size_t)K + k0 + c * 8;
+                gm_cp_async16(ra + (size_t)r * LDA + gm_swz<CPR>(r, c) * 8, src, row >= 0);
+            }
+        }
+    };
+
+#pragma unroll
+    for (int s = 0; s < NSA - 1; ++s) {
+        if (s < S) load_stage(s);
+        gm_cp_commit();
+    }
+    gm_cp_wait<NSA - 2>();
+    __syncthreads();
+
+    for (int s = 0; s < S; ++s) {
+        if (s + NSA - 1 < S) load_stage(s + NSA - 1);
+        gm_cp_commit();
+        const half* A = reinterpret_cast<const half*>(smem + (size_t)(s % NSA) * LMEM);
+#pragma unroll
+        for (int kk = 0; kk < KS; ++kk) {
+            uint32_t af[MTL][4];
+#pragma unroll
+            for (int l = 0; l < MTL; ++l) {
+                uint32_t w[Fmt<K2>::LW];
+                const int nt = slice * MTL + l;
+                load_words<K2>(w, T + ((size_t)(split * per_split + s * KS + kk) * NTILES + nt0 + nt) * TW + lane, lane);
+                uint32_t b0[2], b1[2];
+                decode_tile<CB, K2>(w, map, lane, b0, b1);
+                af[l][0] = b0[0]; af[l][1] = b1[0]; af[l][2] = b0[1]; af[l][3] = b1[1];  // weights as the A fragment
+            }
+            const int chunk = gm_swz<CPR>(lr, kk * 2 + lc);
+#pragma unroll
+            for (int np = 0; np < NG / 2; ++np) {
+                if (16 * np < cnt) {                         // warp-uniform: a dead n8 group is never read
+                    uint32_t bb[4];
+                    gm_ldsm4(bb, A + (16 * np + lr) * LDA + chunk * 8);
+                    const uint32_t b01[2] = {bb[0], bb[1]}, b23[2] = {bb[2], bb[3]};  // the 16 members of the pair
+#pragma unroll
+                    for (int l = 0; l < MTL; ++l) {
+                        mma16816(work[l][2 * np], af[l], b01);
+                        mma16816(work[l][2 * np + 1], af[l], b23);
+                    }
+                }
+            }
+        }
+        if (((s + 1) * KS) % sub_len == 0) {                 // a shipped sub-range closed: fold its partial into run
+#pragma unroll
+            for (int l = 0; l < MTL; ++l)
+#pragma unroll
+                for (int n = 0; n < NG; ++n)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        run[l][n][c] += work[l][n][c];
+                        work[l][n][c] = 0.f;
+                    }
+        }
+        gm_cp_wait<NSA - 2>();
+        __syncthreads();
+    }
+
+    // store this warp's columns: acc is C[weight column][member] (c0 g,2t; c1 g,2t+1; c2 g+8,2t; c3 g+8,2t+1)
+    float* __restrict__ Zb = Z + (size_t)(mat * ((K >> 4) / per_split) + split) * P * N;
+    const int col_blk = nt0 * 16;
+#pragma unroll
+    for (int l = 0; l < MTL; ++l) {
+        const int cbase = col_blk + (slice * MTL + l) * 16 + g;
+#pragma unroll
+        for (int n = 0; n < NG; ++n) {
+            const int r0 = rows_sh[8 * n + 2 * t], r1 = rows_sh[8 * n + 2 * t + 1];
+            if (r0 >= 0) {
+                float* o = Zb + (size_t)r0 * N + cbase;
+                o[0] = run[l][n][0];
+                o[8] = run[l][n][2];
+            }
+            if (r1 >= 0) {
+                float* o = Zb + (size_t)r1 * N + cbase;
+                o[0] = run[l][n][1];
+                o[8] = run[l][n][3];
+            }
+        }
+    }
+}
+
+// The gm arm's launch: NT 8 tiles (128 a block) across W 8 warps, KS 2 k tiles a stage, an NSA 4 ring, SUBW 4.
+template <int CB, int NT, int W, int LO, int HI, int KS, int NSA, int SUBW>
+__global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    const int u = blockIdx.x;
+    if (u >= ucount[0]) return;
+    constexpr int BM = 128;
+    const int MG = (maxm + BM - 1) / BM;
+    const int mg = blockIdx.z % MG;
+    const int split = (blockIdx.z / MG) % SK;
+    const int mat = blockIdx.z / MG / SK;
+    const half* X = mat ? X1 : X0;
+    const int e = uids[u];
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int KT = K >> 4, NTILES = N >> 4;
+    const int per_split = KT / SK, sub_len = per_split / SUBW;
+    const int nt0 = blockIdx.y * NT;
+    if (per_split % SUBW != 0 || sub_len % KS != 0) return;   // cuda_exl3.zig refuses this launch first
+
+    __shared__ int rows_sh[BM];
+    for (int i = threadIdx.x; i < BM; i += W * 32) {
+        const int m = mg * BM + i;
+        const int code = m < maxm ? members[u * maxm + m] : -1;
+        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    if (rows_sh[0] < 0) return;                               // members come first, so this group is empty
+    int cnt = 0;
+#pragma unroll 16
+    for (int i = 0; i < BM; ++i)
+        if (rows_sh[i] >= 0) cnt = i + 1;
+
+    extern __shared__ __align__(16) unsigned char tf_exl3_gm[];
+    switch (k2) {
+#define TF_GM_CASE(K2_)                                                                                               \
+    case K2_:                                                                                                         \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                         \
+            gm_item<CB, K2_, NT, W, KS, NSA, SUBW>(X, T, Z, tf_exl3_gm, rows_sh, cnt, nt0, split, per_split, sub_len,  \
+                                                   NTILES, mat, P, N, K, warp, lane);                                  \
+        else                                                                                                          \
+            __trap();                                                                                                 \
+        break;
+        TF_GM_CASE(2)
+        TF_GM_CASE(3)
+        TF_GM_CASE(4)
+        TF_GM_CASE(5)
+        TF_GM_CASE(6)
+        TF_GM_CASE(7)
+        TF_GM_CASE(8)
+        TF_GM_CASE(9)
+        TF_GM_CASE(10)
+        TF_GM_CASE(11)
+        TF_GM_CASE(12)
+        TF_GM_CASE(13)
+        TF_GM_CASE(14)
+        TF_GM_CASE(15)
+        TF_GM_CASE(16)
+#undef TF_GM_CASE
+        default:
+            __trap();
+    }
+}
+
 // Program (expert u, n block, split and MTL member tiles): MTL * 16 members times W_q; warps summed in order.
 template <int CB, int NT, int W, int PF, int LO, int HI, int MTL>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
@@ -1510,6 +1740,34 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
 #undef TF_LAUNCH
 }
 
+// The staged gm arm's launch: NT 8 (128 columns a block, staged once) across W 8 warps (one column tile each), KS 2
+
+// k tiles a stage, an NSA 4 ring; SUBW 4 is the shipped arm's warp count, so the split's k is summed in its 4
+
+// sub-ranges and the bits match it. Opt-in, for a shape the guard admits: per_split = KT/SK divisible by SUBW and W,
+
+// and the shipped sub-range per_split/SUBW by KS. cuda_exl3.zig checks the same first (gmShapeOk).
+template <int CB>
+bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
+    constexpr int NT = 8, W = 8, KS = 2, NSA = 4, SUBW = 4;
+    const int KT = a.K / 16;
+    if (KT % a.SK != 0 || a.N % (16 * NT) != 0) return false;
+    const int per_split = KT / a.SK, sub_len = per_split / SUBW;
+    if (a.warps != SUBW || per_split % SUBW != 0 || sub_len % KS != 0) return false;
+    const int MG = (a.maxm + 127) / 128;
+    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * NT)), (unsigned)(a.mats * a.SK * MG));
+    const size_t smem = (size_t)NSA * gm_lmem<KS>();
+#define TF_GM_LAUNCH(LO_, HI_)                                                                                         \
+    grouped_gm_kernel<CB, NT, W, LO_, HI_, KS, NSA, SUBW><<<grid, W * 32, smem, stream>>>(                             \
+        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm,       \
+        a.slots)
+    if (a.lo == 8 && a.hi == 8) TF_GM_LAUNCH(8, 8);
+    else if (a.lo >= 2 && a.hi <= 10) TF_GM_LAUNCH(2, 10);
+    else TF_GM_LAUNCH(2, 16);
+#undef TF_GM_LAUNCH
+    return true;
+}
+
 template <int CB>
 void dequant_launch(const uint32_t* t, half* o, int K, int N, int k2, cudaStream_t stream) {
     dim3 grid((unsigned)(K / 16), (unsigned)(N / 16));
@@ -1535,6 +1793,8 @@ template void grouped_launch<1, 1>(const GroupedArgs&, cudaStream_t);
 template void grouped_launch<2, 1>(const GroupedArgs&, cudaStream_t);
 // The wide member-pass arm (MTL 2, 32 members a program, rows staged in dynamic shared): mul1, opt-in, off by default.
 template void grouped_launch<2, 2>(const GroupedArgs&, cudaStream_t);
+// The staged gm arm (128 members a program, rows the B operand, columns split across the warps): opt-in, off.
+template bool grouped_gm_launch<2>(const GroupedArgs&, cudaStream_t);
 template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
 template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
 template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
