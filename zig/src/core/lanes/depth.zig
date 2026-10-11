@@ -153,12 +153,20 @@ pub const Rule = struct {
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
-        if (most <= 0) return 0;
-        if (r.confidence_floor != null or r.stopsNow()) return most;
+        if (most <= 0) {
+            if (watch != null) note(r, &who, 0, "room");
+            return 0;
+        }
+        if (r.confidence_floor != null or r.stopsNow()) {
+            if (watch != null) note(r, &who, most, if (r.confidence_floor != null) "confidence_floor" else "head_stops");
+            return most;
+        }
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
             const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
-            return @max(1, @min(most, want));
+            const out = @max(1, @min(most, want));
+            if (watch != null) note(r, &who, out, "empty");
+            return out;
         }
         var best: i64 = 1;
         var best_rate: f64 = -1.0;
@@ -185,10 +193,19 @@ pub const Rule = struct {
         }
         const st = &who.state.*.?;
         st.rounds += 1;
-        if (best == 0) return @intFromBool(r.probePlain(st));
+        if (best == 0) {
+            const out: i64 = @intFromBool(r.probePlain(st));
+            if (watch != null) note(r, &who, out, "plain");
+            return out;
+        }
         st.plain = 0;
         st.wait = r.k.depth_probe_every;
-        if (best < most and st.rounds % r.k.depth_probe_every == 0) best += 1;
+        if (best < most and st.rounds % r.k.depth_probe_every == 0) {
+            best += 1;
+            if (watch != null) note(r, &who, best, "probe");
+            return best;
+        }
+        if (watch != null) note(r, &who, best, "rate");
         return best;
     }
 
@@ -204,12 +221,23 @@ pub const Rule = struct {
 
     /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 with a copy ahead).
     pub fn headDepth(r: *Rule, who: *const Who, budget: ?i64, probe: Probe) !i64 {
+        const via_depth = !who.finished and budget == null and !r.node_probabilities;
         const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.node_probabilities)
             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))
         else
             try r.depth(who.*);
-        if (who.forced) return 0;
-        if (d != 0 and probe.copy(probe.ptr, who)) return 1;
+        if (who.forced) {
+            if (watch != null) note(r, who, 0, "forced");
+            return 0;
+        }
+        if (d != 0 and probe.copy(probe.ptr, who)) {
+            if (watch != null) note(r, who, 1, "copy");
+            return 1;
+        }
+        if (watch != null and !via_depth) {
+            const why: []const u8 = if (who.finished) "finished" else if (budget != null) "budget" else "nodes";
+            note(r, who, d, why);
+        }
         return d;
     }
 
@@ -332,6 +360,21 @@ pub const Rule = struct {
     }
 };
 
+/// Optional draft telemetry. Null unless a backend arms it. The null check is the whole cost while it is off.
+pub const Watch = struct {
+    ctx: *anyopaque,
+    choose: *const fn (ctx: *anyopaque, stream: ?*anyopaque, asked: i64, reason: []const u8) void,
+    table: *const fn (ctx: *anyopaque, rule: *const Rule) void,
+};
+
+pub var watch: ?*const Watch = null;
+
+fn note(r: *const Rule, who: *const Who, asked: i64, reason: []const u8) void {
+    const w = watch orelse return;
+    w.table(w.ctx, r);
+    w.choose(w.ctx, who.stream, asked, reason);
+}
+
 fn distance(a: u32, b: usize) usize {
     const x: usize = a;
     return if (x > b) x - b else b - x;
@@ -391,4 +434,62 @@ test "a shared round's drafts come out the same whichever depths its overhead wa
         try rule.budgets(&whos, probe, false, out);
     }
     try std.testing.expectEqualSlices(i64, &got[0], &got[1]);
+}
+
+var seen_why: []const u8 = "";
+var seen_asked: i64 = 0;
+var seen_cost: ?f64 = null;
+
+fn watchChoose(_: *anyopaque, _: ?*anyopaque, asked: i64, reason: []const u8) void {
+    seen_asked = asked;
+    seen_why = reason;
+}
+
+fn watchTable(_: *anyopaque, rule: *const Rule) void {
+    seen_cost = rule.family_costs.get(1);
+}
+
+fn yesCopy(_: *anyopaque, _: *const Who) bool {
+    return true;
+}
+
+fn noCopy(_: *anyopaque, _: *const Who) bool {
+    return false;
+}
+
+test "a watch sees the choice and the cost table, and a copy or a force replaces it" {
+    const gpa = std.testing.allocator;
+    var fc: Table = .{};
+    defer fc.deinit(gpa);
+    for (1..5) |w| try fc.put(gpa, @intCast(w), 5.0 + @as(f64, @floatFromInt(w)));
+    const shared: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.9, 0.9 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = false, .batch_rows = 8 };
+    defer rule.deinit();
+    var st: ?State = null;
+    defer if (st) |*s| s.deinit(gpa);
+    var dummy: u8 = 0;
+    var installed = Watch{ .ctx = &dummy, .choose = watchChoose, .table = watchTable };
+    watch = &installed;
+    defer watch = null;
+
+    var who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
+    try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+    try std.testing.expectEqualStrings("rate", seen_why);
+    try std.testing.expectEqual(@as(i64, 3), seen_asked);
+    try std.testing.expectEqual(@as(?f64, 6), seen_cost);
+
+    rule.head_stops = true;
+    rule.live = 1;
+    try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+    try std.testing.expectEqualStrings("head_stops", seen_why);
+
+    rule.head_stops = false;
+    const copied = try rule.headDepth(&who, null, .{ .ptr = @ptrFromInt(1), .copy = yesCopy });
+    try std.testing.expectEqual(@as(i64, 1), copied);
+    try std.testing.expectEqualStrings("copy", seen_why);
+
+    who.forced = true;
+    const forced = try rule.headDepth(&who, null, .{ .ptr = @ptrFromInt(1), .copy = noCopy });
+    try std.testing.expectEqual(@as(i64, 0), forced);
+    try std.testing.expectEqualStrings("forced", seen_why);
 }
