@@ -30,6 +30,7 @@ const mtp = @import("cuda_mia_mtp.zig");
 const vmm = @import("cuda_vmm.zig");
 const nucleus = @import("cuda_nucleus.zig");
 const profs = @import("cuda_prof.zig");
+const tel = @import("cuda_telemetry.zig");
 const prompt_mm = @import("cuda_mia_prompt.zig");
 const moep = @import("cuda_moe_prompt.zig");
 
@@ -1403,6 +1404,18 @@ pub const Engine = struct {
         const mb = &(e.mbuf orelse return error.NoMtpHead);
         const d = &(e.draws orelse return error.NoMtpHead);
         if (reqs.len == 0) return;
+        // telemetry is off unless TF_FLASHNEXT_TELEMETRY=1, and only rank 0 prints
+        const tel_on = tel.on() and e.rank == 0;
+        errdefer if (tel_on) tel.abandon();
+        if (tel_on) {
+            if (!tel.isPrepared()) {
+                tel.prepare(reqs.len);
+                for (reqs, 0..) |r, i| tel.bind(i, null, @intCast(r.count));
+            }
+            tel.markGap(.draft, tel.now(e.io));
+        }
+        var t_level: std.Io.Timestamp = .zero;
+        if (tel_on) t_level = tel.now(e.io);
         // profiling: the host gap before the head, then its time under the MTP head by draft level
         try e.f.mark(.gap_draft);
         if (e.f.prof) |p| {
@@ -1474,6 +1487,7 @@ pub const Engine = struct {
                 else
                     try d.sampleDraftRow(&e.f, mb, lg, row_of[k], rows, r.seq.st.pos + 1 + j, smp);
                 const t = stops[a.req].take(j, got.prob);
+                if (tel_on) tel.onDraw(a.req, got.prob, stops[a.req].c, t.propose, t.more, j + 1 >= @min(reqs[a.req].count, reqs[a.req].out.len));
                 if (!t.propose) continue;
                 r.out[r.drafted] = @intCast(got.token);
                 r.drafted += 1;
@@ -1481,6 +1495,10 @@ pub const Engine = struct {
                     next[n_next] = .{ .req = a.req, .row = a.row, .tok = @intCast(got.token) };
                     n_next += 1;
                 }
+            }
+            if (tel_on) {
+                tel.endLevel(tel.span(t_level, tel.now(e.io)));
+                t_level = tel.now(e.io);
             }
             try e.f.mark(.draft_sample);
             if (n_next == 0) break;
@@ -1502,6 +1520,13 @@ pub const Engine = struct {
                 row_of[k] = k;
             }
             n_active = n_next;
+        }
+        if (tel_on) {
+            tel.park(tel.now(e.io));
+            var held: [64]usize = undefined;
+            for (reqs, 0..) |r, i| held[i] = r.drafted;
+            const gpu = if (e.f.prof) |p| p.gapMs(.gap_draft) else null;
+            tel.finish(held[0..reqs.len], gpu);
         }
     }
 

@@ -16,6 +16,7 @@ const comm = @import("cuda_comm.zig");
 const rope = @import("cuda_rope.zig");
 const mirror = @import("cuda_mirror.zig");
 const lane_backend = @import("cuda_mia_lanes.zig");
+const tel = @import("cuda_telemetry.zig");
 const kvd = @import("cuda_state.zig");
 
 pub const model_type = "qwen4_exp";
@@ -148,6 +149,8 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
         defer gpa.free(ids);
         try own.lanes.measure(io, ids);
     }
+    // after the cost measurement, so its timings are the table depth() reads and not the log
+    tel.arm();
     var backend = own.lanes.backend();
     own.lanes.follower = o.tp == 2 and o.rank == 1;
     if (o.tp == 2) {
