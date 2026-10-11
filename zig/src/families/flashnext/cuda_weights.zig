@@ -1178,8 +1178,8 @@ const Loader = struct {
             .cb = cb,
             .k2_gu = .{ gu_lo, gu_hi },
             .k2_d = .{ d_lo, d_hi },
-            .tile_gu = try exl3.defaultTile(d, iw, true),
-            .tile_d = try exl3.defaultTile(iw, d, false),
+            .tile_gu = try exl3.tile(d, iw, true),
+            .tile_d = try exl3.tile(iw, d, false),
         };
         // the per-expert trellis addresses a launch takes (device pointers: ours alone, no Python counterpart)
         x.gate_ptr = try L.out.whole(try std.fmt.bufPrint(&nb, "{s}.x3.gate_ptr", .{path}), "int64", &.{n}, std.mem.sliceAsBytes(gp));
