@@ -885,7 +885,53 @@ void exl3x_rot_in_instances(const __nv_bfloat16* xb, const half* xh, int x_strid
 //   dequant_kernel (experts_grouped.cuh:288)  grid (K/16, N/16), block 32
 
 
+// down_combine_kernel with the combined row rounded to bf16 (the write-back's MODE 2 rounding) and no per-slot y
+// stores: the write-back then takes it as a bf16 branch, so the same bits as down_epilogue + _hc_writeback MODE 2.
+__global__ void down_combine_bf16_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                         const half* __restrict__ svh_d, const float* __restrict__ y,
+                                         const float* __restrict__ wts, __nv_bfloat16* __restrict__ out, int P, int D,
+                                         int SK, int E, int slots) {
+    __shared__ float4 part[32][32];
+    const int r = blockIdx.x, blk = blockIdx.y;
+    const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blk * 128 + 4 * lane;
+    const int p = r * slots + k;
+    const int e = pick[p];
+    float o[4];
+    if (e >= 0 && e < E) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.f;
+            for (int q = 0; q < SK; ++q) s += Z[((size_t)q * P + p) * D + n + j];
+            v[j] = s;
+        }
+        fwht128(v, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = y[(size_t)p * D + n + j];
+    }
+    part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
+    __syncthreads();
+    if (k != 0) return;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q = 0; q < slots; ++q) {
+        const float w = wts[r * slots + q];
+        const float4 u = part[q][lane];
+        acc[0] = fmaf(w, u.x, acc[0]);
+        acc[1] = fmaf(w, u.y, acc[1]);
+        acc[2] = fmaf(w, u.z, acc[2]);
+        acc[3] = fmaf(w, u.w, acc[3]);
+    }
+    __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(out + (size_t)r * D + n);
+    o2[0] = __floats2bfloat162_rn(acc[0], acc[1]);
+    o2[1] = __floats2bfloat162_rn(acc[2], acc[3]);
+}
+
 }  // namespace tf_exl3_exp
+
 
 
 // ===============================================================================================================
