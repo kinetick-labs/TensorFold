@@ -274,9 +274,17 @@ pub fn groupWorkspaceBytes(rows: usize, slots: usize, experts: usize) usize {
     return groupWorkspaceInts(rows * slots, experts) * @sizeOf(i32);
 }
 
-/// gateup_epilogue_kernel (experts.cu:116) and down_epilogue_kernel (:161): grid (rows*slots, width/128), block 32.
+/// Warps in a gate/up or down epilogue block: each warp is one pick, the same fwht and split sum as a block of 32.
+pub const epilogue_warps: usize = 4;
+
+/// gateup_epilogue_kernel and down_epilogue_kernel: grid (ceil(rows*slots/4), width/128), block 128.
 pub fn epilogueGrid(rows: usize, slots: usize, width: usize) [2]usize {
-    return .{ rows * slots, width / 128 };
+    const p = rows * slots;
+    return .{ (p + epilogue_warps - 1) / epilogue_warps, width / 128 };
+}
+
+pub fn epilogueBlock() usize {
+    return epilogue_warps * 32;
 }
 
 /// combine_kernel (experts.cu:183): grid (rows, ceil(D/256)), block 256.
@@ -728,7 +736,7 @@ pub fn gateupEpilogue(k: *const Kernels, z: u64, pick: u64, svh_g: u64, svh_u: u
     a.add(int(experts));
     a.add(limit);
     a.add(act_mode);
-    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = 32 } }, s, &a);
+    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = epilogueBlock() } }, s, &a);
 }
 
 /// down epilogue: Y fp32 = (split sums in order) @ H * svh_d.
@@ -743,7 +751,7 @@ pub fn downEpilogue(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, ro
     a.add(int(d));
     a.add(int(sk));
     a.add(int(experts));
-    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = 32 } }, s, &a);
+    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = epilogueBlock() } }, s, &a);
 }
 
 /// The slots' combination: out[r] = sum over slots of wts[r][k] * y[r*slots + k] (fp32, fma chain from 0).
@@ -1054,7 +1062,8 @@ test "the launch shapes are the reference's" {
     try testing.expectEqual(@as(usize, 32768), linearShared(8, 128)); // WK * min(M, 8) * 128 * 4, the cap 48 KiB
     try testing.expectEqual(@as(usize, 2048), linearShared(2, 2)); // WK * M * 128 * 4, rows under the 8-row cap
     try testing.expectEqual([2]usize{ 768, 160 }, unpackGrid(2560, 12288));
-    try testing.expectEqual([2]usize{ 640, 5 }, epilogueGrid(128, 5, 640)); // rows x slots, width / 128
+    try testing.expectEqual([2]usize{ 160, 5 }, epilogueGrid(128, 5, 640)); // ceil(rows*slots / 4 warps), width / 128
+    try testing.expectEqual(@as(usize, 128), epilogueBlock());
     try testing.expectEqual([2]usize{ 1, 1 }, combineGrid(1, 256));
     try testing.expectEqual([2]usize{ 1, 2 }, combineGrid(1, 300));
     try testing.expectEqual([2]usize{ 1, 5 }, downCombineGrid(1, 640));
