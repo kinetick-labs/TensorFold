@@ -428,6 +428,30 @@ pub const sym = struct {
             "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
     };
+    /// tf_exl3x: (8, 4, 4), the decode arm (trellis words through a 4-deep cp.async ring), [k2 range]
+    /// [arm][k2 range]: arm 0 (8,4,4) ring 4, 1 (8,4,3) registers + 8-row fold, 2 (8,4,5) ring 2, 3 (8,4,6) ring 3
+    pub const grouped_async = [4][3][:0]const u8{
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi4ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi4ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi4ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi3ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi3ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi3ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi5ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi5ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi5ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi6ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi6ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi6ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+    };
     /// tf_exl3x: the wide member-pass arm (MTL 2, 32 members a program, rows staged in dynamic shared), mul1, opt-in.
     pub const grouped_wide = [4][3][:0]const u8{
         .{
@@ -515,6 +539,8 @@ pub const Kernels = struct {
     grouped_wide: [4][3]?cuda.Function,
     /// the decode ablation's instances: null when the embedded fatbin predates them (a timing probe, off by default)
     grouped_abl: [4][3]?cuda.Function,
+    /// the decode cp.async arm: null when the embedded fatbin predates it
+    grouped_async: [4][3]?cuda.Function = @splat(.{ null, null, null }),
     /// the staged gm arm's instances: null when the embedded fatbin predates them (opt-in, off by default)
     grouped_gm: [3]?cuda.Function,
     grouped_gm4: [3]?cuda.Function,
@@ -555,6 +581,9 @@ pub const Kernels = struct {
         };
         for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
         for (sym.grouped_gm4, 0..) |s, i| k.grouped_gm4[i] = k.module.function(s) catch null;
+        for (sym.grouped_async, 0..) |row, i| for (row, 0..) |s, j| {
+            k.grouped_async[i][j] = k.module.function(s) catch null;
+        };
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
         const ceiling: usize = @intCast(try ctx.attribute(.max_shared_memory_per_block_optin));
         // the wide arm stages its A tile in dynamic shared: opt the staged instances in against the same ceiling
@@ -562,6 +591,11 @@ pub const Kernels = struct {
         k.wide_smem_max = @intCast(ceiling -| wstatic);
         for (k.grouped_wide) |row| for (row) |maybe| {
             if (maybe) |f| try f.allowDynamicShared(k.wide_smem_max);
+        };
+        // the decode cp.async arm: its ring in dynamic shared, opted in against the same ceiling
+        for (&k.grouped_async) |*row| for (row) |*maybe| if (maybe.*) |f| {
+            const st: usize = @intCast(try f.attribute(.shared_size_bytes));
+            if (st + async_smem_max <= ceiling) try f.allowDynamicShared(@intCast(async_smem_max)) else maybe.* = null;
         };
         // the gm arm stages its member ring in dynamic shared: opt the staged instances in against the same ceiling
         const gstatic: usize = if (k.grouped_gm[0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
@@ -905,6 +939,39 @@ pub fn gmShapeOk(kk: usize, n: usize, sk: usize, shipped_w: usize) bool {
     return (per_split / gm_subw) % gm_ks == 0;
 }
 
+/// The decode cp.async arm: picks up to this many on the (8, 4, 1) tile take grouped_async (the same tile, the same
+/// k walk and fold, the trellis words through a 4-deep shared ring). TF_FLASHNEXT_X3_ASYNC=0: off.
+pub const async_max_picks = 64;
+pub const arm_stages = [4]usize{ 4, 0, 2, 3 };
+/// TF_FLASHNEXT_X3_ARM: the decode arm (0-3, arm_stages); default 3 (cp.async ring 3 deep + 8-row fold)
+fn armIndex() usize {
+    const st = struct {
+        var v: usize = 3;
+        var read: bool = false;
+    };
+    if (!st.read) {
+        if (std.c.getenv("TF_FLASHNEXT_X3_ARM")) |x| st.v = @min(3, std.fmt.parseInt(usize, std.mem.span(x), 10) catch 3);
+        st.read = true;
+    }
+    return st.v;
+}
+/// ring bytes: stages x 4 warps x 8 tiles x the widest k2's 4 * k2 words
+pub fn asyncSmem(stages: usize, hi: u32) usize {
+    return stages * 4 * 8 * 4 * @as(usize, hi) * 4;
+}
+const async_smem_max = asyncSmem(4, 16);
+fn asyncOn() bool {
+    const st = struct {
+        var on: bool = true;
+        var read: bool = false;
+    };
+    if (!st.read) {
+        if (std.c.getenv("TF_FLASHNEXT_X3_ASYNC")) |v| st.on = !std.mem.eql(u8, std.mem.span(v), "0");
+        st.read = true;
+    }
+    return st.on;
+}
+
 /// The grouped expert GEMM: 16 members a program, or 32 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
     const t = tile_settings[setting];
@@ -935,6 +1002,10 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
         const mtiles = (maxm + 127) / 128;
         const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
         return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[1]), .y = @intCast(g[0]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
+    }
+    if (!gm and p <= async_max_picks and t.nt == 8 and t.w == 4 and t.pf == 1 and k.grouped_async[armIndex()][range] != null and !wideMembers() and !ablateDecode() and asyncOn()) {
+        const ga = groupedGrid(experts, n, 8, mats, sk, (@min(maxm, grouped_grid_members) + 15) / 16);
+        return cuda.launch.launch(k.grouped_async[armIndex()][range].?, .{ .grid = .{ .x = @intCast(ga[0]), .y = @intCast(ga[1]), .z = @intCast(ga[2]) }, .block = .{ .x = 128 }, .shared = @intCast(asyncSmem(arm_stages[armIndex()], ranges[range].hi)) }, s, &a);
     }
     const wide = wideMembers();
     const abl = !wide and ablateDecode();
