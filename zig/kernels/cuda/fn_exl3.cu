@@ -620,6 +620,57 @@ __global__ void group_scatter_kernel(const int* __restrict__ pick, const int* __
     }
 }
 
+// n <= GROUP_TILE: one block does hist, compaction and the stable scatter in shared memory (no workspace, no memset).
+// Same uids (id order), same member ids in pick order, same -1 pad as the three-kernel path.
+__global__ void group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids, int* __restrict__ ucount,
+                                   int* __restrict__ members, int n, int slots, int E, int maxm) {
+    extern __shared__ int tf_group_small[];
+    int* cnt = tf_group_small;
+    int* place = tf_group_small + E;
+    __shared__ int su;
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        const int e = pick[i];
+        if ((unsigned)e < (unsigned)E) atomicAdd(cnt + e, 1);
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int lane = (int)threadIdx.x;
+        int u = 0;
+        for (int base = 0; base < E; base += 32) {
+            const int e = base + lane;
+            const bool hit = e < E && cnt[e] > 0;
+            const unsigned m = __ballot_sync(0xffffffffu, hit);
+            if (e < E) {
+                if (hit) {
+                    const int r = u + __popc(m & ((1u << lane) - 1u));
+                    uids[r] = e;
+                    place[e] = r;
+                } else {
+                    place[e] = -1;
+                }
+            }
+            u += __popc(m);
+        }
+        if (lane == 0) { ucount[0] = u; su = u; }
+    }
+    __syncthreads();
+    const int nfill = su * maxm;
+    for (int i = (int)threadIdx.x; i < nfill; i += (int)blockDim.x) members[i] = -1;
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    for (int i = 0; i < n; ++i) {
+        const int e = pick[i];
+        if ((unsigned)e >= (unsigned)E) continue;
+        const int rank = cnt[e];
+        cnt[e] = rank + 1;
+        if (rank >= maxm) continue;
+        members[(size_t)place[e] * maxm + rank] = (i / slots) * 32 + (i % slots);
+    }
+}
+
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
