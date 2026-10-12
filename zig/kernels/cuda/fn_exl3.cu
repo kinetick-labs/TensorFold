@@ -1082,6 +1082,62 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
     }
 }
 
+// The decode arm (PF >= 3, cuda_exl3.zig grouped_async): one warp's k tiles [kt0, kt0 + nkt) as warp_tiles walks
+// them, the trellis words staged by cp.async through a PF-deep ring in dynamic shared (a warp's own slice), so PF - 1
+// k steps are in flight without their registers. The same words reach the same lanes and the same mma run in the
+// same k order: the bits are warp_tiles'.
+template <int CB, int K2, int NT, int S>
+__device__ __forceinline__ void warp_tiles_async(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                                 const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                                 float (&acc)[NT][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int SW = NT * TW;                         // a k step's words: NT tiles, contiguous along n
+    extern __shared__ __align__(16) uint32_t tf_x3a_smem[];
+    uint32_t* buf = tf_x3a_smem + (size_t)(threadIdx.x >> 5) * S * SW;
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* base = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    auto issue = [&](int it) {
+        const uint32_t* src = base + (size_t)it * kstride;
+        uint32_t* dst = buf + (it % S) * SW;
+        for (int c = lane; c < SW / 4; c += 32) {
+            const unsigned sa = (unsigned)__cvta_generic_to_shared(dst + 4 * c);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(src + 4 * c));
+        }
+    };
+#pragma unroll
+    for (int d = 0; d < S - 1; ++d) {
+        if (d < nkt) issue(d);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+    for (int it = 0; it < nkt; ++it) {
+        if (it + S - 1 < nkt) issue(it + S - 1);
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(S - 1));
+        __syncwarp();
+        const uint32_t* cur = buf + (it % S) * SW;
+        uint32_t w[NT][LW];
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int l = 0; l < LW; ++l)
+                w[i][l] = ((TW % 32) == 0 || l * 32 + lane < TW) ? cur[i * TW + l * 32 + lane] : 0u;
+        __syncwarp();                                   // every lane has read the slot before it is refilled
+        const int k = (kt0 + it) * 16;
+        uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                         load_pair(x1 + k + 8, ok1)};
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            uint32_t b0[2], b1[2];
+            decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+            mma16816(acc[i][0], a, b0);
+            mma16816(acc[i][1], a, b1);
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncwarp();
+}
+
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
 template <int CB, int K2, int NT, int PF, int ABL = 0>
 __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
@@ -1594,7 +1650,10 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             }
         }
     } else {
-    __shared__ float red[W][16][NT * 16];
+    // the decode arm (PF >= 3, picks <= 64: at most 5 rows, so at most 5 members an expert) folds rows 0-7 only:
+    // 16 KB instead of 32 for occupancy; the rows it drops are dead (r < 0), the fold of the rest is unchanged
+    constexpr int RR = PF >= 3 ? 8 : 16;
+    __shared__ float red[W][RR][NT * 16];
     for (int tt = 0; tt < MTL; ++tt) {
         if (rows_sh[tt * 16] < 0) break;                  // members ascend, so the first dead row ends the group
         if (tt) __syncthreads();                          // red is reused: the previous tile's store has read it
@@ -1614,7 +1673,9 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
+            { if constexpr (PF == 3) warp_tiles<CB, K2_, NT, 1>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+              else if constexpr (PF >= 4) warp_tiles_async<CB, K2_, NT, (PF == 5 ? 2 : PF == 6 ? 3 : PF)>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+              else warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); } \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -1646,11 +1707,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
                 const int col = i * 16 + h * 8 + 2 * t;
                 red[warp][g][col] = acc[i][h][0];
                 red[warp][g][col + 1] = acc[i][h][1];
-                red[warp][g + 8][col] = acc[i][h][2];
-                red[warp][g + 8][col + 1] = acc[i][h][3];
+                if constexpr (RR == 16) {
+                    red[warp][g + 8][col] = acc[i][h][2];
+                    red[warp][g + 8][col + 1] = acc[i][h][3];
+                }
             }
         __syncthreads();
-        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+        for (int idx = threadIdx.x; idx < RR * NT * 16; idx += W * 32) {
             const int row = idx / (NT * 16), col = idx % (NT * 16);
             const int r = rows_sh[tt * 16 + row];
             if (r < 0) continue;
@@ -1912,6 +1975,11 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }
     else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
     else if (a.nt == 4 && a.warps == 4 && a.pf == 1) { TF_RANGES(4, 4, 1) }
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 4) { TF_RANGES(8, 4, 4) }
+    // decode arms: PF 3 the register walk with the 8-row fold, PF 5 / 6 the cp.async ring 2 / 3 deep
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 3) { TF_RANGES(8, 4, 3) }
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 5) { TF_RANGES(8, 4, 5) }
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 6) { TF_RANGES(8, 4, 6) }   // the decode cp.async arm (grouped_async)
     else (void)0;   // nt/warps/pf outside the settings the reference compiles and cuda_exl3.zig's table lists
 #undef TF_RANGES
 #undef TF_LAUNCH
