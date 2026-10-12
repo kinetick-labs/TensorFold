@@ -26,7 +26,7 @@ Context:          262,144 tokens
 MTP:              cap 3 (TF_FLASHNEXT_DEPTH; unset is 3). Acceptance-rate ask, product stop -0.4 only truncates (TF_FLASHNEXT_CONFIDENCE)
 KV cache:         bf16 (default)
 Streams:          2 (--parallel 2)
-Experts window:   2048 rows (TF_FLASHNEXT_X3_MOE_WINDOW)
+Experts window:   4096 rows (TF_FLASHNEXT_X3_MOE_WINDOW)
 N-gram table:     rows gathered per prompt chunk, no prefetch stage (TF_FLASHNEXT_PREFILL_ROWS, default 2048)
 CUDA graphs:      on by default (TF_FLASHNEXT_GRAPH_LOG counts them)
 Vision:           not supported (text only)
@@ -168,7 +168,7 @@ ask. The acceptance-rate rule asks inside the cap, and the product stop shortens
 Two further defaults worth knowing: `TF_FLASHNEXT_PRODUCT_STREAMS=2` switches the head's stop
 (the product rule while at most two lanes are drafting, then `wide_confidence` 0.5; a different
 concept from `--parallel 2`; `cuda_mia_lanes.zig` `confidenceNow`, `cuda_engine.zig:53`). It does not
-make `depth()` ask the cap. `TF_FLASHNEXT_X3_MOE_WINDOW=2048` is the grouped-experts window
+make `depth()` ask the cap. `TF_FLASHNEXT_X3_MOE_WINDOW=4096` is the grouped-experts window
 (`cuda_forward.zig:335`).
 
 The command below is the served operating point. Unset variables resolve to the same values.
@@ -178,7 +178,7 @@ Depth 3 is the cap. The earlier **50.4 tok/s** Fibonacci figure was this serve a
 export TF_FLASHNEXT_DEPTH=3
 export TF_FLASHNEXT_CONFIDENCE=-0.4
 export TF_FLASHNEXT_PRODUCT_STREAMS=2
-export TF_FLASHNEXT_X3_MOE_WINDOW=2048
+export TF_FLASHNEXT_X3_MOE_WINDOW=4096
 # optional: confirm the decode/verify graphs are being captured
 # export TF_FLASHNEXT_GRAPH_LOG=1
 # optional: one tf-draft line per round (grep tf-draft). Off leaves tokens unchanged.
