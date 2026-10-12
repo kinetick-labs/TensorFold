@@ -339,21 +339,28 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
         prev = word != lane / (8 / K2);
     }
 
-    for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
-        const int R = min(16, M - m0);
-
-        float acc[8][2][4];
+    // MT 16-row m tiles share each decoded weight tile (a row's mma sums do not depend on the other rows: same bits)
+    constexpr int MT = 2;
+    for (int mb = 0; mb < M; mb += 16 * MT) {
+        float acc[MT][8][2][4];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int u = 0; u < MT; ++u)
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[u][i][h][c] = 0.f;
 
         // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
-        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
-        const half* x0 = xh + (size_t)r0 * K;
-        const half* x1 = xh + (size_t)r1 * K;
+        const half* x0[MT];
+        const half* x1[MT];
+#pragma unroll
+        for (int u = 0; u < MT; ++u) {
+            const int m0 = mb + 16 * u, Rm = M - m0;
+            x0[u] = xh + (size_t)(m0 + (g < Rm ? g : Rm - 1)) * K;
+            x1[u] = xh + (size_t)(m0 + (g + 8 < Rm ? g + 8 : Rm - 1)) * K;
+        }
         const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
         // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
         constexpr bool PF = K2 <= 12;
@@ -363,11 +370,16 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
 #pragma unroll 1
         for (int i = 0; i < per_warp; ++i) {
             const int kt = kt0 + i;
-            uint32_t a[4];
-            a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
-            a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
-            a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
-            a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
+            uint32_t a[MT][4];
+#pragma unroll
+            for (int u = 0; u < MT; ++u) {
+                if (mb + 16 * u < M) {
+                    a[u][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[u] + kt * 16 + 2 * t));
+                    a[u][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[u] + kt * 16 + 2 * t));
+                    a[u][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[u] + kt * 16 + 2 * t + 8));
+                    a[u][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[u] + kt * 16 + 2 * t + 8));
+                }
+            }
             if constexpr (PF) {
                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
             }
@@ -378,8 +390,13 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                 else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
                 uint32_t b0[2], b1[2];
                 decode_lane<K2, CB>(w, lane, b0, b1);
-                mma16816(acc[j][0], a, b0);
-                mma16816(acc[j][1], a, b1);
+#pragma unroll
+                for (int u = 0; u < MT; ++u) {
+                    if (mb + 16 * u < M) {
+                        mma16816(acc[u][j][0], a[u], b0);
+                        mma16816(acc[u][j][1], a[u], b1);
+                    }
+                }
             }
             if constexpr (PF) {
 #pragma unroll
@@ -387,6 +404,11 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             }
         }
 
+#pragma unroll
+      for (int u = 0; u < MT; ++u) {
+        const int m0 = mb + 16 * u, pass = m0 >> 4;
+        if (m0 >= M) break;
+        const int R = min(16, M - m0);
         // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
         for (int rlo = 0; rlo < R; rlo += 8) {
             const int rn = min(R - rlo, 8);
@@ -398,7 +420,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     for (int h = 0; h < 2; ++h) {
                         const int col = i * 16 + h * 8 + 2 * t;
                         *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
-                            rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
+                            rlo ? make_float2(acc[u][i][h][2], acc[u][i][h][3]) : make_float2(acc[u][i][h][0], acc[u][i][h][1]);
                     }
             }
             __syncthreads();
@@ -451,6 +473,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             }
         }
         __syncthreads();                             // red is reused in the next pass
+      }
     }
 }
 
