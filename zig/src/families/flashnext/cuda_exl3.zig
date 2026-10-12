@@ -841,10 +841,10 @@ pub fn ablateDecode() bool {
     return wideFlag(v);
 }
 
-/// Whether the staged gm arm runs: TF_FLASHNEXT_X3_GM, off by default (upstream's gm_kernel ported as an opt-in arm).
+/// Whether the staged gm arm runs: TF_FLASHNEXT_X3_GM, on by default (one decode a weight tile for 128 member rows); 0 turns it off.
 pub fn gmMembers() bool {
     const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_GM")) |e| std.mem.span(e) else null;
-    return wideFlag(v);
+    return if (v == null) true else wideFlag(v);
 }
 
 /// The gm arm's setting: NT 8 / W 8 / KS 2 / NSA 4, and SUBW 4 (the shipped warp count, so its 4 k sub-ranges).
