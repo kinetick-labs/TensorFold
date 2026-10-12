@@ -690,11 +690,16 @@ pub fn groupPlan(pick: []const i32, slots: usize, experts: usize, maxm: usize, u
     @memset(members[0 .. u * maxm], -1);
     @memset(local, 0);
     const cap: i32 = @intCast(maxm);
+    var cur: usize = 0;
     for (pick, 0..) |e, i| {
+        const gt = i / group_tile;
+        if (gt != cur) {
+            @memset(local, 0);
+            cur = gt;
+        }
         if (e < 0 or @as(usize, @intCast(e)) >= experts) continue;
         const eu: usize = @intCast(e);
-        const tile = i / group_tile;
-        const rank = hist[tile * experts + eu] + local[eu];
+        const rank = hist[gt * experts + eu] + local[eu];
         local[eu] += 1;
         if (rank >= cap) continue;
         members[@as(usize, @intCast(place[eu])) * maxm + @as(usize, @intCast(rank))] = @intCast((i / slots) * 32 + (i % slots));
@@ -736,7 +741,7 @@ pub fn gateupEpilogue(k: *const Kernels, z: u64, pick: u64, svh_g: u64, svh_u: u
     a.add(int(experts));
     a.add(limit);
     a.add(act_mode);
-    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = epilogueBlock() } }, s, &a);
+    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock()) } }, s, &a);
 }
 
 /// down epilogue: Y fp32 = (split sums in order) @ H * svh_d.
@@ -751,7 +756,7 @@ pub fn downEpilogue(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, ro
     a.add(int(d));
     a.add(int(sk));
     a.add(int(experts));
-    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = epilogueBlock() } }, s, &a);
+    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock()) } }, s, &a);
 }
 
 /// The slots' combination: out[r] = sum over slots of wts[r][k] * y[r*slots + k] (fp32, fma chain from 0).
@@ -1026,7 +1031,9 @@ test "grouped expert rows stay in pick order across tiles, with the maxm pad" {
     }
     pick[10] = 4;
     pick[2000] = 4;
-    for (&pick, 0..) |*p, i| if (p.* == 4 and i != 10 and i != 2000) p.* = 1;
+    for (&pick, 0..) |*p, i| {
+        if (p.* == 4 and i != 10 and i != 2000) p.* = 1;
+    }
     var uids_s: [8]i32 = undefined;
     var uids_p: [8]i32 = undefined;
     var mem_s: [8 * 3]i32 = undefined;
