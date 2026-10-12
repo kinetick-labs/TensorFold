@@ -542,6 +542,11 @@ pub const Engine = struct {
             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
         };
         errdefer if (e.mtpq) |*t| t.deinit();
+        // EXL3: a 4-bit draft head from the trellis lm_head (drafts only); TF_FLASHNEXT_X3_DRAFT_HEAD=0: the whole head
+        if (e.w.mtp != null and e.w.head3 != null and e.w.draft_head == null and !envOff("TF_FLASHNEXT_X3_DRAFT_HEAD")) {
+            try @import("cuda_draft3.zig").build(gpa, d, &e.f, &e.w, e.stream, e.c.vocab, o.rank, o.world);
+            std.log.info("EXL3 draft head: {d} rows in 4-bit", .{e.w.draft_count});
+        }
         // sampling scratch: the main head's rows and the draft head's one row
         const draft_n: usize = if (e.w.draft_head) |q| q.n else e.g.head_n;
         const main_sz = try sampleSizes(&e.torch.f, &.{ .{ state.max_rows, e.g.head_n, max_k }, .{ 1, e.g.head_n, max_k }, .{ rows, e.g.head_n, state.cand }, .{ 1, draft_n, state.cand }, .{ rows, draft_n, state.cand } });
