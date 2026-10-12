@@ -45,7 +45,7 @@ pub const default_confidence = 0.70;
 /// at depth 15 cost hash-map prose 10% served), or TF_FLASHNEXT_CONFIDENCE (-1..1: c > 0 Python's per-draft rule, c < 0
 /// the running product at -c, 0 every draft). The oracle runs keep `default_confidence`. Drafts only: the kept tokens
 /// are the target's either way.
-pub const served_confidence = -0.4;
+pub const served_confidence = -0.6;
 
 /// The served hybrid: the running product (served_confidence) while at most this many streams are live, Python's
 /// per-draft rule at `wide_confidence` above that (TF_FLASHNEXT_PRODUCT_STREAMS; 2 by default). W6's served A/B: the

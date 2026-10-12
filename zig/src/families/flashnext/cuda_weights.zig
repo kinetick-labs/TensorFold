@@ -35,7 +35,7 @@ const Tensor = st.Tensor;
 
 pub const Mode = enum { device, hash, count };
 
-/// The default draft vocabulary (qwen4_exp/cuda/draft_vocab.txt, 79,591 ids), embedded.
+/// The default draft vocabulary (qwen4_exp/cuda/draft_vocab.txt, 79,591 ids) plus fr/es/de Wikipedia ids and accented Latin pieces: 95,111 ids, embedded.
 pub const draft_vocab = @embedFile("cuda_draft_vocab.txt");
 
 /// What the loader takes beside the checkpoint and its Config.
@@ -2135,21 +2135,21 @@ test {
     _ = &digests;
 }
 
-test "the default draft vocabulary: 79,591 ids, split as np.array_split" {
+test "the default draft vocabulary: 95,111 ids, split as np.array_split" {
     const a = std.testing.allocator;
     const all = try draftIds(a, draft_vocab, 248320, 0, 1);
     defer a.free(all);
-    try std.testing.expectEqual(@as(usize, 79591), all.len);
+    try std.testing.expectEqual(@as(usize, 95111), all.len);
     try std.testing.expectEqual(@as(u32, 0), all[0]);
     try std.testing.expectEqual(@as(u32, 248076), all[all.len - 1]);
     const r0 = try draftIds(a, draft_vocab, 248320, 0, 2);
     defer a.free(r0);
     const r1 = try draftIds(a, draft_vocab, 248320, 1, 2);
     defer a.free(r1);
-    try std.testing.expectEqual(@as(usize, 39796), r0.len);
-    try std.testing.expectEqual(@as(usize, 39795), r1.len);
-    try std.testing.expectEqualSlices(u32, all[0..39796], r0);
-    try std.testing.expectEqualSlices(u32, all[39796..], r1);
+    try std.testing.expectEqual(@as(usize, 47556), r0.len);
+    try std.testing.expectEqual(@as(usize, 47555), r1.len);
+    try std.testing.expectEqualSlices(u32, all[0..47556], r0);
+    try std.testing.expectEqualSlices(u32, all[47556..], r1);
     const small = try draftIds(a, "5 3 3 9 1", 6, 0, 1);
     defer a.free(small);
     try std.testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, small);

@@ -31,7 +31,7 @@ pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-pr
 /// The checkpoint's native window; 1,048,576 with YaRN (work/PLAN.md, "1M context").
 pub const default_context: i64 = 262144;
 /// Drafts a Flash Next CUDA serve may ask when `TF_FLASHNEXT_DEPTH` is unset. The acceptance-rate rule already asks near this, so a higher cap only widens the verify window. NVFP4 and INT4-AutoRound share this open; other families do not.
-pub const served_draft_cap: usize = 3;
+pub const served_draft_cap: usize = 4;
 pub const prefill_step: u32 = 2048;
 pub const prompt_rows: u32 = kvd.prefill_rows;
 
@@ -392,8 +392,8 @@ test {
     _ = lane_backend;
 }
 
-test "the served draft cap is 3, and TF_FLASHNEXT_DEPTH overrides it" {
-    try std.testing.expectEqual(@as(usize, 3), try draftCap(null));
+test "the served draft cap is 4, and TF_FLASHNEXT_DEPTH overrides it" {
+    try std.testing.expectEqual(@as(usize, 4), try draftCap(null));
     try std.testing.expectEqual(@as(usize, 15), try draftCap("15"));
     try std.testing.expectError(error.BadDepth, draftCap("0"));
     try std.testing.expectError(error.BadDepth, draftCap("16"));
