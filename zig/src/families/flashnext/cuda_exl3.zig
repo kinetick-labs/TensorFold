@@ -1092,7 +1092,9 @@ test "the launch shapes are the reference's" {
     try testing.expectEqual(@as(usize, 2048), linearShared(2, 2)); // WK * M * 128 * 4, rows under the 8-row cap
     try testing.expectEqual([2]usize{ 768, 160 }, unpackGrid(2560, 12288));
     try testing.expectEqual([2]usize{ 160, 5 }, epilogueGrid(128, 5, 640)); // ceil(rows*slots / 4 warps), width / 128
-    try testing.expectEqual(@as(usize, 128), epilogueBlock());
+    try testing.expectEqual(@as(usize, 128), epilogueBlock(128, 5));
+    try testing.expectEqual([2]usize{ 30, 5 }, epilogueGrid(3, 10, 640)); // under 256 picks: one warp a pick
+    try testing.expectEqual(@as(usize, 32), epilogueBlock(3, 10));
     try testing.expectEqual([2]usize{ 1, 1 }, combineGrid(1, 256));
     try testing.expectEqual([2]usize{ 1, 2 }, combineGrid(1, 300));
     try testing.expectEqual([2]usize{ 1, 5 }, downCombineGrid(1, 640));
