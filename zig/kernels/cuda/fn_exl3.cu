@@ -318,7 +318,7 @@ template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
-    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
+    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK, int ldy) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
     extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
@@ -436,7 +436,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * ldy + col0 + 4 * lane, v);
                 }
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
@@ -467,7 +467,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     }
                     float v[4] = {s.x, s.y, s.z, s.w};
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + r) * ldy + col0 + 4 * lane, v);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
@@ -522,7 +522,7 @@ void exl3_linear_instances(const half* xh, const uint32_t* T, long long stride_k
         const int smem = (int)(WK * (M < 8 ? M : 8) * 128 * sizeof(float));                                             \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);           \
         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z,       \
-                                                            counters, M, K, N, SK);                                     \
+                                                            counters, M, K, N, SK, N);                                  \
         return;                                                                                                        \
     }
     TF_EXL3_ALL(TF_LAUNCH)
