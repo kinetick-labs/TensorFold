@@ -666,10 +666,11 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
                                        int E, float limit, int act_mode) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+    const int warps = (int)blockDim.x >> 5, warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
+    const int p = (int)blockIdx.x * warps + warp, blk = (int)blockIdx.y;
+    if (p >= P) return;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
-    const int lane = threadIdx.x;
     const int n = blk * 128 + 4 * lane;
     float gv[4], uv[4];
 #pragma unroll
@@ -710,10 +711,11 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
 __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                      const half* __restrict__ svh_d, float* __restrict__ y, int P, int D, int SK,
                                      int E) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+    const int warps = (int)blockDim.x >> 5, warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
+    const int p = (int)blockIdx.x * warps + warp, blk = (int)blockIdx.y;
+    if (p >= P) return;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
-    const int lane = threadIdx.x;
     const int n = blk * 128 + 4 * lane;
     float v[4];
 #pragma unroll
@@ -801,8 +803,8 @@ void exl3x_rot_in_instances(const __nv_bfloat16* xb, const half* xh, int x_strid
 //   group_hist_kernel              grid (tiles), block 256; tiles of GROUP_TILE picks, histogram in work
 //   group_scan_kernel              1 block of 256: exclusive scan, uids in id order, members set to -1
 //   group_scatter_kernel           grid (tiles), block 128, E*4 shared: stable scatter, same member ids
-//   gateup_epilogue_kernel (:116)  grid (rows*slots, N/128), block 32
-//   down_epilogue_kernel   (:161)  grid (rows*slots, D/128), block 32
+//   gateup_epilogue_kernel          grid (ceil(rows*slots/4), N/128), block 128 (4 warps, one pick a warp)
+//   down_epilogue_kernel            grid (ceil(rows*slots/4), D/128), block 128 (4 warps, one pick a warp)
 //   combine_kernel         (:183)  grid (rows, ceil(D/256)), block 256
 //   down_combine_kernel    (:194)  grid (rows, D/128), block 32*slots (slots <= 32)
 //   grouped_kernel (experts_grouped.cuh:191)  grid (nexp_max, N/(16*nt), mats*SK*mtiles), block W*32, no smem
