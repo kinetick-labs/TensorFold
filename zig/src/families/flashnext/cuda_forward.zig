@@ -336,10 +336,10 @@ const X3Scratch = struct {
 
 /// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
 pub fn x3MoeWindow() usize {
-    // TF_FLASHNEXT_X3_MOE_WINDOW (default 2048: +7.0-7.6% over 1024 at identical bits) trades scratch for fewer passes.
+    // TF_FLASHNEXT_X3_MOE_WINDOW (default 4096: with every member kept, 4096 is +8-9% over 2048 at identical bits) trades scratch for fewer passes.
     // One read: a forward asks again at every MoE layer, and the process does not change the variable.
-    const v = x3MoeWindowEnv() orelse return 2048;
-    return @max(@min(std.fmt.parseInt(usize, v, 10) catch 2048, 16384), 128);
+    const v = x3MoeWindowEnv() orelse return 4096;
+    return @max(@min(std.fmt.parseInt(usize, v, 10) catch 4096, 16384), 128);
 }
 
 fn x3MoeWindowEnv() ?[]const u8 {
