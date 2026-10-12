@@ -368,19 +368,19 @@ pub const sym = struct {
     /// tf_exl3_lin (linear.cu): [k2: 8, 10, 12][WK: 2, 4, 8]
     pub const linear = [3][3][:0]const u8{
         .{
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
         },
     };
     /// tf_exl3_lin: the width's dequantize-to-dense
@@ -590,7 +590,7 @@ pub fn rotIn(k: *const Kernels, x: u64, x_dtype: c_int, suh: u64, xh: u64, rows:
 }
 
 /// linear: y [M, N] = xh [M, K] @ W_q + bias, from the rotated input the trellis holds. Rows 1..128.
-pub fn linear(k: *const Kernels, k2: u32, cb: u8, xh: u64, words: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, y_dtype: c_int, z: u64, counters: u64, rows: usize, kk: usize, n: usize, split: Split, s: cuda.Stream) !void {
+pub fn linear(k: *const Kernels, k2: u32, cb: u8, xh: u64, words: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, y_dtype: c_int, z: u64, counters: u64, rows: usize, kk: usize, n: usize, split: Split, ldy: usize, s: cuda.Stream) !void {
     if (cb != 2) return error.Codebook; // the (k2, codebook) rows this fatbin binds are mul1's
     const i = k2Index(k2) orelse return error.Width;
     if (wkIndex(split.wk) == null) return error.Split;
@@ -612,6 +612,7 @@ pub fn linear(k: *const Kernels, k2: u32, cb: u8, xh: u64, words: u64, stride_k:
     a.add(int(kk));
     a.add(int(n));
     a.add(int(split.sk));
+    a.add(int(ldy));
     const wk = split.wk;
     const j = wkIndex(wk).?;
     try cuda.launch.launch(k.linear[i][j], .{ .grid = dim3(g), .block = .{ .x = @intCast(wk * 32) }, .shared = @intCast(sm) }, s, &a);
