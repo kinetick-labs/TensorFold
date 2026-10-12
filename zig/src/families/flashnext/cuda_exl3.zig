@@ -404,6 +404,7 @@ pub const sym = struct {
     pub const down_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp20down_epilogue_kernelEPKfPKiPK6__halfPfiiii";
     pub const combine = "_ZN10tf_fn_exl311tf_exl3_exp14combine_kernelEPKfS2_Pfii";
     pub const down_combine = "_ZN10tf_fn_exl311tf_exl3_exp19down_combine_kernelEPKfPKiPK6__halfPfS2_S8_iiiii";
+    pub const down_combine_bf16 = "_ZN10tf_fn_exl311tf_exl3_exp24down_combine_bf16_kernelEPKfPKiPK6__halfS2_S2_P13__nv_bfloat16iiiii";
     /// tf_exl3x (experts_grouped.cuh): [tile setting][k2 range], MTL 1 (one 16-member tile a program).
     pub const grouped = [4][3][:0]const u8{
         .{
@@ -502,6 +503,7 @@ pub const Kernels = struct {
     down_epilogue: cuda.Function,
     combine: cuda.Function,
     down_combine: cuda.Function,
+    down_combine_bf16: cuda.Function,
     grouped: [4][3]cuda.Function,
     /// the wide arm's instances: null when the embedded fatbin predates them, so the default path still loads
     grouped_wide: [4][3]?cuda.Function,
@@ -534,6 +536,7 @@ pub const Kernels = struct {
         k.down_epilogue = try k.module.function(sym.down_epilogue);
         k.combine = try k.module.function(sym.combine);
         k.down_combine = try k.module.function(sym.down_combine);
+        k.down_combine_bf16 = try k.module.function(sym.down_combine_bf16);
         for (sym.grouped, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped[i][j] = try k.module.function(s);
         };
@@ -810,6 +813,25 @@ pub fn downCombine(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts
     a.add(int(experts));
     a.add(int(slots));
     try cuda.launch.launch(k.down_combine, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
+}
+
+/// downCombine with the row rounded to bf16 [rows, D] and no per-slot y stores (the write-back's bf16 branch).
+pub fn downCombineBf16(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts: u64, out: u64, rows: usize, p: usize, d: usize, sk: usize, experts: usize, slots: usize, s: cuda.Stream) !void {
+    if (slots > 32) return error.Slots;
+    const g = downCombineGrid(rows, d);
+    var a: cuda.Args = .{};
+    a.add(z);
+    a.add(pick);
+    a.add(svh_d);
+    a.add(y);
+    a.add(wts);
+    a.add(out);
+    a.add(int(p));
+    a.add(int(d));
+    a.add(int(sk));
+    a.add(int(experts));
+    a.add(int(slots));
+    try cuda.launch.launch(k.down_combine_bf16, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
 }
 
 /// The wide member-pass arm's member-tile count: 2 tiles of 16 = 32 member rows a program, their rows staged.
