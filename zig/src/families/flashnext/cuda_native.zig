@@ -30,6 +30,8 @@ pub const model_type = "qwen4_exp";
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-precision", "gptq-b4", "exl3-b4-05" };
 /// The checkpoint's native window; 1,048,576 with YaRN (work/PLAN.md, "1M context").
 pub const default_context: i64 = 262144;
+/// Drafts a Flash Next CUDA serve may ask when `TF_FLASHNEXT_DEPTH` is unset. The acceptance-rate rule already asks near this, so a higher cap only widens the verify window. NVFP4 and INT4-AutoRound share this open; other families do not.
+pub const served_draft_cap: usize = 3;
 pub const prefill_step: u32 = 2048;
 pub const prompt_rows: u32 = kvd.prefill_rows;
 
@@ -87,10 +89,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
     errdefer own.closeLink();
     const yarn = try yarnFor(gpa, io, dir, o.context);
-    // the window: 15 drafts (16 rows: deeper MTP chains and copy windows; decode D4, TP=2 served edits +37%, code and
-    // prose unchanged at confidence 0.5; aot/fnaot3 holds every width to 16) unless TF_FLASHNEXT_DEPTH says (Python's 6)
-    const depth: usize = if (getenv("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
-    if (depth < 1 or depth > lane_backend.max_drafts) return error.BadDepth;
+    const depth = try draftCap(getenv("TF_FLASHNEXT_DEPTH"));
     if (o.tp == 2) {
         // a rank stops on SIGTERM / SIGINT while it loads and, rank 1, while it follows (in a container it is PID 1,
         // where a signal's default action is ignored); rank 0's server takes them over once it serves
@@ -325,6 +324,13 @@ fn yarnFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize) 
     return yarnOf(gpa, text, context, getenv(rope.env_factor), getenv(rope.env_ramp));
 }
 
+/// `TF_FLASHNEXT_DEPTH` when it parses, otherwise `served_draft_cap`. Out of `1 .. max_drafts` is `BadDepth`.
+fn draftCap(text: ?[]const u8) error{BadDepth}!usize {
+    const depth: usize = if (text) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else served_draft_cap;
+    if (depth < 1 or depth > lane_backend.max_drafts) return error.BadDepth;
+    return depth;
+}
+
 fn getenv(name: [:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
@@ -384,6 +390,14 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
 test {
     _ = mirror;
     _ = lane_backend;
+}
+
+test "the served draft cap is 3, and TF_FLASHNEXT_DEPTH overrides it" {
+    try std.testing.expectEqual(@as(usize, 3), try draftCap(null));
+    try std.testing.expectEqual(@as(usize, 15), try draftCap("15"));
+    try std.testing.expectError(error.BadDepth, draftCap("0"));
+    try std.testing.expectError(error.BadDepth, draftCap("16"));
+    try std.testing.expectError(error.BadDepth, draftCap("nope"));
 }
 
 test "open compiles over the engine" {
