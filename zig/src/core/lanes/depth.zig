@@ -62,7 +62,7 @@ pub const Rule = struct {
     /// the head stops each chain by its own rule (a running product of its draws' probabilities): every ask is the
     /// most drafts the stream's room allows, and the head's stops are the depth (no acceptance-rate guess cuts them)
     head_stops: bool = false,
-    /// ... while at most this many streams are live (`live`, which the round loop sets each step)
+    /// ... while at most this many streams are live (`live` is never set, so stopsNow stays false)
     head_stops_most: u32 = std.math.maxInt(u32),
     live: usize = 0,
     batch_rows: u32,
