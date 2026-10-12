@@ -387,7 +387,7 @@ pub const State = struct {
         const sizes = fixedSizes(g);
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, aligned(&sizes)) };
         errdefer a.buf.free();
-        try a.buf.fill8(0, null);
+        // reset() zeros conv, rec and ple_tail on the engine stream. A default-stream fill here would block the host.
         var s: State = .{
             .d = d,
             .g = g,
