@@ -276,15 +276,22 @@ pub fn groupWorkspaceBytes(rows: usize, slots: usize, experts: usize) usize {
 
 /// Warps in a gate/up or down epilogue block: each warp is one pick, the same fwht and split sum as a block of 32.
 pub const epilogue_warps: usize = 4;
+/// Picks below this run one warp a block (decode / verify): more blocks, the 32-thread launch shape.
+pub const epilogue_wide_min: usize = 256;
 
-/// gateup_epilogue_kernel and down_epilogue_kernel: grid (ceil(rows*slots/4), width/128), block 128.
-pub fn epilogueGrid(rows: usize, slots: usize, width: usize) [2]usize {
-    const p = rows * slots;
-    return .{ (p + epilogue_warps - 1) / epilogue_warps, width / 128 };
+pub fn epilogueWarps(p: usize) usize {
+    return if (p >= epilogue_wide_min) epilogue_warps else 1;
 }
 
-pub fn epilogueBlock() usize {
-    return epilogue_warps * 32;
+/// gateup_epilogue_kernel and down_epilogue_kernel: grid (ceil(rows*slots/w), width/128), block 32*w.
+pub fn epilogueGrid(rows: usize, slots: usize, width: usize) [2]usize {
+    const p = rows * slots;
+    const w = epilogueWarps(p);
+    return .{ (p + w - 1) / w, width / 128 };
+}
+
+pub fn epilogueBlock(rows: usize, slots: usize) usize {
+    return epilogueWarps(rows * slots) * 32;
 }
 
 /// combine_kernel (experts.cu:183): grid (rows, ceil(D/256)), block 256.
@@ -392,6 +399,7 @@ pub const sym = struct {
     pub const group_hist = "_ZN10tf_fn_exl311tf_exl3_exp17group_hist_kernelEPKiPiii";
     pub const group_scan = "_ZN10tf_fn_exl311tf_exl3_exp17group_scan_kernelEPiS1_S1_S1_iii";
     pub const group_scatter = "_ZN10tf_fn_exl311tf_exl3_exp20group_scatter_kernelEPKiS2_Piiiii";
+    pub const group_small = "_ZN10tf_fn_exl311tf_exl3_exp18group_small_kernelEPKiPiS3_S3_iiii";
     pub const gateup_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp22gateup_epilogue_kernelEPKfPKiPK6__halfS7_S7_PS5_iiiifi";
     pub const down_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp20down_epilogue_kernelEPKfPKiPK6__halfPfiiii";
     pub const combine = "_ZN10tf_fn_exl311tf_exl3_exp14combine_kernelEPKfS2_Pfii";
@@ -489,6 +497,7 @@ pub const Kernels = struct {
     group_hist: cuda.Function,
     group_scan: cuda.Function,
     group_scatter: cuda.Function,
+    group_small: cuda.Function,
     gateup_epilogue: cuda.Function,
     down_epilogue: cuda.Function,
     combine: cuda.Function,
@@ -520,6 +529,7 @@ pub const Kernels = struct {
         k.group_hist = try k.module.function(sym.group_hist);
         k.group_scan = try k.module.function(sym.group_scan);
         k.group_scatter = try k.module.function(sym.group_scatter);
+        k.group_small = try k.module.function(sym.group_small);
         k.gateup_epilogue = try k.module.function(sym.gateup_epilogue);
         k.down_epilogue = try k.module.function(sym.down_epilogue);
         k.combine = try k.module.function(sym.combine);
@@ -625,6 +635,18 @@ pub fn group(k: *const Kernels, pick: u64, uids: u64, ucount: u64, members: u64,
     if (experts * @sizeOf(i32) > 48 * 1024) return error.TooManyExperts;
     const n = rows * slots;
     const tiles = groupTiles(n);
+    if (tiles == 1 and 2 * experts * @sizeOf(i32) <= 48 * 1024) {
+        var one: cuda.Args = .{};
+        one.add(pick);
+        one.add(uids);
+        one.add(ucount);
+        one.add(members);
+        one.add(int(n));
+        one.add(int(slots));
+        one.add(int(experts));
+        one.add(int(maxm));
+        return cuda.launch.launch(k.group_small, .{ .grid = .{ .x = 1 }, .block = .{ .x = 256 }, .shared = @intCast(2 * experts * @sizeOf(i32)) }, s, &one);
+    }
     try s.d.check(s.d.api.cuMemsetD8Async(work, 0, tiles * experts * @sizeOf(i32), s.handle), "cuMemsetD8Async");
     const ni = int(n);
     const ne = int(experts);
@@ -741,7 +763,7 @@ pub fn gateupEpilogue(k: *const Kernels, z: u64, pick: u64, svh_g: u64, svh_u: u
     a.add(int(experts));
     a.add(limit);
     a.add(act_mode);
-    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock()) } }, s, &a);
+    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock(rows, slots)) } }, s, &a);
 }
 
 /// down epilogue: Y fp32 = (split sums in order) @ H * svh_d.
@@ -756,7 +778,7 @@ pub fn downEpilogue(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, ro
     a.add(int(d));
     a.add(int(sk));
     a.add(int(experts));
-    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock()) } }, s, &a);
+    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock(rows, slots)) } }, s, &a);
 }
 
 /// The slots' combination: out[r] = sum over slots of wts[r][k] * y[r*slots + k] (fp32, fma chain from 0).
@@ -1105,7 +1127,7 @@ test "the symbol table carries the widths and planes it claims" {
         try testing.expect(std.mem.indexOf(u8, s, t) != null);
     };
     for (sym.rot_in_experts) |s| try testing.expect(std.mem.startsWith(u8, s, "_ZN10tf_fn_exl311tf_exl3_exp13rot_in_kernel"));
-    for ([_][:0]const u8{ sym.rot_in, sym.group_hist, sym.group_scan, sym.group_scatter, sym.gateup_epilogue, sym.down_epilogue, sym.combine, sym.down_combine }) |s| {
+    for ([_][:0]const u8{ sym.rot_in, sym.group_hist, sym.group_scan, sym.group_scatter, sym.group_small, sym.gateup_epilogue, sym.down_epilogue, sym.combine, sym.down_combine }) |s| {
         try testing.expect(std.mem.startsWith(u8, s, "_ZN10tf_fn_exl311tf_exl3_"));
     }
 }
