@@ -6,7 +6,8 @@ binary, not the Python runtime. It is the Zig counterpart of the public Python r
 [`sxuff/qwen38-flash-next-dgx-spark`](https://github.com/sxuff/qwen38-flash-next-dgx-spark): same
 family, same checkpoint, a different engine with the same mechanisms under Zig names.
 
-Default operating point: **262,144-token window, MTP depth 15, product stop at -0.4, bf16 KV, two streams, CUDA graphs on**.
+Default operating point: **262,144-token window, bf16 KV, two streams, CUDA graphs on**. The draft cap is 15.
+A round asks about 3–3.6 drafts from acceptance rates and holds about 2; the product stop at -0.4 only truncates that chain.
 
 **Scope.** Text only. The Zig engine has no vision turn: it does not load the checkpoint's vision
 tower and exposes no image or video input. The vision weights (`vision_k6.safetensors` in the pack, a
@@ -22,7 +23,7 @@ Quantization:     4.05bpw_h6_ng6
 Engine:           Zig (tensorfold-native), Zig 0.17.0
 Hardware:         one GB10, 128 GB unified memory
 Context:          262,144 tokens
-MTP:              depth 15, running-product stop at -0.4 (TF_FLASHNEXT_DEPTH, TF_FLASHNEXT_CONFIDENCE)
+MTP:              cap 15 (TF_FLASHNEXT_DEPTH). Ask ~3–3.6 from acceptance rates, held ~2; -0.4 only truncates (TF_FLASHNEXT_CONFIDENCE)
 KV cache:         bf16 (default)
 Streams:          2 (--parallel 2)
 Experts window:   2048 rows (TF_FLASHNEXT_X3_MOE_WINDOW)
@@ -123,7 +124,15 @@ For GB10 (`sm_121`) the relevant directory is `share/tensorfold/cuda/sm121/`.
 ## 3. Serving
 
 sxuff's profile is a set of service settings; in the Zig engine each maps to a variable or flag.
-**This recipe serves the engine's own defaults**: depth 15 and the running-product stop at -0.4.
+**This recipe serves the engine's own defaults.** `TF_FLASHNEXT_DEPTH` unset is 15, and that number
+is the cap (`most_drafts`), not the drafts asked each round. `depth()` in `core/lanes/depth.zig`
+picks the ask from acceptance rates. `Config.init` stores the product rule as `head_stops`, but
+`Engine.init` (`core/lanes/engine.zig`) never copies `head_stops` or `head_stops_most` onto the
+rule, and nothing sets `Rule.live`, so `stopsNow()` stays false. The served `-0.4` product rule
+runs in the head (`cuda_mia_lanes.zig` `confidenceNow`, `cuda_decode.zig` `Stop.take`) and only
+truncates the chain already asked. On the 50.4 tok/s serve the ask is about 3–3.6 drafts and the
+head holds about 2. Forcing `head_stops` so every ask is the cap costs 7–17%.
+
 The table is how sxuff's depth 6 / 0.70 profile maps onto those variables. Depth and confidence
 are read from the
 environment, not from the server flags — the native CUDA Flash Next path builds its options from
@@ -133,7 +142,7 @@ environment, not from the server flags — the native CUDA Flash Next path build
 
 | sxuff (Python 0.6.5) | Zig engine | Read in |
 | --- | --- | --- |
-| `depth=6` | `TF_FLASHNEXT_DEPTH=6` (engine default is 15) | `cuda_native.zig:91` |
+| `depth=6` | `TF_FLASHNEXT_DEPTH=6` (unset is the cap 15, not a fixed ask of 15) | `cuda_native.zig:91` |
 | `confidence=0.70` | `TF_FLASHNEXT_CONFIDENCE=0.70` (per-draft rule; served default is the running-product rule at `-0.4`) | `cuda_engine.zig:62` |
 | `max_len=262144` | `--context 262144` (default) | `server/cli.zig` |
 | `tp=1` | one GPU (default) | — |
@@ -148,16 +157,18 @@ keeps that value as `default_confidence = 0.70`, but the **served** default is t
 stop rule (`served_confidence = -0.4`, `cuda_engine.zig:47`). A positive `TF_FLASHNEXT_CONFIDENCE`
 selects Python's per-draft rule, so `TF_FLASHNEXT_CONFIDENCE=0.70` reproduces sxuff's threshold;
 leaving it unset serves the product rule instead. `default_depth = 6` (`cuda_engine.zig:39`) is the
-options-struct default; `cuda_native.zig:91` passes 15 when `TF_FLASHNEXT_DEPTH` is unset, and that
-is the depth a serve actually runs.
+options-struct default; `cuda_native.zig:91` passes 15 when `TF_FLASHNEXT_DEPTH` is unset. That 15
+is the most drafts a round may ask. The acceptance-rate rule asks about 3–3.6, and the product
+stop shortens what the head keeps.
 
-Two further defaults worth knowing: `TF_FLASHNEXT_PRODUCT_STREAMS=2` (the product rule while at most
-two streams are live, then `wide_confidence` 0.5; a different concept from `--parallel 2`;
-`cuda_engine.zig:53`) and `TF_FLASHNEXT_X3_MOE_WINDOW=2048` (the grouped-experts window;
-`cuda_forward.zig:335`).
+Two further defaults worth knowing: `TF_FLASHNEXT_PRODUCT_STREAMS=2` switches the head's stop
+(the product rule while at most two lanes are drafting, then `wide_confidence` 0.5; a different
+concept from `--parallel 2`; `cuda_mia_lanes.zig` `confidenceNow`, `cuda_engine.zig:53`). It does not
+make `depth()` ask the cap. `TF_FLASHNEXT_X3_MOE_WINDOW=2048` is the grouped-experts window
+(`cuda_forward.zig:335`).
 
-The command below is the served operating point behind the **50.4 tok/s** decode and **2.22
-tokens/round** figures. Unset variables resolve to the same values.
+The command below is the served operating point behind the **50.4 tok/s** decode. Unset variables
+resolve to the same values. Depth 15 is the cap.
 
 ```bash
 export TF_FLASHNEXT_DEPTH=15
@@ -185,19 +196,23 @@ the serve command above, through the Zig server. Treat each as a band, not a spe
 Fibonacci prompt is `tools/bench_openai.py`'s `fibonacci-raw`: "Write a short Python function that
 computes the Fibonacci sequence and explain it." Decode tok/s is `(completion tokens - 1) / (last
 token time - first token time)`, the median of three repetitions, temperature 0. One request is one
-live stream, so the stop stays the running product (`p1 * ... * pj >= 0.4`) rather than
-`wide_confidence` 0.5.
+live stream, so the head's stop stays the running product (`p1 * ... * pj >= 0.4`) rather than
+`wide_confidence` 0.5. That rule truncates the chain. It does not choose how many drafts to ask.
 
 | Metric | Value | Method | Reserve |
 | --- | ---: | --- | --- |
-| Decode, Fibonacci prompt | 50.4 tok/s | depth 15, product stop -0.4, experts window 2048, temperature 0, median of three | One GB10, `--context 262144`, `--parallel 2`, bf16 KV, graphs on |
+| Decode, Fibonacci prompt | 50.4 tok/s | cap 15, acceptance-rate ask (~3–3.6), product stop -0.4 holds ~2, experts window 2048, temperature 0, median of three | One GB10, `--context 262144`, `--parallel 2`, bf16 KV, graphs on |
 | Decode, chat prompt | 42.7 tok/s | same serve and timing | as above |
 | Prefill | 770–780 tok/s | ~14,400-token prompt with `TF_FLASHNEXT_PREFILL_ROWS=4096` | Chunk rows 4096, above the one-GPU default 2048 |
-| Draft acceptance | 56.7 % | same serve; 2.22 tokens emitted a round | Measured acceptance, not a ceiling |
+| Draft chain | ~2.25 tokens/round | same serve, draft-chain log | acceptance by level 0.66 / 0.40 / 0.33 / 0.09 |
 | Served output after the rebase | bit-identical | `token_sha afccd937e6ac` matched before and after the rebase | One prompt |
 
-A window holds at most `depth + 1` = 16 rows. 2.22 tokens a round is the measured outcome of the
-product stop, not a configured ceiling.
+A round is about 48 ms. Verify is about 36 ms at 1 row, 46 ms at 3, and 55 ms at 4. A draft step
+is about 2.9 ms. Host gaps around the phases are about 0.01 ms. The depth rule asks about 3–3.6
+drafts and the product stop holds about 2, which is the ~2.25 tokens a round. Acceptance by level
+is 0.66, 0.40, 0.33, 0.09. An earlier pass on this same serve reported 2.22 tokens a round and
+56.7% acceptance as one figure. A window can hold `depth + 1` = 16 rows; a round does not fill it.
+Forcing `head_stops` so every ask is that cap costs 7–17%.
 
 **Not comparable to sxuff's 75.68 tok/s.** That figure is the Python recipe's short-prompt decode on
 **40,960-token context, text only, one stream**; this page's operating point is **262,144** and two
