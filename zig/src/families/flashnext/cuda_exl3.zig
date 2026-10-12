@@ -849,6 +849,8 @@ pub fn gmMembers() bool {
 
 /// The gm arm's setting: NT 8 / W 8 / KS 2 / NSA 4, and SUBW 4 (the shipped warp count, so its 4 k sub-ranges).
 pub const gm_nt: usize = 8;
+/// Picks below this (decode, verify, short prompts) skip the gm arm.
+pub const gm_min_picks: usize = 1024;
 pub const gm_warps: usize = 8;
 pub const gm_ks: usize = 2;
 pub const gm_nsa: usize = 4;
@@ -892,7 +894,8 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(maxm));
     a.add(int(slots));
     // The staged gm arm (opt-in): member rows the B operand, decoded weights the A operand; wins over the wide arm.
-    const gm = gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
+    // prompt-sized calls only: decode / verify picks keep the MTL 1 arm (the gm arm is 35% slower there)
+    const gm = p >= gm_min_picks and gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
     if (gm) {
         const f = k.grouped_gm[range] orelse return error.NoGmKernel;
         const mtiles = (maxm + 127) / 128;
