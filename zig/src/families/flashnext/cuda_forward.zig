@@ -340,6 +340,11 @@ const X3Scratch = struct {
 
 /// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
 /// TF_FLASHNEXT_X3_COMBINE=0 keeps the per-slot rows and the write-back's MoE mode (the same bits).
+fn x3Direct() bool {
+    if (std.c.getenv("TF_FLASHNEXT_X3_DIRECT")) |v| return v[0] != '0';
+    return true;
+}
+
 fn x3Combine() bool {
     if (std.c.getenv("TF_FLASHNEXT_X3_COMBINE")) |v| return v[0] != '0';
     return true;
@@ -1023,6 +1028,11 @@ pub const Forward = struct {
 
     /// An EXL3 trellis projection's `m` rows (128 at a time): the rotated fp16 input, then the 3-bit matmul.
     pub fn x3mm(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_dtype: c_int, m: usize) !void {
+        return f.x3mmLd(part, x, x_stride, x_dtype, q, out, q.n, out_dtype, m);
+    }
+
+    /// x3mm with output rows `ldy` elements apart (a stacked projection's columns written in place).
+    fn x3mmLd(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, ldy: usize, out_dtype: c_int, m: usize) !void {
         const xs = &(f.x3 orelse return error.NoExl3Scratch);
         const k3 = f.k3 orelse return error.NoExl3Kernels;
         const st = exl3.strides(.strips, q.k, q.n, q.k2);
@@ -1031,7 +1041,7 @@ pub const Forward = struct {
         while (r0 < m) : (r0 += 128) {
             const nn = @min(128, m - r0);
             try exl3.rotIn(k3, x + r0 * x_stride, x_dtype, q.suh, xs.xh, nn, q.k, f.s);
-            try exl3.linear(k3, q.k2, q.cb, xs.xh, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * @as(usize, q.n) * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, f.s);
+            try exl3.linear(k3, q.k2, q.cb, xs.xh, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * ldy * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, ldy, f.s);
         }
         if (part) |p| try f.mark(p);
     }
@@ -1042,8 +1052,13 @@ pub const Forward = struct {
         var r0: usize = 0;
         while (r0 < m) : (r0 += 128) {
             const nn = @min(128, m - r0);
-            try f.x3mm(null, x + r0 * x_stride, x_stride, x_dtype, q, xs.face, 1, nn);
-            try f.th.slotCopy(xs.face, q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+            if (x3Direct()) {
+                // the linear's rows straight into `out`'s columns (the same values the face and copy left)
+                try f.x3mmLd(null, x + r0 * x_stride, x_stride, x_dtype, q, out + col * 2 + r0 * out_w * 2, out_w, 1, nn);
+            } else {
+                try f.x3mm(null, x + r0 * x_stride, x_stride, x_dtype, q, xs.face, 1, nn);
+                try f.th.slotCopy(xs.face, q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+            }
         }
         if (part) |p| try f.mark(p);
     }
@@ -1079,8 +1094,7 @@ pub const Forward = struct {
         while (r0 < m) : (r0 += 128) {
             const nn = @min(128, m - r0);
             try exl3.rotIn(k3, x + r0 * x_stride, 1, q.suh, d[0], nn, q.k, sd.s);
-            try exl3.linear(k3, q.k2, q.cb, d[0], q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, d[3], 1, if (q.split.sk > 1) d[1] else 0, d[2], nn, q.k, q.n, q.split, sd.s);
-            try th2.slotCopy(d[3], q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+            try exl3.linear(k3, q.k2, q.cb, d[0], q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + col * 2 + r0 * out_w * 2, 1, if (q.split.sk > 1) d[1] else 0, d[2], nn, q.k, q.n, q.split, out_w, sd.s);
         }
     }
 
