@@ -1394,7 +1394,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int MTG = (maxm + 16 * MTL - 1) / (16 * MTL);
     // The grid holds G member groups (TF_GROUPED_GRID_MEMBERS rows); a program walks mg0, mg0+G, ...
     // Each member row's sums are unchanged; only which program computes it moves.
-    const int G = min(MTG, (TF_GROUPED_GRID_MEMBERS + 16 * MTL - 1) / (16 * MTL));
+    // MTL 1 launches at most TF_GROUPED_GRID_MEMBERS rows; the wide arm (MTL > 1) launches every group (host grid)
+    const int G = MTL == 1 ? min(MTG, (TF_GROUPED_GRID_MEMBERS + 15) / 16) : MTG;
     const int mg0 = blockIdx.z % G;
     const int split = (blockIdx.z / G) % SK;
     const int mat = blockIdx.z / G / SK;
@@ -1802,7 +1803,7 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MTG = (a.maxm + 16 * MTL - 1) / (16 * MTL);
     const char* abl_g = getenv("TF_EXL3_ABL_DECODE");
     // grouped_kernel walks member groups past TF_GROUPED_GRID_MEMBERS; the ablation probe still launches each one
-    const int MTGL = (abl_g != nullptr && abl_g[0] != '0') ? MTG : min(MTG, (TF_GROUPED_GRID_MEMBERS + 16 * MTL - 1) / (16 * MTL));
+    const int MTGL = (MTL > 1 || (abl_g != nullptr && abl_g[0] != '0')) ? MTG : min(MTG, (TF_GROUPED_GRID_MEMBERS + 15) / 16);
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MTGL));
     const char* abl_e = getenv("TF_EXL3_ABL_DECODE");
     const bool abl = abl_e != nullptr && abl_e[0] != '0';   // timing probe: unset or "0" is off (the repo's getenv idiom)
