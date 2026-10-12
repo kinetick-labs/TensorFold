@@ -237,10 +237,13 @@ pub const Scratch = struct {
     }
 };
 
+/// Rows one rot_in launch rotates for the 128-row linears that follow it (per element the same kernel math).
+const x3_rot_rows: usize = 1024;
+
 /// EXL3's scratch: a dense trellis linear's rotated fp16 input, its split-K partials and one launch's counters.
 const X3Scratch = struct {
     arena: state.Arena,
-    xh: u64, // [128, K] fp16: a dense linear's rotated input, the widest dense K
+    xh: u64, // [x3_rot_rows, K] fp16: a dense linear's rotated input (one rot_in for several 128-row linears), the widest dense K
     z: u64, // fp32: the most split-K partials a dense linear leaves
     ctr: u64, // int32: a dense linear's counters, the widest N; zeroed once, every launch re-zeroes its own slots
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
@@ -317,13 +320,11 @@ const X3Scratch = struct {
         };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
         const sizes = [20]usize{
-            128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
-            P * g.hidden * 2,                    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
-            4,                                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
-            exl3.groupWorkspaceBytes(mrows, slots, g.experts),
-            @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
-            128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
-            max_rows * g.hidden * 2,
+            x3_rot_rows * kmax * 2,                            @max(zmax, 1) * 4,                   @max(ctrmax, 8) * 4, 128 * face * 2,
+            P * g.hidden * 2,                                  P * g.hidden * 2,                    P * g.moe_width * 2, @max(mz, 1) * 4,
+            4,                                                 @max(maxu, 1) * 4,                   4,                   @max(maxu, 1) * mrows * 4,
+            exl3.groupWorkspaceBytes(mrows, slots, g.experts), @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),       x3_rot_rows * kmax * 2,
+            @max(zmax, 1) * 4,                                 @max(ctrmax, 8) * 4,                 128 * face * 2,      max_rows * g.hidden * 2,
         };
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
@@ -1037,11 +1038,15 @@ pub const Forward = struct {
         const k3 = f.k3 orelse return error.NoExl3Kernels;
         const st = exl3.strides(.strips, q.k, q.n, q.k2);
         const esz: usize = if (out_dtype == 2) 4 else 2;
-        var r0: usize = 0;
-        while (r0 < m) : (r0 += 128) {
-            const nn = @min(128, m - r0);
-            try exl3.rotIn(k3, x + r0 * x_stride, x_dtype, q.suh, xs.xh, nn, q.k, f.s);
-            try exl3.linear(k3, q.k2, q.cb, xs.xh, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * ldy * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, ldy, f.s);
+        var g0: usize = 0;
+        while (g0 < m) : (g0 += x3_rot_rows) {
+            const gn = @min(x3_rot_rows, m - g0);
+            try exl3.rotIn(k3, x + g0 * x_stride, x_dtype, q.suh, xs.xh, gn, q.k, f.s);
+            var r0 = g0;
+            while (r0 < g0 + gn) : (r0 += 128) {
+                const nn = @min(128, g0 + gn - r0);
+                try exl3.linear(k3, q.k2, q.cb, xs.xh + (r0 - g0) * q.k * 2, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * ldy * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, ldy, f.s);
+            }
         }
         if (part) |p| try f.mark(p);
     }
@@ -1049,13 +1054,16 @@ pub const Forward = struct {
     /// One trellis part of an EXL3 stack: `q`'s columns into `out` from column `col`, through the scratch and a copy.
     fn x3Col(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_w: usize, col: usize, m: usize) !void {
         const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        if (x3Direct()) {
+            // the linear's rows straight into `out`'s columns (the same values the face and copy left)
+            try f.x3mmLd(null, x, x_stride, x_dtype, q, out + col * 2, out_w, 1, m);
+            if (part) |p| try f.mark(p);
+            return;
+        }
         var r0: usize = 0;
         while (r0 < m) : (r0 += 128) {
             const nn = @min(128, m - r0);
-            if (x3Direct()) {
-                // the linear's rows straight into `out`'s columns (the same values the face and copy left)
-                try f.x3mmLd(null, x + r0 * x_stride, x_stride, x_dtype, q, out + col * 2 + r0 * out_w * 2, out_w, 1, nn);
-            } else {
+            {
                 try f.x3mm(null, x + r0 * x_stride, x_stride, x_dtype, q, xs.face, 1, nn);
                 try f.th.slotCopy(xs.face, q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
             }
@@ -1090,11 +1098,15 @@ pub const Forward = struct {
         const st = exl3.strides(.strips, q.k, q.n, q.k2);
         var th2 = f.th;
         th2.s = sd.s;
-        var r0: usize = 0;
-        while (r0 < m) : (r0 += 128) {
-            const nn = @min(128, m - r0);
-            try exl3.rotIn(k3, x + r0 * x_stride, 1, q.suh, d[0], nn, q.k, sd.s);
-            try exl3.linear(k3, q.k2, q.cb, d[0], q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + col * 2 + r0 * out_w * 2, 1, if (q.split.sk > 1) d[1] else 0, d[2], nn, q.k, q.n, q.split, out_w, sd.s);
+        var g0: usize = 0;
+        while (g0 < m) : (g0 += x3_rot_rows) {
+            const gn = @min(x3_rot_rows, m - g0);
+            try exl3.rotIn(k3, x + g0 * x_stride, 1, q.suh, d[0], gn, q.k, sd.s);
+            var r0 = g0;
+            while (r0 < g0 + gn) : (r0 += 128) {
+                const nn = @min(128, g0 + gn - r0);
+                try exl3.linear(k3, q.k2, q.cb, d[0] + (r0 - g0) * q.k * 2, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + col * 2 + r0 * out_w * 2, 1, if (q.split.sk > 1) d[1] else 0, d[2], nn, q.k, q.n, q.split, out_w, sd.s);
+            }
         }
     }
 
