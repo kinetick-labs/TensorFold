@@ -255,14 +255,15 @@ const X3Scratch = struct {
     mids: u64, // [maxu] int32
     mcnt: u64, // [1] int32
     mmem: u64, // [maxu, x3MoeWindow()] int32
+    gwork: u64, // group histogram, totals and place (groupWorkspaceBytes)
+    rows: usize, // grouped-expert window this scratch was sized for
 
     fn deinit(x: *X3Scratch) void {
         x.arena.buf.free();
     }
 
     /// The scratch a model's trellis matrices need: widest K, split-K partials and counters, and the experts' buffers.
-    /// `k3` sizes the grouped-expert window: the runtime pass never asks for more rows than group_kernel's shared memory.
-    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize, k3: ?*const exl3.Kernels) !X3Scratch {
+    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize) !X3Scratch {
         var kmax: usize = @max(g.hidden, g.heads * g.head_dim);
         var zmax: usize = 0;
         var ctrmax: usize = 0;
@@ -299,7 +300,7 @@ const X3Scratch = struct {
             if (ng.exl3) |e| plew = @max(plew, e.words);
             pleh = ng.head_bias.len;
         }
-        const mrows = @min(max_rows, x3MoeRows(g, k3));
+        const mrows = @min(max_rows, x3MoeWindow());
         const slots = g.slots();
         const P = mrows * slots;
         const maxu = @min(P, g.experts);
@@ -313,10 +314,11 @@ const X3Scratch = struct {
             else => return e,
         };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
-        const sizes = [14]usize{
+        const sizes = [15]usize{
             128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
             P * g.hidden * 2,                    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
             4,                                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
+            exl3.groupWorkspaceBytes(mrows, slots, g.experts),
             @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
         };
         var total: usize = 0;
@@ -325,8 +327,9 @@ const X3Scratch = struct {
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer s.arena.buf.free();
         try s.arena.buf.fill8(0, null);
-        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.ple_dev, &s.ple_hb };
+        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.gwork, &s.ple_dev, &s.ple_hb };
         for (ptrs, sizes) |p, n| p.* = s.arena.take(n);
+        s.rows = mrows;
         return s;
     }
 };
@@ -349,20 +352,6 @@ fn x3MoeWindowEnv() ?[]const u8 {
         held.read = true;
     }
     return held.text;
-}
-
-/// Rows the grouped-expert scratch must hold. The pass uses min(the env window, the shared-memory cap), and the cap
-/// is larger for the smaller slot count, so both the main path and the MTP path fit. With one slot count this is
-/// exactly the pass's window.
-fn x3MoeRows(g: state.Geometry, k3: ?*const exl3.Kernels) usize {
-    const window = x3MoeWindow();
-    const k = k3 orelse return window;
-    const hi = g.slots();
-    const lo = @min(g.topKFor(false), g.topKFor(true)) + 1;
-    const rows_hi = @min(window, exl3.groupWindowMax(k, hi));
-    const rows_lo = @min(window, exl3.groupWindowMax(k, lo));
-    const cover = (rows_lo * lo + hi - 1) / hi;
-    return @max(rows_hi, cover);
 }
 
 /// A trellis matrix `a`'s share of an EXL3 scratch's sizes: the widest K, the most split-K partials and counters.
@@ -693,7 +682,7 @@ pub const Forward = struct {
     /// fn_qsa_scores.cu for the prompt indexer's scores (`_scores`' bits); null: Python's `_scores`
     qsa_fast: ?*const prompt.QsaScores = null,
 
-    pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize, k3: ?*const exl3.Kernels) !Forward {
+    pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize) !Forward {
         var f: Forward = .{ .gpa = gpa, .d = d, .s = s, .ops = ops, .t = t, .th = th, .w = w, .c = c, .dims = dims, .g = g, .sc = undefined, .pin = undefined, .pin_rows = max_rows, .staged = undefined, .eps = @floatCast(c.eps), .vocab_offset = w.vocab_offset };
         f.sc = try Scratch.init(d, g, max_rows, partBytes(g, max_rows));
         errdefer f.sc.deinit();
@@ -702,7 +691,7 @@ pub const Forward = struct {
         errdefer f.pin.free();
         f.staged = try cuda.Event.init(d, false);
         try f.staged.record(s);
-        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows, k3);
+        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows);
         errdefer if (f.x3) |*q| q.deinit();
         if (f.x3) |*q| {
             // the mul1 codebook's per-head bias: `_ple_rows` reads it as its HB operand, so it lives on the device too
@@ -2090,8 +2079,7 @@ pub const Forward = struct {
         const rng_gu = exl3.rangeIndex(ex.k2_gu[0], ex.k2_gu[1]);
         const rng_d = exl3.rangeIndex(ex.k2_d[0], ex.k2_d[1]);
         const es: usize = if (x.y_f32) 4 else 2;
-        // Clamp once: rows*slots*4 <= group_smem_max. Rows change passes not bits; the halving replay was unsound.
-        const win = @min(x3MoeWindow(), exl3.groupWindowMax(k3, slots));
+        const win = xs.rows; // the env window this scratch was sized for; grouping does not split it
         var r0: usize = 0;
         while (r0 < n) {
             const R = @min(win, n - r0);
@@ -2101,7 +2089,7 @@ pub const Forward = struct {
             const pick = b.moe_pick + at * slots * 4;
             const xin = b.mixed + at * D * 2;
             const y = b.moe_y + at * slots * D * es;
-            try exl3.group(k3, pick, xs.mids, xs.mcnt, xs.mmem, R, slots, E, maxu, f.s);
+            try exl3.group(k3, pick, xs.mids, xs.mcnt, xs.mmem, xs.gwork, R, slots, E, maxu, f.s);
             try f.mark(.topk_plan);
             try exl3.rotInExperts(k3, true, xin, @intCast(D), pick, ex.suh_g, ex.suh_u, xs.mg, xs.mu, R, D, slots, E, f.s);
             try exl3.grouped(k3, set_gu, rng_gu, xs.mg, xs.mu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, D, I, P, gu.sk, maxu, slots, E, 2, f.s);

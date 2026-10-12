@@ -10,7 +10,8 @@
 //     mangles with a hash of the source path (cuobjdump shows _GLOBAL__N__b46678aa_10_fn_exl3_cu_...), which
 //     would make the names the Zig launcher resolves depend on the build directory;
 //   - the reference's per-codebook instantiation TUs (experts_cb{0,1,2}.cu) folded in, and instance drivers
-//     added so one fatbin carries every kernel the family can ask for.
+//     added so one fatbin carries every kernel the family can ask for;
+//   - group_kernel replaced by a multi-block histogram, exclusive scan and stable scatter (same member order).
 // The reference's own namespaces are kept (tf_exl3 for the tile decoder, tf_exl3x for the expert GEMM); the whole
 // translation unit sits in tf_fn_exl3, this tree's one-namespace-a-fatbin convention, and the Zig launcher
 // resolves the kernels by the mangled names recorded in cuda_kernels.zig (cuobjdump -symbols of this fatbin).
@@ -539,62 +540,83 @@ namespace tf_exl3_exp {
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
 
-// Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
-constexpr int GROUP_THREADS = 1024;
-constexpr int GROUP_PER_THREAD = 4;
+// Grouping: distinct experts (< E) in id order, members (row * 32 + slot) in pick order, -1 after the last.
+// Three kernels, one stream: a tile histogram, an exclusive scan that compacts uids, then a stable scatter.
+// Tile size matches cuda_exl3.zig group_tile. Counts may use atomics; write order does not.
+constexpr int GROUP_TILE = 1024;
 
-__global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
-                                                              int* __restrict__ ucount, int* __restrict__ members,
-                                                              int R, int slots, int E, int maxm) {
-    extern __shared__ int sh_pick[];
-    __shared__ int warp_tot[GROUP_THREADS / 32];
-    const int n = R * slots;
-    for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
-    __syncthreads();
-    int cnt[GROUP_PER_THREAD];
-    int used = 0;
-#pragma unroll
-    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        int c = 0;
-        if (e < E)
-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
-        cnt[q] = c;
-        used += c > 0;
+__device__ __forceinline__ int group_tiles(int n) { return (n + GROUP_TILE - 1) / GROUP_TILE; }
+
+// work: hist[tiles * E], then totals[E], then place[E]. hist is zero on entry.
+__global__ void group_hist_kernel(const int* __restrict__ pick, int* __restrict__ work, int n, int E) {
+    const int tile = (int)blockIdx.x;
+    const int begin = tile * GROUP_TILE;
+    int end = begin + GROUP_TILE;
+    if (end > n) end = n;
+    int* hist = work + (size_t)tile * E;
+    for (int i = begin + (int)threadIdx.x; i < end; i += (int)blockDim.x) {
+        const int e = pick[i];
+        if ((unsigned)e >= (unsigned)E) continue;
+        atomicAdd(hist + e, 1);
     }
-    // exclusive scan of `used` over threads
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int inc = used;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        int v = __shfl_up_sync(0xffffffffu, inc, o);
-        if (lane >= o) inc += v;
-    }
-    if (lane == 31) warp_tot[warp] = inc;
-    __syncthreads();
-    if (warp == 0) {
-        int v = warp_tot[lane];
-        int s = v;
-#pragma unroll
-        for (int o = 1; o < 32; o <<= 1) {
-            int x = __shfl_up_sync(0xffffffffu, s, o);
-            if (lane >= o) s += x;
+}
+
+// Exclusive scan of each expert across tiles (in place), uids in id order, members filled with -1.
+__global__ void group_scan_kernel(int* __restrict__ work, int* __restrict__ uids, int* __restrict__ ucount,
+                                  int* __restrict__ members, int n, int E, int maxm) {
+    const int tiles = group_tiles(n);
+    int* totals = work + (size_t)tiles * E;
+    int* place = totals + E;
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) {
+        int sum = 0;
+        for (int t = 0; t < tiles; ++t) {
+            int* bin = work + (size_t)t * E + e;
+            const int c = *bin;
+            *bin = sum;
+            sum += c;
         }
-        warp_tot[lane] = s - v;                                   // exclusive per warp
-        if (lane == 31) ucount[0] = s;
+        totals[e] = sum;
     }
     __syncthreads();
-    int place = warp_tot[warp] + inc - used;
-#pragma unroll
-    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        if (cnt[q] == 0) continue;
-        const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        uids[place] = e;
-        int j = 0;
-        for (int i = 0; i < n && j < maxm; ++i)
-            if (sh_pick[i] == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
-        for (; j < maxm; ++j) members[place * maxm + j] = -1;
-        ++place;
+    if (threadIdx.x == 0) {
+        int u = 0;
+        for (int e = 0; e < E; ++e) {
+            if (totals[e] == 0) {
+                place[e] = -1;
+                continue;
+            }
+            uids[u] = e;
+            place[e] = u;
+            ++u;
+        }
+        ucount[0] = u;
+    }
+    __syncthreads();
+    const size_t nfill = (size_t)ucount[0] * (size_t)maxm;
+    for (size_t i = threadIdx.x; i < nfill; i += blockDim.x) members[i] = -1;
+}
+
+// One block a tile, picks in index order: rank is earlier tiles' count plus this tile's running count.
+__global__ void group_scatter_kernel(const int* __restrict__ pick, const int* __restrict__ work,
+                                     int* __restrict__ members, int n, int slots, int E, int maxm) {
+    extern __shared__ int tf_group_local[];
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) tf_group_local[e] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const int tile = (int)blockIdx.x;
+    const int begin = tile * GROUP_TILE;
+    int end = begin + GROUP_TILE;
+    if (end > n) end = n;
+    const int* off = work + (size_t)tile * E;
+    const int tiles = group_tiles(n);
+    const int* place = work + (size_t)tiles * E + E;
+    for (int i = begin; i < end; ++i) {
+        const int e = pick[i];
+        if ((unsigned)e >= (unsigned)E) continue;
+        const int rank = off[e] + tf_group_local[e];
+        tf_group_local[e] += 1;
+        if (rank >= maxm) continue;
+        members[(size_t)place[e] * maxm + rank] = (i / slots) * 32 + (i % slots);
     }
 }
 
@@ -776,8 +798,9 @@ void exl3x_rot_in_instances(const __nv_bfloat16* xb, const half* xh, int x_strid
 }
 
 // The rest of the expert kernels' launch contract, for the Zig side:
-//   group_kernel (experts.cu:19)   1 block, GROUP_THREADS=1024, R*slots*4 dynamic bytes (lifted past 48 KiB,
-//                                  against the device's own sharedMemPerBlockOptin minus its static use)
+//   group_hist_kernel              grid (tiles), block 256; tiles of GROUP_TILE picks, histogram in work
+//   group_scan_kernel              1 block of 256: exclusive scan, uids in id order, members set to -1
+//   group_scatter_kernel           grid (tiles), block 128, E*4 shared: stable scatter, same member ids
 //   gateup_epilogue_kernel (:116)  grid (rows*slots, N/128), block 32
 //   down_epilogue_kernel   (:161)  grid (rows*slots, D/128), block 32
 //   combine_kernel         (:183)  grid (rows, ceil(D/256)), block 256
