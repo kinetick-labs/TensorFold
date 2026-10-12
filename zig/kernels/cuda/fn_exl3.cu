@@ -1379,6 +1379,9 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     }
 }
 
+// grouped_kernel launches at most this many member rows an expert; larger groups loop (cuda_exl3.zig grouped_grid_members)
+constexpr int TF_GROUPED_GRID_MEMBERS = 512;
+
 // Program (expert u, n block, split and MTL member tiles): MTL * 16 members times W_q; warps summed in order.
 template <int CB, int NT, int W, int PF, int LO, int HI, int MTL>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
@@ -1389,9 +1392,12 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int u = blockIdx.x;
     if (u >= ucount[0]) return;
     const int MTG = (maxm + 16 * MTL - 1) / (16 * MTL);
-    const int mg = blockIdx.z % MTG;
-    const int split = (blockIdx.z / MTG) % SK;
-    const int mat = blockIdx.z / MTG / SK;
+    // The grid holds G member groups (TF_GROUPED_GRID_MEMBERS rows); a program walks mg0, mg0+G, ...
+    // Each member row's sums are unchanged; only which program computes it moves.
+    const int G = min(MTG, (TF_GROUPED_GRID_MEMBERS + 16 * MTL - 1) / (16 * MTL));
+    const int mg0 = blockIdx.z % G;
+    const int split = (blockIdx.z / G) % SK;
+    const int mat = blockIdx.z / G / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -1405,6 +1411,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     // Deferred: upstream stages these rows in a swizzled cp.async A-tile (B via ldsm4); here they are global reads.
     __shared__ int rows_sh[16 * MTL];
+    for (int mg = mg0; mg < MTG; mg += G) {
+    if (mg != mg0) __syncthreads();       // rows_sh / red are reused by the next group
     for (int i = threadIdx.x; i < 16 * MTL; i += W * 32) {
         const int m = mg * 16 * MTL + i;
         const int code = m < maxm ? members[u * maxm + m] : -1;
@@ -1562,6 +1570,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             for (int w = 1; w < W; ++w) s += red[w][row][col];
             Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
         }
+    }
     }
     }
 }
@@ -1791,7 +1800,10 @@ struct GroupedArgs {
 template <int CB, int MTL>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MTG = (a.maxm + 16 * MTL - 1) / (16 * MTL);
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MTG));
+    const char* abl_g = getenv("TF_EXL3_ABL_DECODE");
+    // grouped_kernel walks member groups past TF_GROUPED_GRID_MEMBERS; the ablation probe still launches each one
+    const int MTGL = (abl_g != nullptr && abl_g[0] != '0') ? MTG : min(MTG, (TF_GROUPED_GRID_MEMBERS + 16 * MTL - 1) / (16 * MTL));
+    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MTGL));
     const char* abl_e = getenv("TF_EXL3_ABL_DECODE");
     const bool abl = abl_e != nullptr && abl_e[0] != '0';   // timing probe: unset or "0" is off (the repo's getenv idiom)
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
