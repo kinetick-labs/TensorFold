@@ -244,6 +244,7 @@ const X3Scratch = struct {
     z: u64, // fp32: the most split-K partials a dense linear leaves
     ctr: u64, // int32: a dense linear's counters, the widest N; zeroed once, every launch re-zeroes its own slots
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
+    side: [4]u64, // the side stream's xh, z, ctr and face, sized as the main ones
     ple_dev: u64, // [max_rows * heads, WORDS] int16: the staged PLE rows as the table stores them (exl3_mm.Scratch.ple_dev)
     ple_hb: u64, // [heads * DH] fp16: the mul1 codebook's per-head bias, the table's own file, uploaded once
     // the grouped experts' rows: P = x3MoeWindow() * slots
@@ -314,12 +315,13 @@ const X3Scratch = struct {
             else => return e,
         };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
-        const sizes = [15]usize{
+        const sizes = [19]usize{
             128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
             P * g.hidden * 2,                    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
             4,                                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
             exl3.groupWorkspaceBytes(mrows, slots, g.experts),
             @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
+            128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
         };
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
@@ -327,7 +329,7 @@ const X3Scratch = struct {
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer s.arena.buf.free();
         try s.arena.buf.fill8(0, null);
-        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.gwork, &s.ple_dev, &s.ple_hb };
+        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.gwork, &s.ple_dev, &s.ple_hb, &s.side[0], &s.side[1], &s.side[2], &s.side[3] };
         for (ptrs, sizes) |p, n| p.* = s.arena.take(n);
         s.rows = mrows;
         return s;
@@ -1051,10 +1053,42 @@ pub const Forward = struct {
     }
 
     /// The stack an EXL3 gdn/attention projection is: qkv3, z3, b, a rows into `out`, in the GDN proj's order.
+    /// The side stream for a prompt's independent dense parts (TF_FLASHNEXT_X3_SIDE=0 off): over 128 rows only.
+    fn x3Side(f: *Forward, R: usize) ?Side {
+        if (R <= 128) return null;
+        if (std.c.getenv("TF_FLASHNEXT_X3_SIDE")) |v| if (v[0] == '0') return null;
+        return f.side;
+    }
+
+    /// x3Col on the side stream with its own scratch: the same kernels on the same inputs, so the same bits.
+    fn x3ColSide(f: *Forward, sd: Side, x: u64, x_stride: usize, q: W.X3, out: u64, out_w: usize, col: usize, m: usize) !void {
+        const k3 = f.k3 orelse return error.NoExl3Kernels;
+        const d = (f.x3 orelse return error.NoExl3Scratch).side;
+        const st = exl3.strides(.strips, q.k, q.n, q.k2);
+        var th2 = f.th;
+        th2.s = sd.s;
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += 128) {
+            const nn = @min(128, m - r0);
+            try exl3.rotIn(k3, x + r0 * x_stride, 1, q.suh, d[0], nn, q.k, sd.s);
+            try exl3.linear(k3, q.k2, q.cb, d[0], q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, d[3], 1, if (q.split.sk > 1) d[1] else 0, d[2], nn, q.k, q.n, q.split, sd.s);
+            try th2.slotCopy(d[3], q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+        }
+    }
+
     fn x3GdnProj(f: *Forward, gd: *const W.Gdn, x: *const Bufs, out: u64, out_w: usize, R: usize) !void {
         const g = f.g;
-        try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
-        try f.x3Col(null, x.b.mixed, g.hidden, 1, gd.z3.?, out, out_w, g.gdnConv(), R);
+        if (f.x3Side(R)) |sd| {
+            try sd.fork.record(f.s);
+            try sd.s.wait(sd.fork);
+            try f.x3ColSide(sd, x.b.mixed, g.hidden, gd.z3.?, out, out_w, g.gdnConv(), R);
+            try sd.join.record(sd.s);
+            try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
+            try f.s.wait(sd.join);
+        } else {
+            try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
+            try f.x3Col(null, x.b.mixed, g.hidden, 1, gd.z3.?, out, out_w, g.gdnConv(), R);
+        }
         try f.rowsCol(null, x.b.mixed, g.hidden, gd.ba3.?, out, out_w, g.gdnConv() + g.nv * state.gdn_dv, R);
     }
 
@@ -1743,10 +1777,22 @@ pub const Forward = struct {
         if (a.q3 != null) {
             // the pack quantizes every attention linear whole: q (with its gate), k, v, the indexer's rows
             const hd = g.head_dim;
-            try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
-            try f.x3Col(null, b.mixed, g.hidden, 1, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
-            try f.x3Col(null, b.mixed, g.hidden, 1, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
-            try f.x3Col(null, b.mixed, g.hidden, 1, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+            if (f.x3Side(R)) |sd| {
+                // k, v and the indexer's rows (a few programs each) beside q, on the side stream's scratch
+                try sd.fork.record(f.s);
+                try sd.s.wait(sd.fork);
+                try f.x3ColSide(sd, b.mixed, g.hidden, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
+                try f.x3ColSide(sd, b.mixed, g.hidden, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
+                try f.x3ColSide(sd, b.mixed, g.hidden, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+                try sd.join.record(sd.s);
+                try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
+                try f.s.wait(sd.join);
+            } else {
+                try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
+                try f.x3Col(null, b.mixed, g.hidden, 1, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
+                try f.x3Col(null, b.mixed, g.hidden, 1, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
+                try f.x3Col(null, b.mixed, g.hidden, 1, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+            }
             try f.mark(.attn_proj);
         } else if (a.proj8 != null) try f.projFace(.attn_proj, b.mixed, g.hidden, a.proj8, a.proj, b.pa, g.attnWidth(), R) else try f.mmxAt(.attn_proj, b.mixed, g.hidden, b.xs_mixed, a.proj, b.pa, false, R);
         const ci: usize = if (mtp) g.attention_layers else f.sub[@intCast(layer.index)];
