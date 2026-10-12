@@ -1311,6 +1311,13 @@ __device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32
     gm_cp_wait<NSA - 2>();
     __syncthreads();
 
+    // weight words one stage ahead in registers (same words, same decode: only the load issues earlier)
+    uint32_t wq[KS][MTL][Fmt<K2>::LW];
+#pragma unroll
+    for (int kk = 0; kk < KS; ++kk)
+#pragma unroll
+        for (int l = 0; l < MTL; ++l)
+            load_words<K2>(wq[kk][l], T + ((size_t)(split * per_split + kk) * NTILES + nt0 + slice * MTL + l) * TW + lane, lane);
     for (int s = 0; s < S; ++s) {
         if (s + NSA - 1 < S) load_stage(s + NSA - 1);
         gm_cp_commit();
@@ -1321,8 +1328,10 @@ __device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32
 #pragma unroll
             for (int l = 0; l < MTL; ++l) {
                 uint32_t w[Fmt<K2>::LW];
-                const int nt = slice * MTL + l;
-                load_words<K2>(w, T + ((size_t)(split * per_split + s * KS + kk) * NTILES + nt0 + nt) * TW + lane, lane);
+#pragma unroll
+                for (int q = 0; q < Fmt<K2>::LW; ++q) w[q] = wq[kk][l][q];
+                if (s + 1 < S)                               // the next stage's words for this kk: one stage in flight
+                    load_words<K2>(wq[kk][l], T + ((size_t)(split * per_split + (s + 1) * KS + kk) * NTILES + nt0 + slice * MTL + l) * TW + lane, lane);
                 uint32_t b0[2], b1[2];
                 decode_tile<CB, K2>(w, map, lane, b0, b1);
                 af[l][0] = b0[0]; af[l][1] = b1[0]; af[l][2] = b0[1]; af[l][3] = b1[1];  // weights as the A fragment
