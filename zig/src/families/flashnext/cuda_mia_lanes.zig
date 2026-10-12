@@ -346,7 +346,7 @@ pub fn Lanes(comptime E: type) type {
                 .max_streams = @intCast(self.streams),
                 .shared_costs = self.shared[0..self.shared_count],
                 .draft_streams = many,
-                // the running-product rule (confidence < 0) stops each chain itself: the round loop asks the most
+                // confidence < 0 is stored as draft_stops. Engine.init does not copy it onto the rule, so the ask stays the acceptance-rate depth.
                 .draft_stops = self.drafting and self.confidence < 0,
                 .draft_stops_most = @intCast(@min(self.product_streams, std.math.maxInt(u32))),
                 // each sequence keeps its prompt's last streams until its first drafts: joiners draft together
