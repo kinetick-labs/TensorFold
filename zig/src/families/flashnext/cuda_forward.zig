@@ -245,6 +245,7 @@ const X3Scratch = struct {
     ctr: u64, // int32: a dense linear's counters, the widest N; zeroed once, every launch re-zeroes its own slots
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
     side: [4]u64, // the side stream's xh, z, ctr and face, sized as the main ones
+    mo: u64, // [max_rows, D] bf16: the experts' combined rows (downCombineBf16), the write-back's branch
     ple_dev: u64, // [max_rows * heads, WORDS] int16: the staged PLE rows as the table stores them (exl3_mm.Scratch.ple_dev)
     ple_hb: u64, // [heads * DH] fp16: the mul1 codebook's per-head bias, the table's own file, uploaded once
     // the grouped experts' rows: P = x3MoeWindow() * slots
@@ -315,13 +316,14 @@ const X3Scratch = struct {
             else => return e,
         };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
-        const sizes = [19]usize{
+        const sizes = [20]usize{
             128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
             P * g.hidden * 2,                    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
             4,                                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
             exl3.groupWorkspaceBytes(mrows, slots, g.experts),
             @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
             128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
+            max_rows * g.hidden * 2,
         };
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
@@ -329,7 +331,7 @@ const X3Scratch = struct {
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer s.arena.buf.free();
         try s.arena.buf.fill8(0, null);
-        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.gwork, &s.ple_dev, &s.ple_hb, &s.side[0], &s.side[1], &s.side[2], &s.side[3] };
+        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.gwork, &s.ple_dev, &s.ple_hb, &s.side[0], &s.side[1], &s.side[2], &s.side[3], &s.mo };
         for (ptrs, sizes) |p, n| p.* = s.arena.take(n);
         s.rows = mrows;
         return s;
@@ -337,6 +339,12 @@ const X3Scratch = struct {
 };
 
 /// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
+/// TF_FLASHNEXT_X3_COMBINE=0 keeps the per-slot rows and the write-back's MoE mode (the same bits).
+fn x3Combine() bool {
+    if (std.c.getenv("TF_FLASHNEXT_X3_COMBINE")) |v| return v[0] != '0';
+    return true;
+}
+
 pub fn x3MoeWindow() usize {
     // TF_FLASHNEXT_X3_MOE_WINDOW (default 4096: with every member kept, 4096 is +8-9% over 2048 at identical bits) trades scratch for fewer passes.
     // One read: a forward asks again at every MoE layer, and the process does not change the variable.
@@ -2022,6 +2030,7 @@ pub const Forward = struct {
             try f.mark(.moe_gather);
             return .{ .ranks = .{ .part = b.g_moe, .world = cm.world } };
         }
+        if (m.x3 != null and x3Combine()) return .{ .bf16 = (f.x3 orelse return error.NoExl3Scratch).mo };
         return .{ .moe = .{ .y = b.moe_y, .y_f32 = x.y_f32, .wts = b.moe_wts, .slots = slots } };
     }
 
@@ -2143,7 +2152,9 @@ pub const Forward = struct {
             try exl3.gateupEpilogue(k3, xs.mz, pick, ex.svh_g, ex.svh_u, ex.suh_d, xs.md, R, slots, P, I, gu.sk, E, std.math.inf(f32), 0, f.s);
             try f.mark(.experts_gate_up);
             try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, R, slots, E, 1, f.s);
-            try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
+            if (x3Combine()) {
+                try exl3.downCombineBf16(k3, xs.mz, pick, ex.svh_d, y, b.moe_wts + at * slots * 4, xs.mo + at * D * 2, R, P, D, dn.sk, E, slots, f.s);
+            } else try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
             try f.mark(.experts_down);
             r0 += R;
         }
