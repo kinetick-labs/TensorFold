@@ -191,7 +191,8 @@ zig-out/native/bin/tensorfold-native serve /home/jct-spark/models/exl3-405 \
 not time, allocate, or print for this, and the served tokens stay on `token_sha afccd937e6ac`. The
 flag is read once, after the startup cost measurement, so that measurement is the table `depth()` uses.
 
-Grep `tf-draft`. Rank 0 prints one line per stream per round:
+Grep `tf-draft`. Rank 0 prints one line per stream per round. The samples below are the field layout.
+On this serve a round line has `why=rate` and `stop=product`, and the costs line has `head_stops=0`.
 
 ```text
 tf-draft round i=0 asked=15 held=8 acc=3 out=4 win=8 why=head_stops stop=product verify_ms=4.210 draft_ms=1.500 gap_verify_ms=0.040 gap_draft_ms=0.020 p=0.910,0.400 lvl=1.000,0.500
