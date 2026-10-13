@@ -249,7 +249,7 @@ pub fn linearBlock(wk: usize) usize {
 }
 
 pub fn linearShared(wk: usize, rows: usize) usize {
-    return wk * @min(rows, 8) * 128 * @sizeOf(f32);
+    return wk * @min(rows, 8) * 136 * @sizeOf(f32); // red rows padded to 136 floats (fn_exl3.cu TF_LIN_LDR)
 }
 
 /// unpack_kernel (linear.cu:269): grid (N/16, K/16), block 32; one warp a tile.
@@ -1120,8 +1120,8 @@ test "the launch shapes are the reference's" {
     try testing.expectEqual([2]usize{ 96, 1 }, linearGrid(12288, 1));
     try testing.expectEqual([2]usize{ 5, 4 }, linearGrid(640, 4));
     try testing.expectEqual(@as(usize, 256), linearBlock(8));
-    try testing.expectEqual(@as(usize, 32768), linearShared(8, 128)); // WK * min(M, 8) * 128 * 4, the cap 48 KiB
-    try testing.expectEqual(@as(usize, 2048), linearShared(2, 2)); // WK * M * 128 * 4, rows under the 8-row cap
+    try testing.expectEqual(@as(usize, 34816), linearShared(8, 128)); // WK * min(M, 8) * 136 * 4, the cap 48 KiB
+    try testing.expectEqual(@as(usize, 2176), linearShared(2, 2)); // WK * M * 136 * 4, rows under the 8-row cap
     try testing.expectEqual([2]usize{ 768, 160 }, unpackGrid(2560, 12288));
     try testing.expectEqual([2]usize{ 160, 5 }, epilogueGrid(128, 5, 640)); // ceil(rows*slots / 4 warps), width / 128
     try testing.expectEqual(@as(usize, 128), epilogueBlock(128, 5));
