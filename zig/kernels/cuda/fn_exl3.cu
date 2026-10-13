@@ -1359,17 +1359,18 @@ __device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32
                     }
                 }
             }
-        }
-        if (((s + 1) * KS) % sub_len == 0) {                 // a shipped sub-range closed: fold its partial into run
+            // a shipped sub-range closed after this k tile (it may end inside a stage): fold its partial into run
+            if ((s * KS + kk + 1) % sub_len == 0) {
 #pragma unroll
-            for (int l = 0; l < MTL; ++l)
+                for (int l = 0; l < MTL; ++l)
 #pragma unroll
-                for (int n = 0; n < NG; ++n)
+                    for (int n = 0; n < NG; ++n)
 #pragma unroll
-                    for (int c = 0; c < 4; ++c) {
-                        run[l][n][c] += work[l][n][c];
-                        work[l][n][c] = 0.f;
-                    }
+                        for (int c = 0; c < 4; ++c) {
+                            run[l][n][c] += work[l][n][c];
+                            work[l][n][c] = 0.f;
+                        }
+            }
         }
         gm_cp_wait<NSA - 2>();
         __syncthreads();
@@ -1420,7 +1421,7 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     const int KT = K >> 4, NTILES = N >> 4;
     const int per_split = KT / SK, sub_len = per_split / SUBW;
     const int nt0 = blockIdx.x * NT;
-    if (per_split % SUBW != 0 || sub_len % KS != 0) return;   // cuda_exl3.zig refuses this launch first
+    if (per_split % SUBW != 0 || per_split % KS != 0) return;   // cuda_exl3.zig refuses this launch first
 
     __shared__ int rows_sh[BM];
     for (int i = threadIdx.x; i < BM; i += W * 32) {
@@ -1923,15 +1924,9 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
 // sub-ranges and the bits match it. Opt-in, for a shape the guard admits: per_split = KT/SK divisible by SUBW and W,
 
 // and the shipped sub-range per_split/SUBW by KS. cuda_exl3.zig checks the same first (gmShapeOk).
-template <int CB>
-bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
-    constexpr int NT = 8, W = 8, KS = 2, NSA = 4, SUBW = 4;
-    const int KT = a.K / 16;
-    if (KT % a.SK != 0 || a.N % (16 * NT) != 0) return false;
-    const int per_split = KT / a.SK, sub_len = per_split / SUBW;
-    if (a.warps != SUBW || per_split % SUBW != 0 || sub_len % KS != 0) return false;
-    const int MG = (a.maxm + 127) / 128;
-    dim3 grid((unsigned)(a.N / (16 * NT)), (unsigned)a.nexp_max, (unsigned)(a.mats * a.SK * MG));
+template <int CB, int KS, int NSA>
+void grouped_gm_launch_ks(const GroupedArgs& a, cudaStream_t stream, dim3 grid) {
+    constexpr int NT = 8, W = 8, SUBW = 4;
     const size_t smem = (size_t)NSA * gm_lmem<KS>();
 #define TF_GM_LAUNCH(LO_, HI_)                                                                                         \
     grouped_gm_kernel<CB, NT, W, LO_, HI_, KS, NSA, SUBW><<<grid, W * 32, smem, stream>>>(                             \
@@ -1941,6 +1936,24 @@ bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
     else if (a.lo >= 2 && a.hi <= 10) TF_GM_LAUNCH(2, 10);
     else TF_GM_LAUNCH(2, 16);
 #undef TF_GM_LAUNCH
+}
+
+#ifndef TF_GM4_DOWN
+#define TF_GM4_DOWN 0
+#endif
+template <int CB>
+bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
+    constexpr int NT = 8, SUBW = 4;
+    const int KT = a.K / 16;
+    if (KT % a.SK != 0 || a.N % (16 * NT) != 0) return false;
+    const int per_split = KT / a.SK, sub_len = per_split / SUBW;
+    if (a.warps != SUBW || per_split % SUBW != 0 || sub_len % 2 != 0) return false;
+    const int MG = (a.maxm + 127) / 128;
+    dim3 grid((unsigned)(a.N / (16 * NT)), (unsigned)a.nexp_max, (unsigned)(a.mats * a.SK * MG));
+    // 4 k tiles a stage in a 2-deep ring (the same 32 KiB) where the sub-range allows it (gate/up): same k order and
+    // sums, bit for bit; otherwise (down) 2 tiles a stage in a 4-deep ring as before
+    if (TF_GM4_DOWN ? per_split % 4 == 0 : (per_split % 4 == 0 && a.mats == 2)) grouped_gm_launch_ks<CB, 4, 2>(a, stream, grid);
+    else grouped_gm_launch_ks<CB, 2, 4>(a, stream, grid);
     return true;
 }
 
