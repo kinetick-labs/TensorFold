@@ -480,6 +480,12 @@ pub const sym = struct {
         "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi10ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi16ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
     };
+    /// the gm arm at 4 k tiles a stage in a 2-deep ring (the same 32 KiB), for sub-ranges divisible by 4 (gate/up)
+    pub const grouped_gm4 = [3][:0]const u8{
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi8ELi8ELi4ELi2ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi10ELi4ELi2ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi16ELi4ELi2ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+    };
     /// tf_exl3x: the width's dequantize-to-dense (the grouped path's own decoder)
     pub const dequant = [3][:0]const u8{
         "_ZN10tf_fn_exl38tf_exl3x14dequant_kernelILi2ELi8EEEvPKjP6__halfii",
@@ -511,6 +517,7 @@ pub const Kernels = struct {
     grouped_abl: [4][3]?cuda.Function,
     /// the staged gm arm's instances: null when the embedded fatbin predates them (opt-in, off by default)
     grouped_gm: [3]?cuda.Function,
+    grouped_gm4: [3]?cuda.Function,
     dequant: [3]cuda.Function,
     /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
     wide_smem_max: u32,
@@ -547,6 +554,7 @@ pub const Kernels = struct {
             k.grouped_abl[i][j] = k.module.function(s) catch null;
         };
         for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
+        for (sym.grouped_gm4, 0..) |s, i| k.grouped_gm4[i] = k.module.function(s) catch null;
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
         const ceiling: usize = @intCast(try ctx.attribute(.max_shared_memory_per_block_optin));
         // the wide arm stages its A tile in dynamic shared: opt the staged instances in against the same ceiling
@@ -558,6 +566,7 @@ pub const Kernels = struct {
         // the gm arm stages its member ring in dynamic shared: opt the staged instances in against the same ceiling
         const gstatic: usize = if (k.grouped_gm[0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
         k.gm_smem_max = @intCast(ceiling -| gstatic);
+        for (k.grouped_gm4) |maybe| if (maybe) |f| try f.allowDynamicShared(k.gm_smem_max);
         for (k.grouped_gm) |maybe| {
             if (maybe) |f| try f.allowDynamicShared(k.gm_smem_max);
         }
@@ -920,7 +929,9 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     // prompt-sized calls only: decode / verify picks keep the MTL 1 arm (the gm arm is 35% slower there)
     const gm = p >= gm_min_picks and gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
     if (gm) {
-        const f = k.grouped_gm[range] orelse return error.NoGmKernel;
+        // gate/up takes the 4-tiles-a-stage instance (same k order, sub-range folds per k tile, same 32 KiB)
+        const ks4 = (kk / 16 / sk) % 4 == 0 and mats == 2;   // gate/up only (fn_exl3.cu grouped_gm_launch)
+        const f = (if (ks4) k.grouped_gm4[range] else null) orelse k.grouped_gm[range] orelse return error.NoGmKernel;
         const mtiles = (maxm + 127) / 128;
         const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
         return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[1]), .y = @intCast(g[0]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
