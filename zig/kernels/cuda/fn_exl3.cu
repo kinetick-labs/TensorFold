@@ -314,6 +314,9 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     store4(xh, F16, (size_t)row * K + k, v);
 }
 
+// red rows padded to 136 floats: the 8 g rows of a warp store land in distinct banks (128 put them all in one)
+constexpr int TF_LIN_LDR = 136;
+
 template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
@@ -419,7 +422,7 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const int col = i * 16 + h * 8 + 2 * t;
-                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
+                        *reinterpret_cast<float2*>(red + (warp * RH + g) * TF_LIN_LDR + col) =
                             rlo ? make_float2(acc[u][i][h][2], acc[u][i][h][3]) : make_float2(acc[u][i][h][0], acc[u][i][h][1]);
                     }
             }
@@ -428,11 +431,11 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             if (SK == 1) {
                 for (int r = warp; r < rn; r += WK) {
                     float v[4];
-                    const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
+                    const float4 u = *reinterpret_cast<const float4*>(red + r * TF_LIN_LDR + 4 * lane);
                     v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
 #pragma unroll
                     for (int w = 1; w < WK; ++w) {
-                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * TF_LIN_LDR + 4 * lane);
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
@@ -441,10 +444,10 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
                     const int r = idx >> 5, c = 4 * (idx & 31);
-                    float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+                    float4 s = *reinterpret_cast<const float4*>(red + r * TF_LIN_LDR + c);
 #pragma unroll
                     for (int w = 1; w < WK; ++w) {
-                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * TF_LIN_LDR + c);
                         s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
                     }
                     *reinterpret_cast<float4*>(Z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = s;
@@ -519,7 +522,7 @@ void exl3_linear_instances(const half* xh, const uint32_t* T, long long stride_k
         auto kernel = WK == 2   ? linear_kernel<K2_, CB_, 2>                                                           \
                       : WK == 4 ? linear_kernel<K2_, CB_, 4>                                                           \
                                 : linear_kernel<K2_, CB_, 8>;                                                          \
-        const int smem = (int)(WK * (M < 8 ? M : 8) * 128 * sizeof(float));                                             \
+        const int smem = (int)(WK * (M < 8 ? M : 8) * TF_LIN_LDR * sizeof(float));                                             \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);           \
         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z,       \
                                                             counters, M, K, N, SK, N);                                  \
