@@ -923,7 +923,7 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
         const f = k.grouped_gm[range] orelse return error.NoGmKernel;
         const mtiles = (maxm + 127) / 128;
         const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
-        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
+        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[1]), .y = @intCast(g[0]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
     }
     const wide = wideMembers();
     const abl = !wide and ablateDecode();
