@@ -1402,7 +1402,7 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
-    const int u = blockIdx.x;
+    const int u = blockIdx.y;   // n blocks of one expert item run side by side, so its staged rows hit in L2
     if (u >= ucount[0]) return;
     constexpr int BM = 128;
     const int MG = (maxm + BM - 1) / BM;
@@ -1416,7 +1416,7 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int KT = K >> 4, NTILES = N >> 4;
     const int per_split = KT / SK, sub_len = per_split / SUBW;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = blockIdx.x * NT;
     if (per_split % SUBW != 0 || sub_len % KS != 0) return;   // cuda_exl3.zig refuses this launch first
 
     __shared__ int rows_sh[BM];
@@ -1928,7 +1928,7 @@ bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int per_split = KT / a.SK, sub_len = per_split / SUBW;
     if (a.warps != SUBW || per_split % SUBW != 0 || sub_len % KS != 0) return false;
     const int MG = (a.maxm + 127) / 128;
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * NT)), (unsigned)(a.mats * a.SK * MG));
+    dim3 grid((unsigned)(a.N / (16 * NT)), (unsigned)a.nexp_max, (unsigned)(a.mats * a.SK * MG));
     const size_t smem = (size_t)NSA * gm_lmem<KS>();
 #define TF_GM_LAUNCH(LO_, HI_)                                                                                         \
     grouped_gm_kernel<CB, NT, W, LO_, HI_, KS, NSA, SUBW><<<grid, W * 32, smem, stream>>>(                             \
