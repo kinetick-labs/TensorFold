@@ -2058,3 +2058,201 @@ template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStrea
 }  // namespace tf_exl3x
 
 }  // namespace tf_fn_exl3
+
+
+// ===============================================================================================================
+// The prompt arm (port of grearjake-star's PR #212 prompt_kernel, ashhart/TensorFold, Apache-2.0; integration and
+// measurements by sxuff): a program (64-column n block, expert item, member group of 64, matrix) decodes each weight
+// tile once into shared memory for its 4 warps x 16 members, and sums the K splits in the kernel. The arithmetic is
+// the gm arm's: the same m16n8k16 chains over the same sub-ranges (SUBW 4 a split), sub-ranges added in order, splits
+// added from 0.f, so Z holds the final [mat, P, N] sums and the epilogues read one split, bit for bit.
+// One instance a width (K2): programs of another width return at once.
+// ===============================================================================================================
+namespace tf_fn_exl3 {
+namespace tf_exl3x {
+
+constexpr int PG_WARPS = 4;
+constexpr int PG_NT = 4;      // 64 columns a program (NT 8 would spill)
+constexpr int PG_CH = 4;      // k tiles a chunk
+
+__device__ __forceinline__ void pg_cp_async16(uint32_t dst, const void* src, bool ok) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void pg_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N_>
+__device__ __forceinline__ void pg_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N_)); }
+__device__ __forceinline__ void pg_ldsm4(uint32_t (&a)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void pg_stage_a(uint32_t abuf, const half* __restrict__ X, const int* rows16, int K, int kt0,
+                                           int KT, int lane) {
+    constexpr int CPR = PG_CH * 2;
+#pragma unroll
+    for (int i = 0; i < (16 * CPR) / 32; ++i) {
+        const int idx = lane + 32 * i, r = idx / CPR, c = idx % CPR;
+        const int row = rows16[r];
+        const int kt = kt0 + c / 2;
+        const bool ok = row >= 0 && kt < KT;
+        const half* src = X + (size_t)(ok ? row : 0) * K + (size_t)(ok ? kt0 * 16 + c * 8 : 0);
+        pg_cp_async16(abuf + r * (CPR * 16) + ((c ^ (r & 7)) % CPR) * 16, src, ok);
+    }
+}
+
+template <int CB, int K2>
+__device__ __forceinline__ void pg_program(const half* __restrict__ X0, const half* __restrict__ X1,
+                                           const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1,
+                                           const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+                                           const int* __restrict__ uids, const int* __restrict__ ucount,
+                                           const int* __restrict__ members, float* __restrict__ Z, int K, int N,
+                                           int P, int SK, int maxm, int slots) {
+    constexpr int NT = PG_NT, CH = PG_CH;
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int DPW = NT / PG_WARPS;
+    constexpr int ABYTES = 16 * CH * 32;
+    const int u = blockIdx.y;
+    if (u >= ucount[0]) return;
+    const int MG = (maxm + 63) / 64;
+    const int mg = blockIdx.z % MG, mat = blockIdx.z / MG;
+    const int e = uids[u];
+    if ((mat ? K2_1[e] : K2_0[e]) != K2) return;
+    const half* X = mat ? X1 : X0;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int nt0 = blockIdx.x * NT;
+    const int KT = K >> 4, NTILES = N >> 4;
+    const int seg = (KT / SK) / 4, wps = 4;           // the gm arm's sub-ranges (SUBW 4 a split)
+
+    __shared__ uint4 sb[2 * CH * NT * 32];
+    __shared__ __align__(128) uint4 sa[PG_WARPS * 2 * 16 * CH * 2];
+    __shared__ int rows_sh[PG_WARPS * 16];
+    for (int i = threadIdx.x; i < PG_WARPS * 16; i += PG_WARPS * 32) {
+        const int m = mg * 64 + i;
+        const int code = m < maxm ? members[(size_t)u * maxm + m] : -1;
+        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    if (rows_sh[0] < 0) return;                         // members come first: an empty group
+    int cnt = 0;
+    for (int i = 0; i < PG_WARPS * 16; ++i)
+        if (rows_sh[i] >= 0) cnt = i + 1;
+    const bool active = warp * 16 < cnt;
+    const int* rows16 = rows_sh + warp * 16;
+
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + (size_t)(nt0 + warp * DPW) * TW + lane;
+    const uint32_t abase = (uint32_t)__cvta_generic_to_shared(sa);
+    const uint32_t abuf0 = abase + warp * 2 * ABYTES;
+
+    float acc[NT][2][4], ts[NT][2][4], res[NT][2][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][h][c] = ts[i][h][c] = res[i][h][c] = 0.f;
+
+    uint32_t wn[CH][DPW][LW];
+#pragma unroll
+    for (int kc = 0; kc < CH; ++kc)
+        if (kc < KT)
+#pragma unroll
+            for (int j = 0; j < DPW; ++j) load_words<K2>(wn[kc][j], tp + (size_t)kc * kstride + j * TW, lane);
+    if (active) pg_stage_a(abuf0, X, rows16, K, 0, KT, lane);
+    pg_commit();
+
+    int sleft = seg, gs = 0;
+    const int chunks = (KT + CH - 1) / CH;
+    for (int c = 0; c < chunks; ++c) {
+        uint4* buf = sb + (size_t)(c & 1) * CH * NT * 32;
+#pragma unroll
+        for (int kc = 0; kc < CH; ++kc)
+            if (c * CH + kc < KT)
+#pragma unroll
+                for (int j = 0; j < DPW; ++j) {
+                    uint32_t b0[2], b1[2];
+                    decode_tile<CB, K2>(wn[kc][j], map, lane, b0, b1);
+                    buf[(kc * NT + warp * DPW + j) * 32 + lane] = make_uint4(b0[0], b0[1], b1[0], b1[1]);
+                }
+#pragma unroll
+        for (int kc = 0; kc < CH; ++kc) {
+            const int kt = (c + 1) * CH + kc;
+            if (kt < KT)
+#pragma unroll
+                for (int j = 0; j < DPW; ++j) load_words<K2>(wn[kc][j], tp + (size_t)kt * kstride + j * TW, lane);
+        }
+        __syncwarp();
+        if (active && c + 1 < chunks) pg_stage_a(abuf0 + ((c + 1) & 1) * ABYTES, X, rows16, K, (c + 1) * CH, KT, lane);
+        pg_commit();
+        pg_wait<1>();
+        __syncthreads();
+        if (active) {
+            const uint32_t abuf = abuf0 + (c & 1) * ABYTES;
+            const int ar = lane & 15;
+#pragma unroll
+            for (int kc = 0; kc < CH; ++kc) {
+                const int kt = c * CH + kc;
+                if (kt < KT) {
+                    uint32_t a[4];
+                    const int ch = kc * 2 + (lane >> 4);
+                    pg_ldsm4(a, abuf + ar * (CH * 32) + ((ch ^ (ar & 7)) % (CH * 2)) * 16);
+#pragma unroll
+                    for (int i = 0; i < NT; ++i) {
+                        const uint4 b = buf[(kc * NT + i) * 32 + lane];
+                        const uint32_t b0[2] = {b.x, b.y}, b1[2] = {b.z, b.w};
+                        mma16816(acc[i][0], a, b0);
+                        mma16816(acc[i][1], a, b1);
+                    }
+                    if (--sleft == 0) {
+                        const int wi = gs % wps;
+#pragma unroll
+                        for (int i = 0; i < NT; ++i)
+#pragma unroll
+                            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                                for (int q = 0; q < 4; ++q) {
+                                    ts[i][h][q] = wi == 0 ? acc[i][h][q] : ts[i][h][q] + acc[i][h][q];
+                                    acc[i][h][q] = 0.f;
+                                    if (wi == wps - 1) res[i][h][q] += ts[i][h][q];
+                                }
+                        sleft = seg;
+                        ++gs;
+                    }
+                }
+            }
+        }
+    }
+    pg_wait<0>();
+    if (!active) return;
+    const int r0 = rows16[g], r1 = rows16[g + 8];
+    float* zm = Z + (size_t)mat * P * N;
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int col = (nt0 + i) * 16 + h * 8 + 2 * t;
+            if (r0 >= 0) *reinterpret_cast<float2*>(zm + (size_t)r0 * N + col) = make_float2(res[i][h][0], res[i][h][1]);
+            if (r1 >= 0) *reinterpret_cast<float2*>(zm + (size_t)r1 * N + col) = make_float2(res[i][h][2], res[i][h][3]);
+        }
+}
+
+}  // namespace tf_exl3x
+}  // namespace tf_fn_exl3
+
+#define TF_PG_KERNEL(K2_)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(128) tf_exl3_prompt_k##K2_(                                           \
+        const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,                    \
+        const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,                  \
+        const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,                \
+        float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {                                    \
+        tf_fn_exl3::tf_exl3x::pg_program<2, K2_>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, \
+                                                 maxm, slots);                                                        \
+    }
+TF_PG_KERNEL(2) TF_PG_KERNEL(3) TF_PG_KERNEL(4) TF_PG_KERNEL(5) TF_PG_KERNEL(6) TF_PG_KERNEL(7) TF_PG_KERNEL(8)
+TF_PG_KERNEL(9) TF_PG_KERNEL(10) TF_PG_KERNEL(11) TF_PG_KERNEL(12) TF_PG_KERNEL(13) TF_PG_KERNEL(14) TF_PG_KERNEL(15)
+TF_PG_KERNEL(16)
+#undef TF_PG_KERNEL
