@@ -67,7 +67,7 @@ pub const Functions = struct {
     pub fn resolve(m: []const cuda.Module) !Functions {
         const i = struct {
             fn at(e: Images) usize {
-                return @intFromEnum(e);
+                return @backingInt(e);
             }
         }.at;
         return .{
