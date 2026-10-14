@@ -930,7 +930,7 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     const gm = p >= gm_min_picks and gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
     if (gm) {
         // gate/up takes the 4-tiles-a-stage instance (same k order, sub-range folds per k tile, same 32 KiB)
-        const ks4 = (kk / 16 / sk) % 4 == 0 and mats == 2;   // gate/up only (fn_exl3.cu grouped_gm_launch)
+        const ks4 = (kk / 16 / sk) % 4 == 0 and mats == 2; // gate/up only (fn_exl3.cu grouped_gm_launch)
         const f = (if (ks4) k.grouped_gm4[range] else null) orelse k.grouped_gm[range] orelse return error.NoGmKernel;
         const mtiles = (maxm + 127) / 128;
         const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
