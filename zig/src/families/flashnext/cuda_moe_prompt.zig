@@ -103,7 +103,6 @@ pub const Prompt4 = struct {
         return planTile(o, picks, pairs, experts, q.tile, p);
     }
 
-
     fn run(p: *const Prompt4, s: cuda.Stream, f: Fn, x: u64, x_stride: usize, slots: usize, w: u64, scale: u64, kg: usize, nb: usize, pl: kern.Plan, out: u64, n: usize, limit: f32, skip: c_int, max_items: usize) !void {
         return p.runG(s, f, x, x_stride, slots, w, scale, kg, nb, pl, out, n, limit, skip, max_items, null);
     }
