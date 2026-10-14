@@ -546,6 +546,7 @@ pub const Kernels = struct {
     grouped_gm4: [3]?cuda.Function,
     /// the prompt arm (PR #212's prompt_kernel on the gm plan), one instance a k2 (index = k2): null when absent
     prompt: [17]?cuda.Function = @splat(null),
+    prompt_items: ?cuda.Function = null,
     dequant: [3]cuda.Function,
     /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
     wide_smem_max: u32,
@@ -584,6 +585,7 @@ pub const Kernels = struct {
         for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
         for (sym.grouped_gm4, 0..) |s, i| k.grouped_gm4[i] = k.module.function(s) catch null;
         k.prompt = @splat(null);
+        k.prompt_items = k.module.function("tf_exl3_prompt_items") catch null;
         inline for (2..17) |k2| k.prompt[k2] = k.module.function(std.fmt.comptimePrint("tf_exl3_prompt_k{d}", .{k2})) catch null;
         for (sym.grouped_async, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped_async[i][j] = k.module.function(s) catch null;
@@ -995,7 +997,13 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
         for (k2s) |k2| {
             if (k2 >= lo and k2 <= hi and k.prompt[k2] == null) have = false;
         }
+        if (k.prompt_items == null or experts > 1024) have = false;
         if (have) {
+            var ia: cuda.Args = .{};
+            ia.add(ucount);
+            ia.add(members);
+            ia.add(int(maxm));
+            try cuda.launch.launch(k.prompt_items.?, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, s, &ia);
             var a: cuda.Args = .{};
             a.add(x0);
             a.add(x1);
@@ -1013,10 +1021,10 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
             a.add(int(sk));
             a.add(int(maxm));
             a.add(int(slots));
-            const mg = (maxm + 63) / 64;
+            const items_max = @min((p + 63) / 64 + experts, 1 << 16);
             for (k2s) |k2| {   // the pack's widths only (an empty program per expert of another width)
                 if (k2 < lo or k2 > hi) continue;
-                try cuda.launch.launch(k.prompt[k2].?, .{ .grid = .{ .x = @intCast(n / 64), .y = @intCast(experts), .z = @intCast(mats * mg) }, .block = .{ .x = 128 } }, s, &a);
+                try cuda.launch.launch(k.prompt[k2].?, .{ .grid = .{ .x = @intCast(n / 64), .y = @intCast(items_max), .z = @intCast(mats) }, .block = .{ .x = 128 } }, s, &a);
             }
             return 1;
         }
