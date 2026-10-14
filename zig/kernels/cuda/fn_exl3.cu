@@ -2072,6 +2072,9 @@ namespace tf_fn_exl3 {
 namespace tf_exl3x {
 
 constexpr int PG_WARPS = 4;
+// the compact item list (expert item, member group of 64) the prompt arm walks, built by tf_exl3_prompt_items
+__device__ int2 pg_items[1 << 16];
+__device__ int pg_nitems;
 constexpr int PG_NT = 4;      // 64 columns a program (NT 8 would spill)
 constexpr int PG_CH = 4;      // k tiles a chunk
 
@@ -2112,10 +2115,9 @@ __device__ __forceinline__ void pg_program(const half* __restrict__ X0, const ha
     constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
     constexpr int DPW = NT / PG_WARPS;
     constexpr int ABYTES = 16 * CH * 32;
-    const int u = blockIdx.y;
-    if (u >= ucount[0]) return;
-    const int MG = (maxm + 63) / 64;
-    const int mg = blockIdx.z % MG, mat = blockIdx.z / MG;
+    if ((int)blockIdx.y >= pg_nitems) return;
+    const int2 it = pg_items[blockIdx.y];
+    const int u = it.x, mg = it.y, mat = blockIdx.z;
     const int e = uids[u];
     if ((mat ? K2_1[e] : K2_0[e]) != K2) return;
     const half* X = mat ? X1 : X0;
@@ -2256,3 +2258,32 @@ TF_PG_KERNEL(2) TF_PG_KERNEL(3) TF_PG_KERNEL(4) TF_PG_KERNEL(5) TF_PG_KERNEL(6) 
 TF_PG_KERNEL(9) TF_PG_KERNEL(10) TF_PG_KERNEL(11) TF_PG_KERNEL(12) TF_PG_KERNEL(13) TF_PG_KERNEL(14) TF_PG_KERNEL(15)
 TF_PG_KERNEL(16)
 #undef TF_PG_KERNEL
+
+// One block of 1024: each expert item's member count (members come first, -1 after), its 64-member groups, a scan,
+// then the (item, group) list in item order.
+extern "C" __global__ void __launch_bounds__(1024) tf_exl3_prompt_items(const int* __restrict__ ucount,
+                                                                          const int* __restrict__ members, int maxm) {
+    __shared__ int sc[1024];
+    const int n = ucount[0], u = threadIdx.x;
+    int k = 0;
+    if (u < n) {
+        const int* row = members + (size_t)u * maxm;
+        int lo = 0, hi = maxm;                      // first -1
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (row[mid] >= 0) lo = mid + 1; else hi = mid;
+        }
+        k = (lo + 63) / 64;
+    }
+    sc[u] = k;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {
+        const int v = u >= off ? sc[u - off] : 0;
+        __syncthreads();
+        sc[u] += v;
+        __syncthreads();
+    }
+    const int start = sc[u] - k;
+    for (int j = 0; j < k; ++j) tf_fn_exl3::tf_exl3x::pg_items[start + j] = make_int2(u, j);
+    if (u == 1023) tf_fn_exl3::tf_exl3x::pg_nitems = sc[u];
+}
