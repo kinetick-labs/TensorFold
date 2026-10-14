@@ -116,7 +116,7 @@ pub const Prof = struct {
         try p.events[p.n - 1].synchronize();
         for (1..p.n) |i| {
             const ms = try cuda.Event.elapsedMs(p.events[i - 1], p.events[i]);
-            p.sums[@intFromBool(p.in_mtp[i])][@intFromEnum(p.labels[i])] += ms;
+            p.sums[@intFromBool(p.in_mtp[i])][@backingInt(p.labels[i])] += ms;
             if (p.in_mtp[i]) p.by_level[@min(p.levels[i], max_levels - 1)] += ms;
         }
         // keep the last event as the next interval's start
