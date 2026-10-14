@@ -546,6 +546,7 @@ pub const Kernels = struct {
     grouped_gm4: [3]?cuda.Function,
     /// the prompt arm (PR #212's prompt_kernel on the gm plan), one instance a k2 (index = k2): null when absent
     prompt: [17]?cuda.Function = @splat(null),
+    prompt_items: ?cuda.Function = null,
     dequant: [3]cuda.Function,
     /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
     wide_smem_max: u32,
@@ -584,6 +585,7 @@ pub const Kernels = struct {
         for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
         for (sym.grouped_gm4, 0..) |s, i| k.grouped_gm4[i] = k.module.function(s) catch null;
         k.prompt = @splat(null);
+        k.prompt_items = k.module.function("tf_exl3_prompt_items") catch null;
         inline for (2..17) |k2| k.prompt[k2] = k.module.function(std.fmt.comptimePrint("tf_exl3_prompt_k{d}", .{k2})) catch null;
         for (sym.grouped_async, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped_async[i][j] = k.module.function(s) catch null;
