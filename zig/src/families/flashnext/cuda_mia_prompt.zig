@@ -80,7 +80,6 @@ pub fn pleRows(t: tri.Tri, pk: u64, hb: u64, out: u64, rows: usize, words: usize
     try run(t, "_ple_rows", .{ rows, heads, 1 }, &.{ aot.ptr("PK", "*i16", pk), aot.ptr("HB", f16p, hb), aot.ptr("OUT", f16p, out) }, &.{ ci("WORDS", words), ci("KB", bits), ci("HEADS", heads), ci("DH", dh), ci("BLOCK", block), aot.cf("K_INV", k_inv), aot.cf("K_BIAS", k_bias) });
 }
 
-
 /// nvfp4.matmul's bits for m >= min_rows and split K (the shared expert's tables).
 pub fn fp4(t: tri.Tri, x: u64, x_stride: usize, fp: tri.Fp4, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
     const sk = tri.fp4SplitK(n, k);

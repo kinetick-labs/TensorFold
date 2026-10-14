@@ -306,9 +306,9 @@ const X3Scratch = struct {
         const dn = exl3.defaultTile(g.moe_width, g.hidden, false) catch exl3.glm_down;
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
         const sizes = [14]usize{
-            128 * kmax * 2,      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
-            P * g.hidden * 2,    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
-            4,                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
+            128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
+            P * g.hidden * 2,                    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
+            4,                                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
             @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
         };
         var total: usize = 0;
