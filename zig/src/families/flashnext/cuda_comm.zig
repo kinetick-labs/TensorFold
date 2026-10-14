@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 pub const Prefetch = roce.Prefetch;
 
 /// The control-link frame of the RoCE setup: one byte (1: opened) then the rank's connection blob.
-const roce_tag: link_mod.Tag = @enumFromInt(0x524f4345);
+const roce_tag: link_mod.Tag = @fromBackingInt(@intCast(0x524f4345));
 
 /// The RoCE all-gather, the L2 prefetch and the driver they were opened with (heap: Comm is copied by value).
 const Extra = struct { driver: cuda.Driver, r: ?roce.Roce = null, l2: ?roce.L2 = null, prefetch: bool = false };
