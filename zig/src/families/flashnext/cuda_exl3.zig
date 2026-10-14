@@ -544,6 +544,8 @@ pub const Kernels = struct {
     /// the staged gm arm's instances: null when the embedded fatbin predates them (opt-in, off by default)
     grouped_gm: [3]?cuda.Function,
     grouped_gm4: [3]?cuda.Function,
+    /// the prompt arm (PR #212's prompt_kernel on the gm plan), one instance a k2 (index = k2): null when absent
+    prompt: [17]?cuda.Function = @splat(null),
     dequant: [3]cuda.Function,
     /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
     wide_smem_max: u32,
@@ -581,6 +583,8 @@ pub const Kernels = struct {
         };
         for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
         for (sym.grouped_gm4, 0..) |s, i| k.grouped_gm4[i] = k.module.function(s) catch null;
+        k.prompt = @splat(null);
+        inline for (2..17) |k2| k.prompt[k2] = k.module.function(std.fmt.comptimePrint("tf_exl3_prompt_k{d}", .{k2})) catch null;
         for (sym.grouped_async, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped_async[i][j] = k.module.function(s) catch null;
         };
@@ -972,8 +976,57 @@ fn asyncOn() bool {
     return st.on;
 }
 
+/// Whether the prompt arm runs (TF_FLASHNEXT_X3_PROMPT, on by default; 0 turns it off).
+pub fn promptOn() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_PROMPT")) |e| std.mem.span(e) else null;
+    return if (v == null) true else wideFlag(v);
+}
+
+/// The grouped expert GEMM; returns the splits its Z holds for the epilogue: 1 when the prompt arm summed them in the
+/// kernel (the same order: sub-ranges of the gm arm, splits from 0.f), else `sk`.
+pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !usize {
+    const t = tile_settings[setting];
+    const lo = ranges[range].lo;
+    const hi = ranges[range].hi;
+    const kt = kk / 16;
+    const shape = sk > 0 and kt % sk == 0 and (kt / sk) % 4 == 0 and n % 64 == 0 and t.w == gm_subw;
+    if (p >= gm_min_picks and promptOn() and shape) {
+        var have = true;
+        for (k2s) |k2| {
+            if (k2 >= lo and k2 <= hi and k.prompt[k2] == null) have = false;
+        }
+        if (have) {
+            var a: cuda.Args = .{};
+            a.add(x0);
+            a.add(x1);
+            a.add(tp0);
+            a.add(tp1);
+            a.add(k2_0);
+            a.add(k2_1);
+            a.add(uids);
+            a.add(ucount);
+            a.add(members);
+            a.add(z);
+            a.add(int(kk));
+            a.add(int(n));
+            a.add(int(p));
+            a.add(int(sk));
+            a.add(int(maxm));
+            a.add(int(slots));
+            const mg = (maxm + 63) / 64;
+            for (k2s) |k2| {   // the pack's widths only (an empty program per expert of another width)
+                if (k2 < lo or k2 > hi) continue;
+                try cuda.launch.launch(k.prompt[k2].?, .{ .grid = .{ .x = @intCast(n / 64), .y = @intCast(experts), .z = @intCast(mats * mg) }, .block = .{ .x = 128 } }, s, &a);
+            }
+            return 1;
+        }
+    }
+    try groupedLaunch(k, setting, range, x0, x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, kk, n, p, sk, maxm, slots, experts, mats, s);
+    return sk;
+}
+
 /// The grouped expert GEMM: 16 members a program, or 32 in the wide arm (tf_exl3x, opt-in and off by default).
-pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
+pub fn groupedLaunch(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
     const t = tile_settings[setting];
     var a: cuda.Args = .{};
     a.add(x0);
