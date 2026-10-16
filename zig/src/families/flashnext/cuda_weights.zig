@@ -1143,11 +1143,22 @@ const Loader = struct {
         // the shared expert: bf16 rows [lo, hi) of gate and up (Python slices it by moe_width's bounds), down's columns
         // (the MTP layer's own width: INT4-AutoRound's healed main shared experts are wider than its MTP one)
         const sw = if (mtp and c.int4ar()) (try L.get(try L.nameOf("{s}.shared_expert.gate_proj.weight", .{name}))).dim(0) else c.shared_width;
-        const sg = try L.linear(try L.nameOf("{s}.shared_expert.gate_proj", .{name}), sw, d);
-        const su = try L.linear(try L.nameOf("{s}.shared_expert.up_proj", .{name}), sw, d);
-        const sdn = try L.linear(try L.nameOf("{s}.shared_expert.down_proj", .{name}), d, sw);
-        m.shared.gu = try L.fp4Table(try std.fmt.bufPrint(&pb, "{s}.experts.shared.gu", .{path}), &.{ sg, su }, lo, hi, null);
-        m.shared.down = try L.fp4Table(try std.fmt.bufPrint(&pb, "{s}.experts.shared.down", .{path}), &.{sdn}, 0, d, .{ lo / gs * gs, hi / gs * gs });
+        if (L.mx8 and !mtp and try L.isMx(try L.nameOf("{s}.shared_expert.gate_proj", .{name}))) {
+            // FP4-Local: the MXFP8 shared expert as stored, on the lane matmul's MXFP8 mode
+            const srows = [1][2]usize{.{ lo, hi }};
+            const gu8 = try L.mxFace(try std.fmt.bufPrint(&pb, "{s}.shared8.gu", .{path}), &.{
+                .{ .name = try L.nameOf("{s}.shared_expert.gate_proj", .{name}), .rows = &srows },
+                .{ .name = try L.nameOf("{s}.shared_expert.up_proj", .{name}), .rows = &srows },
+            });
+            const dn8 = try L.mxFace(try std.fmt.bufPrint(&pb, "{s}.shared8.down", .{path}), &.{.{ .name = try L.nameOf("{s}.shared_expert.down_proj", .{name}), .cols = .{ lo, hi } }});
+            m.shared8 = .{ .gu = gu8, .down = dn8, .width = @intCast(hi - lo) };
+        } else {
+            const sg = try L.linear(try L.nameOf("{s}.shared_expert.gate_proj", .{name}), sw, d);
+            const su = try L.linear(try L.nameOf("{s}.shared_expert.up_proj", .{name}), sw, d);
+            const sdn = try L.linear(try L.nameOf("{s}.shared_expert.down_proj", .{name}), d, sw);
+            m.shared.gu = try L.fp4Table(try std.fmt.bufPrint(&pb, "{s}.experts.shared.gu", .{path}), &.{ sg, su }, lo, hi, null);
+            m.shared.down = try L.fp4Table(try std.fmt.bufPrint(&pb, "{s}.experts.shared.down", .{path}), &.{sdn}, 0, d, .{ lo / gs * gs, hi / gs * gs });
+        }
 
         m.routed = .{ .count = e, .width = @intCast(ni), .dims = d };
         var b2: [192]u8 = undefined;
