@@ -522,6 +522,13 @@ pub const Config = struct {
         return self.quant == .gptq;
     }
 
+    /// FP4-Local's MXFP8 dense linears (ModelOpt MIXED_PRECISION with MXFP8 layers).
+    pub fn hasMxfp8(self: Config) bool {
+        const mo = self.modelopt orelse return false;
+        for (mo.layers) |l| if (l.algo == .mxfp8) return true;
+        return false;
+    }
+
     /// What the engine serves: the ModelOpt NVFP4 export (routed experts NVFP4 in groups of 16, the MTP experts
     /// FP8_PB_WO in 128 blocks, the n-gram table FP8, every other linear bf16); anything else is refused with a reason.
     pub fn check(self: Config, why: *Why) !void {
