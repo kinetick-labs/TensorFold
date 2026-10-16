@@ -198,6 +198,7 @@ pub fn geometry(c: *const cfgs.Config, world: u32, has_mtp: bool) !state.Geometr
         .world = world,
         .shared_width = sh.shared_width,
         .int4ar = c.int4ar(),
+        .mx8 = mx8Of(c),
         .mtp_top_k = mtpTopK(c.top_k),
     };
 }
