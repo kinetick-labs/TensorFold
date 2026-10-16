@@ -75,11 +75,12 @@ pub const Mtp = struct {
 };
 
 /// ModelOpt's per-module algorithms in quantized_layers.
-pub const Algo = enum { nvfp4, fp8, fp8_pb_wo, other };
+pub const Algo = enum { nvfp4, w4a16_nvfp4, mxfp8, fp8, fp8_pb_wo, other };
 
 pub const Spec = struct { bits: u32, kind: []const u8, group: ?u32, dynamic: bool };
 pub const Group = struct { name: []const u8, targets: []const []const u8, weights: ?Spec, inputs: ?Spec };
-pub const QuantizedLayer = struct { name: []const u8, algo: Algo, algo_name: []const u8, group: ?u32 };
+/// `csf`: weight_scale_encoding "csf" (the scales ship as lossless byte-window planes, core.nvfp4_csf)
+pub const QuantizedLayer = struct { name: []const u8, algo: Algo, algo_name: []const u8, group: ?u32, csf: bool = false };
 
 /// quantization_config of a ModelOpt export (quant_method "modelopt").
 pub const ModelOpt = struct {
@@ -547,16 +548,21 @@ pub const Config = struct {
         }
         for (mo.layers) |l| {
             const experts = std.mem.endsWith(u8, l.name, ".mlp.experts");
-            const ok = if (std.mem.startsWith(u8, l.name, "mtp.") and experts)
-                l.algo == .fp8_pb_wo and (l.group orelse 128) == 128
+            const nv16 = (l.group orelse 16) == 16;
+            const ok = if (std.mem.startsWith(u8, l.name, "model.visual."))
+                true // the vision tower runs in the Python helper, never in this engine
+            else if (std.mem.startsWith(u8, l.name, "mtp.") and experts)
+                (l.algo == .fp8_pb_wo and (l.group orelse 128) == 128) or ((l.algo == .w4a16_nvfp4 or l.algo == .nvfp4) and nv16 and !l.csf)
             else if (experts)
-                l.algo == .nvfp4 and (l.group orelse 16) == 16
+                l.algo == .nvfp4 and nv16
             else if (std.mem.endsWith(u8, l.name, ".ngram_embedding"))
-                l.algo == .fp8
+                l.algo == .fp8 or (l.algo == .nvfp4 and nv16 and !l.csf)
+            else if (isMxfp8Linear(l.name))
+                l.algo == .mxfp8 and (l.group orelse 32) == 32
             else
                 false;
             if (!ok) {
-                why.set("ModelOpt quantizes {s} as {s}; the engine reads NVFP4 routed experts, FP8_PB_WO MTP experts and an FP8 n-gram table, the rest bf16", .{ l.name, l.algo_name });
+                why.set("ModelOpt quantizes {s} as {s}; the engine reads NVFP4 routed experts (CSF scales too), FP8_PB_WO or NVFP4 MTP experts, an FP8 or NVFP4 n-gram table and MXFP8 attention/DeltaNet/shared-expert linears, the rest bf16", .{ l.name, l.algo_name });
                 return error.UnsupportedQuantization;
             }
         }
@@ -724,8 +730,18 @@ fn ids(v: ?Value, out: *std.ArrayList(i64), a: std.mem.Allocator) !void {
     }
 }
 
+/// The linears FP4-Local ships as MXFP8 (the loader widens them to bf16 exactly).
+fn isMxfp8Linear(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "model.language_model.layers.") and !std.mem.startsWith(u8, name, "mtp.layers.")) return false;
+    const tails = [_][]const u8{ ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.o_proj", ".self_attn.indexer.index_qk_proj", ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z", ".linear_attn.in_proj_a", ".linear_attn.in_proj_b", ".linear_attn.out_proj", ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj", ".mlp.shared_expert.down_proj" };
+    for (tails) |t| if (std.mem.endsWith(u8, name, t)) return true;
+    return false;
+}
+
 fn algoOf(name: []const u8) Algo {
     if (std.ascii.eqlIgnoreCase(name, "NVFP4")) return .nvfp4;
+    if (std.ascii.eqlIgnoreCase(name, "W4A16_NVFP4")) return .w4a16_nvfp4;
+    if (std.ascii.eqlIgnoreCase(name, "MXFP8")) return .mxfp8;
     if (std.ascii.eqlIgnoreCase(name, "FP8")) return .fp8;
     if (std.ascii.eqlIgnoreCase(name, "FP8_PB_WO")) return .fp8_pb_wo;
     return .other;
@@ -760,7 +776,9 @@ fn modelOpt(a: std.mem.Allocator, q: Obj) !ModelOpt {
             if (kv.value_ptr.* != .object) return error.BadConfig;
             const l = kv.value_ptr.object;
             const name = try str(a, l, "quant_algo");
-            try layers.append(a, .{ .name = try a.dupe(u8, kv.key_ptr.*), .algo = algoOf(name), .algo_name = name, .group = if (field(l, "group_size")) |g| @as(u32, @intCast(try integer(g))) else null });
+            const enc = if (field(l, "weight_scale_encoding")) |v| (if (v == .string) v.string else "") else "";
+            if (enc.len != 0 and !std.mem.eql(u8, enc, "csf")) return error.BadConfig;
+            try layers.append(a, .{ .name = try a.dupe(u8, kv.key_ptr.*), .algo = algoOf(name), .algo_name = name, .group = if (field(l, "group_size")) |g| @as(u32, @intCast(try integer(g))) else null, .csf = enc.len != 0 });
         }
     }
     var ignore: std.ArrayList([]const u8) = .empty;
@@ -1421,4 +1439,29 @@ test "checkExl3 refuses a codebook it does not read, a fractional head width and
     c.moe_width = 600;
     try std.testing.expectError(error.UnsupportedModel, c.check(&why));
     try std.testing.expect(std.mem.indexOf(u8, why.text(), "EXL3 blocks") != null);
+}
+
+test "nvidia/Qwen3.8-Flash-Next-FP4-Local's config.json is admitted (CSF experts, MXFP8 linears, NVFP4 MTP and n-gram)" {
+    var why: Why = .{};
+    var c = try parse(std.testing.allocator, @embedFile("fixtures_cuda_config_fp4local.json"), fixture_generation, .{}, &why);
+    defer c.deinit();
+    try c.check(&why);
+    var csf: usize = 0;
+    var mx: usize = 0;
+    for (c.modelopt.?.layers) |l| {
+        if (l.csf) csf += 1;
+        if (l.algo == .mxfp8) mx += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 48), csf);
+    try std.testing.expectEqual(@as(usize, 438), mx);
+}
+
+test "an unknown weight_scale_encoding is refused" {
+    var why: Why = .{};
+    const cfg =
+        \\{"model_type": "qwen4_exp", "text_config": {"model_type": "qwen4_exp_text"},
+        \\ "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+        \\  "quantized_layers": {"model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16, "weight_scale_encoding": "zstd"}}}}
+    ;
+    try std.testing.expectError(error.BadConfig, parse(std.testing.allocator, cfg, fixture_generation, .{}, &why));
 }
