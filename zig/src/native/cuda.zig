@@ -503,8 +503,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         h.slide_free.?(gpa, s);
         gpa.free(h.dir);
     };
+    // image and video rows: a family that takes them (F.media), served with --vision (its helper started)
+    const takes_media = comptime @hasDecl(F, "media") and F.media;
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .warm_turns = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null }, if (@hasDecl(F, "explain")) .{ .ctx = loaded.ctx, .text = F.explain } else null);
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .warm_turns = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null, .media = takes_media and o.vision }, if (@hasDecl(F, "explain")) .{ .ctx = loaded.ctx, .text = F.explain } else null);
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = if (h.follow_fn != null) Host.follow else null };
 }
