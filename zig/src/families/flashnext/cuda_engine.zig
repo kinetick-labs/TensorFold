@@ -1292,6 +1292,12 @@ pub const Engine = struct {
     }
 
     fn drawRows(e: *Engine, logits_base: u64, cand_all: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, out: []u32) !void {
+        try e.drawRowsRaw(logits_base, cand_all, total, row0, rows, first_position, s, out);
+        if (envGet("TF_FLASHNEXT_FORCE")) |path| try e.forceRows(path, first_position, out[0..rows]);
+        if (envGet("TF_FLASHNEXT_LOGIT_DUMP")) |path| try e.dumpRows(path, logits_base, row0, rows, first_position, out);
+    }
+
+    fn drawRowsRaw(e: *Engine, logits_base: u64, cand_all: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, out: []u32) !void {
         const V = e.g.head_n;
         if (rows > state.max_rows) return error.WindowPastRows;
         const logits = logits_base + row0 * V * 2;
@@ -1383,8 +1389,6 @@ pub const Engine = struct {
             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
         }
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
-        if (envGet("TF_FLASHNEXT_FORCE")) |path| try e.forceRows(path, sg.seq.st.pos + 1, out[0 .. sg.a1 - sg.a0]);
-        if (envGet("TF_FLASHNEXT_LOGIT_DUMP")) |path| try e.dumpRows(path, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, out);
     }
 
     /// TF_FLASHNEXT_FORCE=path (diagnostics): "pos token" lines, read again each window; a row at a listed position
@@ -1412,7 +1416,7 @@ pub const Engine = struct {
 
     /// TF_FLASHNEXT_LOGIT_DUMP=path (diagnostics, one GPU): per window row a line "pos sampled lse id:logit x20" (the
     /// head's raw logits, best 20). A later line for a position replaces an earlier one (rejected drafts' rows).
-    fn dumpRows(e: *Engine, path: []const u8, row0: usize, rows: usize, first_position: u64, out: []const u32) !void {
+    fn dumpRows(e: *Engine, path: []const u8, logits_base: u64, row0: usize, rows: usize, first_position: u64, out: []const u32) !void {
         if (e.world > 1) return;
         const V = e.g.head_n;
         if (dump_file == null) {
@@ -1422,7 +1426,7 @@ pub const Engine = struct {
         }
         const host = try e.gpa.alloc(u16, rows * V);
         defer e.gpa.free(host);
-        try e.read(e.buf.b.logits + row0 * V * 2, std.mem.sliceAsBytes(host));
+        try e.read(logits_base + row0 * V * 2, std.mem.sliceAsBytes(host));
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(e.gpa);
         for (0..rows) |r| {
