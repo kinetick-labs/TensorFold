@@ -193,6 +193,7 @@ pub fn geometry(c: *const cfgs.Config, world: u32, has_mtp: bool) !state.Geometr
         .world = world,
         .shared_width = sh.shared_width,
         .int4ar = c.int4ar(),
+        .mx8 = mx8Of(c),
         .mtp_top_k = mtpTopK(c.top_k),
     };
 }
@@ -257,6 +258,11 @@ fn streamWithPriority(d: *const cuda.Driver, priority: c_int) !cuda.Stream {
 
 fn envGet(name: [:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
+}
+
+/// TF_FLASHNEXT_MXFP8 (default on): FP4-Local's MXFP8 mixers natively (0: widened to bf16, the same values).
+fn mx8Of(c: *const cfgs.Config) bool {
+    return c.hasMxfp8() and !envOff("TF_FLASHNEXT_MXFP8");
 }
 
 fn envOff(name: [:0]const u8) bool {
@@ -403,7 +409,7 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
+        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay, .mxfp8 = mx8Of(&e.c) });
         errdefer e.w.deinit();
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
@@ -441,7 +447,10 @@ pub const Engine = struct {
         e.f.comm = o.comm;
         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
         try e.f.initRound(rows, @max(1, o.streams));
-        if (e.c.int4ar()) {
+        if (mx8Of(&e.c)) {
+            e.k8 = try fp8.Kernels.load(ctx);
+            e.f.k8 = &e.k8.?;
+        } else if (e.c.int4ar()) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.k4 = try int4.Kernels.load(ctx);
             e.f.k8 = &e.k8.?;
