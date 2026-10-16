@@ -2105,7 +2105,23 @@ pub const Forward = struct {
         const gu = m.shared.gu;
         const dn = m.shared.down;
         const shared_act = act + top * ni * 2;
-        if (f.side) |sd| {
+        // FP4-Local's MXFP8 shared expert (m.shared8): the same steps on the lane matmul's MXFP8 mode
+        const sh8 = m.shared8;
+        if (sh8 != null and sh8.?.width != ni) return error.ExpertShape;
+        if (sh8) |sh| {
+            const k8 = f.k8 orelse return error.NoFp8Kernels;
+            if (f.side) |sd| {
+                try sd.fork.record(f.s);
+                try sd.s.wait(sd.fork);
+                var th2 = f.th;
+                th2.s = sd.s;
+                try fp8.matmul(k8, sd.s, xin, D, sh.gu, f.sc.shared_g, false, R);
+                try th2.sharedSwiglu(f.sc.shared_g, shared_act, R, ni, slots * ni);
+                try fp8.matmul(k8, sd.s, shared_act, slots * ni, sh.down, f.sc.shared_y, x.y_f32, R);
+                try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+                try sd.join.record(sd.s);
+            }
+        } else if (f.side) |sd| {
             // the shared expert on the side stream: its slot of moe_act and moe_y, which the routed kernels skip
             try sd.fork.record(f.s);
             try sd.s.wait(sd.fork);
@@ -2121,7 +2137,13 @@ pub const Forward = struct {
         }
         if (gu_px) |q| try q.gateUp(f.s, xin, D, ex, plan, slots, E + 1, act, R, skip) else try f.ops.nvfp4GateUp(xin, D, ex, plan, slots, E + 1, act, R, skip);
         try f.mark(.experts_gate_up);
-        if (f.side == null) {
+        if (f.side == null) if (sh8) |sh| {
+            try fp8.matmul(f.k8.?, f.s, xin, D, sh.gu, f.sc.shared_g, false, R);
+            try f.mark(.shared_gate_up);
+            try f.th.sharedSwiglu(f.sc.shared_g, shared_act, R, ni, slots * ni);
+            try f.mark(.shared_swiglu);
+        };
+        if (f.side == null and sh8 == null) {
             try f.fp4At(.shared_gate_up, xin, D, .{ .weight = gu.weight, .scale = gu.scale, .scale2 = gu.scale2 }, f.sc.shared_g, false, R, gu.n, gu.k);
             try f.th.sharedSwiglu(f.sc.shared_g, shared_act, R, ni, slots * ni);
             try f.mark(.shared_swiglu);
@@ -2134,6 +2156,11 @@ pub const Forward = struct {
         if (f.side) |sd| {
             try f.s.wait(sd.join);
             try f.mark(.shared_down);
+        } else if (sh8) |sh| {
+            try fp8.matmul(f.k8.?, f.s, shared_act, slots * ni, sh.down, f.sc.shared_y, x.y_f32, R);
+            try f.mark(.shared_down);
+            try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+            try f.mark(.slot_copy);
         } else {
             try f.fp4At(.shared_down, shared_act, slots * ni, .{ .weight = dn.weight, .scale = dn.scale, .scale2 = dn.scale2 }, f.sc.shared_y, x.y_f32, R, dn.n, dn.k);
             try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
