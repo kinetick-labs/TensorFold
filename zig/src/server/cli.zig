@@ -49,11 +49,12 @@ pub const flags = [_]Flag{
     .{ .name = "--api-key-file", .native = true },
     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
     .{ .name = "--dashboard", .kind = .store_true, .native = true },
-    .{ .name = "--vision", .kind = .store_true },
-    .{ .name = "--vision-urls", .kind = .store_true },
+    .{ .name = "--vision", .kind = .store_true, .native = true },
+    .{ .name = "--vision-urls", .kind = .store_true, .native = true },
     .{ .name = "--vision-offload", .kind = .store_true },
-    .{ .name = "--vision-max-images" },
-    .{ .name = "--vision-image-tokens" },
+    .{ .name = "--vision-max-images", .native = true },
+    .{ .name = "--vision-max-videos", .native = true },
+    .{ .name = "--vision-image-tokens", .native = true },
     .{ .name = "--context", .native = true },
     .{ .name = "--speed-up", .native = !cuda_build },
     .{ .name = "--max-tokens", .native = true },
@@ -99,7 +100,8 @@ pub const flags = [_]Flag{
     .{ .name = "--master-port", .native = served("--tp") },
     // the GPU engine's policy switches as key=value pairs, repeatable
     .{ .name = "--policy", .kind = .append, .native = served("--policy") },
-    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" } },
+    // fp8 joins the bf16/int8/int4 formats: the CUDA Flash Next engine serves bf16 and fp8 KV caches
+    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4", "fp8" }, .native = cuda_build, .native_values = &.{ "bf16", "fp8" } },
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
     .{ .name = "--precision", .choices = &.{ "checkpoint", "full" } },
@@ -170,6 +172,14 @@ pub const Args = struct {
     master_port: u16 = 29551,
     policy: []const u8 = "", // every --policy joined by commas
     cortheon: bool = false, // Cortheon's program, research before building, and cortheon_search/cortheon_fetch run by the server
+    // --vision: image and video input (a helper process runs Python TensorFold's frontend and tower)
+    vision: bool = false,
+    vision_urls: bool = false,
+    vision_max_images: ?i64 = null,
+    vision_max_videos: ?i64 = null,
+    vision_image_tokens: ?i64 = null,
+    // the attention caches' format: bf16 (exact, the default) or fp8 (e4m3 rows, about half the bytes)
+    kv_dtype: []const u8 = "bf16",
 };
 
 /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
@@ -221,6 +231,21 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
     try ranks(u, a, out);
+    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other rank", .{out.tp});
+    // serve_options.check: the image options need --vision
+    if (out.vision_urls and !out.vision) return fail(u, a, "--vision-urls needs --vision", .{});
+    if (out.vision_max_images) |n| {
+        if (n < 1 or n > 256) return fail(u, a, "--vision-max-images must be a positive integer (at most 256)", .{});
+        if (!out.vision) return fail(u, a, "--vision-max-images needs --vision", .{});
+    }
+    if (out.vision_max_videos) |n| {
+        if (n < 1 or n > 64) return fail(u, a, "--vision-max-videos must be a positive integer (at most 64)", .{});
+        if (!out.vision) return fail(u, a, "--vision-max-videos needs --vision", .{});
+    }
+    if (out.vision_image_tokens) |n| {
+        if (n < 1 or n > 65536) return fail(u, a, "--vision-image-tokens is a number of tokens from 1 to 65,536", .{});
+        if (!out.vision) return fail(u, a, "--vision-image-tokens needs --vision", .{});
+    }
     out.alias = alias.items;
     out.api_key = keys.items;
     return out;
@@ -275,7 +300,11 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const n = try int(u, a, name, v);
         if (n < 0) return fail(u, a, "argument --compact-keep: expected a token count from 0: '{s}'", .{v});
         out.compact_keep = @intCast(n);
-    } else if (is(name, "--compact-memory")) out.compact_memory = v else if (is(name, "--slide")) out.slide = true else if (is(name, "--slide-graph")) out.slide_graph = v else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v else if (is(name, "--cortheon")) out.cortheon = true;
+    } else if (is(name, "--compact-memory")) out.compact_memory = v else if (is(name, "--slide")) out.slide = true else if (is(name, "--slide-graph")) out.slide_graph = v else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v else if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--rank")) out.rank = @intCast(try int(u, a, name, v)) else if (is(name, "--master")) out.master = v else if (is(name, "--vision")) out.vision = true else if (is(name, "--vision-urls")) out.vision_urls = true else if (is(name, "--vision-max-images")) out.vision_max_images = try int(u, a, name, v) else if (is(name, "--vision-max-videos")) out.vision_max_videos = try int(u, a, name, v) else if (is(name, "--vision-image-tokens")) out.vision_image_tokens = try int(u, a, name, v) else if (is(name, "--kv-dtype")) out.kv_dtype = v else if (is(name, "--cortheon")) out.cortheon = true else if (is(name, "--master-port")) {
+        const p = try int(u, a, name, v);
+        if (p <= 0 or p > 65535) return fail(u, a, "argument --master-port: invalid port: '{s}'", .{v});
+        out.master_port = @intCast(p);
+    }
 }
 
 /// The CUDA build's --device and --segments; false for any other flag.
@@ -367,6 +396,8 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .master = args.master,
         .master_port = args.master_port,
         .policy = args.policy,
+        .vision = args.vision,
+        .kv_dtype = args.kv_dtype,
     };
 }
 
@@ -422,6 +453,17 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqualStrings("x", (try parse(a, &.{ "m", "--drafter", "x" }, &u)).drafter.?);
     try std.testing.expectEqual(@as(u8, 0), (try parse(a, &.{ "m", "--drafter-bits", "0" }, &u)).drafter_bits);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-bits", "8" }, &u));
+    // two-rank options: only where the backend's `serves` advertises them (native/cuda.zig lists --tp and friends)
+    if (servedBy(native_serves, "--tp")) {
+        const two = try parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1", "--master-port", "29551" }, &u);
+        try std.testing.expectEqual(@as(u32, 2), two.tp);
+        try std.testing.expectEqual(@as(u32, 1), two.rank);
+        try std.testing.expectEqualStrings("10.0.22.1", two.master);
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2" }, &u)); // no --master
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--rank", "1" }, &u)); // rank 1 of 1
+    } else {
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1" }, &u));
+    }
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);

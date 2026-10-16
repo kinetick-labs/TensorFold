@@ -97,6 +97,45 @@ pub const Held = struct {
     parents: ?[]i32 = null,
 };
 
+/// A prompt's images and video frames as the vision frontend prepared them (Python's EncodedVision): the prompt
+/// rows the visual features replace (ascending), each prompt row's three rotary positions (t, h, w: [n, 3] row
+/// major, i32), the decode offset (text after the prompt rotates at its position + delta) and the features
+/// (bf16 [rows.len, width]). A prompt with media prefills from its start and keeps no prefix states.
+pub const Media = struct {
+    rows: []const u32,
+    positions: []const i32,
+    delta: i64,
+    features: []const u8,
+    width: u32,
+    /// a following rank's copy (two ranks): the feature rows' count only; rows, positions and features arrive by
+    /// rank 0's broadcast (they never ride the control link)
+    follower_rows: u32 = 0,
+
+    pub fn rowCount(m: *const Media) usize {
+        return if (m.follower_rows > 0) m.follower_rows else m.rows.len;
+    }
+
+    pub fn featureBytes(m: *const Media) usize {
+        return m.rowCount() * @as(usize, m.width) * 2;
+    }
+
+    pub fn check(m: *const Media, prompt_len: usize) error{BadMedia}!void {
+        if (m.follower_rows > 0) {
+            if (m.rows.len != 0 or m.positions.len != 0 or m.features.len != 0 or m.width == 0 or m.follower_rows > prompt_len) return error.BadMedia;
+            return;
+        }
+        if (m.rows.len == 0 or m.positions.len != 3 * prompt_len or m.width == 0) return error.BadMedia;
+        // a following rank's copy carries no features (they arrive by broadcast)
+        if (m.features.len != 0 and m.features.len != m.featureBytes()) return error.BadMedia;
+        var last: ?u32 = null;
+        for (m.rows) |r| {
+            if (r >= prompt_len or (last != null and r <= last.?)) return error.BadMedia;
+            last = r;
+        }
+        for (m.positions) |p| if (p < 0) return error.BadMedia;
+    }
+};
+
 pub const Spec = struct {
     id: []const u8,
     prompt: []const u32,
@@ -123,6 +162,8 @@ pub const Spec = struct {
     prompt_logprobs: ?u8 = null, // and for each prompt token after the first, with ranks (the prompt pass starts at 0)
     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
+    /// the prompt's images and video frames (null: text); a prompt with media prefills from its start
+    media: ?*const Media = null,
 };
 
 pub const Stream = struct {
@@ -155,6 +196,8 @@ pub const Stream = struct {
     decode_spans: []const [2]u32 = &.{},
     decide: ?u32 = null,
     untaught: bool = false,
+    /// the prompt's images and video frames (null: text); valid until the stream is released
+    media: ?*const Media = null,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
@@ -216,6 +259,7 @@ pub const Stream = struct {
             .prompt_logprobs = spec.prompt_logprobs,
             .grammar = spec.grammar,
             .decode_spans = spec.decode_spans,
+            .media = spec.media,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
@@ -446,4 +490,19 @@ test "loop guard fires, closes thinking, and latches once" {
     try std.testing.expect(!s.finished and s.force.items.len == 0);
     _ = try s.commit(gpa, &.{8}, &.{});
     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+}
+
+test "media rows, positions and features must cover the prompt" {
+    const feats: [16]u8 = @splat(0);
+    const pos: [15]i32 = @splat(0);
+    var m: Media = .{ .rows = &.{ 1, 2 }, .positions = &pos, .delta = -1, .features = &feats, .width = 4 };
+    try m.check(5);
+    try std.testing.expectError(error.BadMedia, m.check(4)); // positions of another prompt
+    m.rows = &.{ 2, 1 };
+    try std.testing.expectError(error.BadMedia, m.check(5)); // rows out of order
+    m.rows = &.{ 1, 2 };
+    m.features = &.{}; // a following rank: no features (they arrive by broadcast)
+    try m.check(5);
+    m.features = feats[0..8];
+    try std.testing.expectError(error.BadMedia, m.check(5));
 }
