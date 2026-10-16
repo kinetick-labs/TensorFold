@@ -474,6 +474,7 @@ fn elemF32(t: Tensor, i: usize) f32 {
     return switch (t.dtype) {
         .bf16 => lay.bf16ToF32(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)),
         .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)))),
+        .f32 => @bitCast(std.mem.readInt(u32, t.bytes[4 * i ..][0..4], .little)),
         else => unreachable,
     };
 }
@@ -804,6 +805,13 @@ const Loader = struct {
     }
 
     /// `expect` for a plain weight shipped as bf16 or fp16 (Python's bf16 linears; a real pack stores them fp16).
+    /// A norm vector read as fp32 by the engine: bf16, fp16, or fp32 as stored (FP4-Local keeps 100 norms fp32).
+    fn expectNorm(L: *Loader, name: []const u8, shape: []const usize) !Tensor {
+        const t = try L.get(name);
+        if (t.dtype == .f32 and t.rank == shape.len and std.mem.eql(usize, t.shape[0..t.rank], shape)) return t;
+        return L.expectBf16OrF16(name, shape);
+    }
+
     fn expectBf16OrF16(L: *Loader, name: []const u8, shape: []const usize) !Tensor {
         const t = try L.get(name);
         if ((t.dtype != .bf16 and t.dtype != .f16) or t.rank != shape.len or !std.mem.eql(usize, t.shape[0..t.rank], shape)) {
@@ -881,7 +889,7 @@ const Loader = struct {
     /// cscale, then with `rotated` YaRN's attention factor folded into the rotary dims (cuda_rope.foldGamma: the
     /// patched Python's q_scale, k_scale, iq_scale and ik_scale; a no-op without YaRN).
     fn cscaleRope(L: *Loader, path: []const u8, name: []const u8, n: usize, rotated: bool) !u64 {
-        const t = try L.expectBf16OrF16(name, &.{n});
+        const t = try L.expectNorm(name, &.{n});
         const host: []f32 = @alignCast(std.mem.bytesAsSlice(f32, try L.staging(n * 4)));
         for (host, 0..) |*h, i| {
             const v = elemF32(t, i);
@@ -893,7 +901,7 @@ const Loader = struct {
 
     /// `.float()` of a bf16 or fp16 vector's elements [lo, hi).
     fn widen(L: *Loader, path: []const u8, t: Tensor, lo: usize, hi: usize) !u64 {
-        if (t.dtype != .bf16 and t.dtype != .f16) return error.UnexpectedTensor;
+        if (t.dtype != .bf16 and t.dtype != .f16 and t.dtype != .f32) return error.UnexpectedTensor;
         const host = std.mem.bytesAsSlice(f32, try L.staging((hi - lo) * 4));
         for (host, lo..) |*h, i| h.* = elemF32(t, i);
         return L.out.whole(path, "float32", &.{hi - lo}, L.host.items);
@@ -2119,7 +2127,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     // norms_around_one over every layer's attn hyper-connection norm
     var means: [cfgs.max_layers]f64 = undefined;
     for (0..c.layers) |i| {
-        const t = try L.expectBf16OrF16(try L.nameOf("{s}layers.{d}.attn_hyper_connection.hc_norm.weight", .{ L.mbase, i }), &.{c.streams * c.hidden});
+        const t = try L.expectNorm(try L.nameOf("{s}layers.{d}.attn_hyper_connection.hc_norm.weight", .{ L.mbase, i }), &.{c.streams * c.hidden});
         var sum: f64 = 0;
         for (0..t.numel()) |j| sum += elemF32(t, j);
         means[i] = sum / @as(f64, @floatFromInt(t.numel()));
