@@ -1692,7 +1692,7 @@ pub const Forward = struct {
     fn pleBlock(f: *Forward, p: *const W.Ple, segs: []const Seg, x: *const Bufs, R: usize) !void {
         const b = &x.b;
         const g = f.g;
-        const scale: f32 = if (f.w.table) |t| (if (t.fp8) 1.0 else t.scale) else 1.0;
+        const scale: f32 = if (f.w.table) |t| (if (t.fp8 or t.nvfp4 != null) 1.0 else t.scale) else 1.0;
         const table = f.w.table.?;
         if (table.exl3 != null) {
             // EXL3: `stage` gathered and decoded the rows into b.ple_emb on the host (Python exl3_mm.ple_rows)
