@@ -1383,6 +1383,56 @@ pub const Engine = struct {
             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
         }
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
+        if (envGet("TF_FLASHNEXT_LOGIT_DUMP")) |path| try e.dumpRows(path, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, out);
+    }
+
+    var dump_file: ?*std.c.FILE = null;
+    extern "c" fn fflush(f: *std.c.FILE) c_int;
+    const c_fflush = fflush;
+
+    /// TF_FLASHNEXT_LOGIT_DUMP=path (diagnostics, one GPU): per window row a line "pos sampled lse id:logit x20" (the
+    /// head's raw logits, best 20). A later line for a position replaces an earlier one (rejected drafts' rows).
+    fn dumpRows(e: *Engine, path: []const u8, row0: usize, rows: usize, first_position: u64, out: []const u32) !void {
+        if (e.world > 1) return;
+        const V = e.g.head_n;
+        if (dump_file == null) {
+            var pb: [512]u8 = undefined;
+            const z = try std.fmt.bufPrintSentinel(&pb, "{s}", .{path}, 0);
+            dump_file = std.c.fopen(z, "a") orelse return error.DumpOpen;
+        }
+        const host = try e.gpa.alloc(u16, rows * V);
+        defer e.gpa.free(host);
+        try e.read(e.buf.b.logits + row0 * V * 2, std.mem.sliceAsBytes(host));
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(e.gpa);
+        for (0..rows) |r| {
+            const row = host[r * V ..][0..V];
+            var mx: f32 = -std.math.inf(f32);
+            for (row) |v| mx = @max(mx, @as(f32, @bitCast(@as(u32, v) << 16)));
+            var sum: f64 = 0;
+            for (row) |v| sum += @exp(@as(f64, @as(f32, @bitCast(@as(u32, v) << 16)) - mx));
+            const lse: f64 = @as(f64, mx) + @log(sum);
+            var ids: [20]u32 = undefined;
+            var vals: [20]f32 = @splat(-std.math.inf(f32));
+            for (row, 0..) |v, id| {
+                const x: f32 = @bitCast(@as(u32, v) << 16);
+                if (x <= vals[19]) continue;
+                var j: usize = 19;
+                while (j > 0 and vals[j - 1] < x) : (j -= 1) {
+                    vals[j] = vals[j - 1];
+                    ids[j] = ids[j - 1];
+                }
+                vals[j] = x;
+                ids[j] = @intCast(id);
+            }
+            line.clearRetainingCapacity();
+            var nb: [64]u8 = undefined;
+            try line.appendSlice(e.gpa, try std.fmt.bufPrint(&nb, "{d} {d} {d:.6}", .{ first_position + r, out[r], lse }));
+            for (ids, vals) |id, v| try line.appendSlice(e.gpa, try std.fmt.bufPrint(&nb, " {d}:{d:.5}", .{ id, v }));
+            try line.append(e.gpa, '\n');
+            _ = std.c.fwrite(line.items.ptr, 1, line.items.len, dump_file.?);
+        }
+        _ = c_fflush(dump_file.?);
     }
 
     /// Keep window `i`'s first `keep` rows (its stream's commit, at its rows of the shared window).
