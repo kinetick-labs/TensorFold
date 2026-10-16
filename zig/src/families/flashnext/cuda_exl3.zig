@@ -249,7 +249,7 @@ pub fn linearBlock(wk: usize) usize {
 }
 
 pub fn linearShared(wk: usize, rows: usize) usize {
-    return wk * @min(rows, 8) * 128 * @sizeOf(f32);
+    return wk * @min(rows, 8) * 136 * @sizeOf(f32); // red rows padded to 136 floats (fn_exl3.cu TF_LIN_LDR)
 }
 
 /// unpack_kernel (linear.cu:269): grid (N/16, K/16), block 32; one warp a tile.
@@ -257,21 +257,41 @@ pub fn unpackGrid(k: usize, n: usize) [2]usize {
     return .{ n / 16, k / 16 };
 }
 
-/// group_kernel (experts.cu:19): 1 block of GROUP_THREADS, R*slots*4 dynamic bytes (lifted past 48 KiB when large).
-pub const group_threads: usize = 1024;
+/// Picks per histogram tile. group_hist_kernel / group_scatter_kernel use the same constant.
+pub const group_tile: usize = 1024;
 
-pub fn groupShared(rows: usize, slots: usize) usize {
-    return rows * slots * @sizeOf(c_int);
+pub fn groupTiles(n: usize) usize {
+    if (n == 0) return 0;
+    return (n + group_tile - 1) / group_tile;
 }
 
-/// The largest window the grouping buffer fits: groupShared(rows, slots) <= k.group_smem_max, never below 128.
-pub fn groupWindowMax(k: *const Kernels, slots: usize) usize {
-    return @max(@as(usize, k.group_smem_max) / groupShared(1, slots), 128);
+/// Workspace ints: hist[tiles, experts], totals[experts], place[experts].
+pub fn groupWorkspaceInts(n: usize, experts: usize) usize {
+    return groupTiles(n) * experts + 2 * experts;
 }
 
-/// gateup_epilogue_kernel (experts.cu:116) and down_epilogue_kernel (:161): grid (rows*slots, width/128), block 32.
+pub fn groupWorkspaceBytes(rows: usize, slots: usize, experts: usize) usize {
+    return groupWorkspaceInts(rows * slots, experts) * @sizeOf(i32);
+}
+
+/// Warps in a gate/up or down epilogue block: each warp is one pick, the same fwht and split sum as a block of 32.
+pub const epilogue_warps: usize = 4;
+/// Picks below this run one warp a block (decode / verify): more blocks, the 32-thread launch shape.
+pub const epilogue_wide_min: usize = 256;
+
+pub fn epilogueWarps(p: usize) usize {
+    return if (p >= epilogue_wide_min) epilogue_warps else 1;
+}
+
+/// gateup_epilogue_kernel and down_epilogue_kernel: grid (ceil(rows*slots/w), width/128), block 32*w.
 pub fn epilogueGrid(rows: usize, slots: usize, width: usize) [2]usize {
-    return .{ rows * slots, width / 128 };
+    const p = rows * slots;
+    const w = epilogueWarps(p);
+    return .{ (p + w - 1) / w, width / 128 };
+}
+
+pub fn epilogueBlock(rows: usize, slots: usize) usize {
+    return epilogueWarps(rows * slots) * 32;
 }
 
 /// combine_kernel (experts.cu:183): grid (rows, ceil(D/256)), block 256.
@@ -348,19 +368,19 @@ pub const sym = struct {
     /// tf_exl3_lin (linear.cu): [k2: 8, 10, 12][WK: 2, 4, 8]
     pub const linear = [3][3][:0]const u8{
         .{
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi8ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi10ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
-            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi2EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi4EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
+            "_ZN10tf_fn_exl311tf_exl3_lin13linear_kernelILi12ELi2ELi8EEEvPK6__halfPKjxxS4_S4_PviPfPiiiiii",
         },
     };
     /// tf_exl3_lin: the width's dequantize-to-dense
@@ -376,11 +396,15 @@ pub const sym = struct {
         "_ZN10tf_fn_exl311tf_exl3_exp13rot_in_kernelI13__nv_bfloat16EEvPKT_iPKiPK6__halfSA_PS8_SB_iii",
         "_ZN10tf_fn_exl311tf_exl3_exp13rot_in_kernelI6__halfEEvPKT_iPKiPKS2_S9_PS2_SA_iii",
     };
-    pub const group = "_ZN10tf_fn_exl311tf_exl3_exp12group_kernelEPKiPiS3_S3_iiii";
+    pub const group_hist = "_ZN10tf_fn_exl311tf_exl3_exp17group_hist_kernelEPKiPiii";
+    pub const group_scan = "_ZN10tf_fn_exl311tf_exl3_exp17group_scan_kernelEPiS1_S1_S1_iii";
+    pub const group_scatter = "_ZN10tf_fn_exl311tf_exl3_exp20group_scatter_kernelEPKiS2_Piiiii";
+    pub const group_small = "_ZN10tf_fn_exl311tf_exl3_exp18group_small_kernelEPKiPiS3_S3_iiii";
     pub const gateup_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp22gateup_epilogue_kernelEPKfPKiPK6__halfS7_S7_PS5_iiiifi";
     pub const down_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp20down_epilogue_kernelEPKfPKiPK6__halfPfiiii";
     pub const combine = "_ZN10tf_fn_exl311tf_exl3_exp14combine_kernelEPKfS2_Pfii";
     pub const down_combine = "_ZN10tf_fn_exl311tf_exl3_exp19down_combine_kernelEPKfPKiPK6__halfPfS2_S8_iiiii";
+    pub const down_combine_bf16 = "_ZN10tf_fn_exl311tf_exl3_exp24down_combine_bf16_kernelEPKfPKiPK6__halfS2_S2_P13__nv_bfloat16iiiii";
     /// tf_exl3x (experts_grouped.cuh): [tile setting][k2 range], MTL 1 (one 16-member tile a program).
     pub const grouped = [4][3][:0]const u8{
         .{
@@ -456,6 +480,12 @@ pub const sym = struct {
         "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi10ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi16ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
     };
+    /// the gm arm at 4 k tiles a stage in a 2-deep ring (the same 32 KiB), for sub-ranges divisible by 4 (gate/up)
+    pub const grouped_gm4 = [3][:0]const u8{
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi8ELi8ELi4ELi2ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi10ELi4ELi2ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi16ELi4ELi2ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+    };
     /// tf_exl3x: the width's dequantize-to-dense (the grouped path's own decoder)
     pub const dequant = [3][:0]const u8{
         "_ZN10tf_fn_exl38tf_exl3x14dequant_kernelILi2ELi8EEEvPKjP6__halfii",
@@ -471,11 +501,15 @@ pub const Kernels = struct {
     unpack: [3]cuda.Function,
     rot_in: cuda.Function,
     rot_in_experts: [2]cuda.Function,
-    group: cuda.Function,
+    group_hist: cuda.Function,
+    group_scan: cuda.Function,
+    group_scatter: cuda.Function,
+    group_small: cuda.Function,
     gateup_epilogue: cuda.Function,
     down_epilogue: cuda.Function,
     combine: cuda.Function,
     down_combine: cuda.Function,
+    down_combine_bf16: cuda.Function,
     grouped: [4][3]cuda.Function,
     /// the wide arm's instances: null when the embedded fatbin predates them, so the default path still loads
     grouped_wide: [4][3]?cuda.Function,
@@ -483,9 +517,8 @@ pub const Kernels = struct {
     grouped_abl: [4][3]?cuda.Function,
     /// the staged gm arm's instances: null when the embedded fatbin predates them (opt-in, off by default)
     grouped_gm: [3]?cuda.Function,
+    grouped_gm4: [3]?cuda.Function,
     dequant: [3]cuda.Function,
-    /// dynamic shared memory group_kernel was opted into (the device's ceiling less its static use)
-    group_smem_max: u32,
     /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
     wide_smem_max: u32,
     /// the gm arm's dynamic ceiling (the device's opt-in less its static use), for the staged member ring
@@ -502,11 +535,15 @@ pub const Kernels = struct {
         for (sym.unpack, 0..) |s, i| k.unpack[i] = try k.module.function(s);
         k.rot_in = try k.module.function(sym.rot_in);
         for (sym.rot_in_experts, 0..) |s, i| k.rot_in_experts[i] = try k.module.function(s);
-        k.group = try k.module.function(sym.group);
+        k.group_hist = try k.module.function(sym.group_hist);
+        k.group_scan = try k.module.function(sym.group_scan);
+        k.group_scatter = try k.module.function(sym.group_scatter);
+        k.group_small = try k.module.function(sym.group_small);
         k.gateup_epilogue = try k.module.function(sym.gateup_epilogue);
         k.down_epilogue = try k.module.function(sym.down_epilogue);
         k.combine = try k.module.function(sym.combine);
         k.down_combine = try k.module.function(sym.down_combine);
+        k.down_combine_bf16 = try k.module.function(sym.down_combine_bf16);
         for (sym.grouped, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped[i][j] = try k.module.function(s);
         };
@@ -517,13 +554,9 @@ pub const Kernels = struct {
             k.grouped_abl[i][j] = k.module.function(s) catch null;
         };
         for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
+        for (sym.grouped_gm4, 0..) |s, i| k.grouped_gm4[i] = k.module.function(s) catch null;
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
-        // group_kernel's grouping buffer: R*slots ints, which passes 48 KiB once a call has enough routed slots.
-        // experts.cu:296 lifts the limit against the device's own opt-in ceiling less the kernel's static use.
         const ceiling: usize = @intCast(try ctx.attribute(.max_shared_memory_per_block_optin));
-        const statics: usize = @intCast(try k.group.attribute(.shared_size_bytes));
-        k.group_smem_max = @intCast(ceiling -| statics);
-        try k.group.allowDynamicShared(k.group_smem_max);
         // the wide arm stages its A tile in dynamic shared: opt the staged instances in against the same ceiling
         const wstatic: usize = if (k.grouped_wide[0][0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
         k.wide_smem_max = @intCast(ceiling -| wstatic);
@@ -533,6 +566,7 @@ pub const Kernels = struct {
         // the gm arm stages its member ring in dynamic shared: opt the staged instances in against the same ceiling
         const gstatic: usize = if (k.grouped_gm[0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
         k.gm_smem_max = @intCast(ceiling -| gstatic);
+        for (k.grouped_gm4) |maybe| if (maybe) |f| try f.allowDynamicShared(k.gm_smem_max);
         for (k.grouped_gm) |maybe| {
             if (maybe) |f| try f.allowDynamicShared(k.gm_smem_max);
         }
@@ -544,8 +578,6 @@ pub const Kernels = struct {
     }
 };
 
-/// The dynamic shared memory limit group_kernel is opted into is read from the device at load (the reference's own
-/// ceiling less the kernel's static use); a launch whose R*slots*4 exceeds it is refused, not launched short.
 fn int(x: usize) c_int {
     return @intCast(x);
 }
@@ -567,7 +599,7 @@ pub fn rotIn(k: *const Kernels, x: u64, x_dtype: c_int, suh: u64, xh: u64, rows:
 }
 
 /// linear: y [M, N] = xh [M, K] @ W_q + bias, from the rotated input the trellis holds. Rows 1..128.
-pub fn linear(k: *const Kernels, k2: u32, cb: u8, xh: u64, words: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, y_dtype: c_int, z: u64, counters: u64, rows: usize, kk: usize, n: usize, split: Split, s: cuda.Stream) !void {
+pub fn linear(k: *const Kernels, k2: u32, cb: u8, xh: u64, words: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, y_dtype: c_int, z: u64, counters: u64, rows: usize, kk: usize, n: usize, split: Split, ldy: usize, s: cuda.Stream) !void {
     if (cb != 2) return error.Codebook; // the (k2, codebook) rows this fatbin binds are mul1's
     const i = k2Index(k2) orelse return error.Width;
     if (wkIndex(split.wk) == null) return error.Split;
@@ -589,6 +621,7 @@ pub fn linear(k: *const Kernels, k2: u32, cb: u8, xh: u64, words: u64, stride_k:
     a.add(int(kk));
     a.add(int(n));
     a.add(int(split.sk));
+    a.add(int(ldy));
     const wk = split.wk;
     const j = wkIndex(wk).?;
     try cuda.launch.launch(k.linear[i][j], .{ .grid = dim3(g), .block = .{ .x = @intCast(wk * 32) }, .shared = @intCast(sm) }, s, &a);
@@ -608,21 +641,105 @@ pub fn unpack(k: *const Kernels, k2: u32, cb: u8, words: u64, out: u64, kk: usiz
     try cuda.launch.launch(k.unpack[i], .{ .grid = dim3(g), .block = .{ .x = 32 } }, s, &a);
 }
 
-/// The experts' grouping: distinct experts in id order, members row*32 + slot, -1 after the last (experts.cu:19).
-pub fn group(k: *const Kernels, pick: u64, uids: u64, ucount: u64, members: u64, rows: usize, slots: usize, experts: usize, maxm: usize, s: cuda.Stream) !void {
-    const sm = groupShared(rows, slots);
-    if (sm > k.group_smem_max) return error.GroupingSharedMemory;
+/// Experts in id order, members row*32+slot in pick order, -1 padded: histogram, scan, stable scatter into `work`.
+pub fn group(k: *const Kernels, pick: u64, uids: u64, ucount: u64, members: u64, work: u64, rows: usize, slots: usize, experts: usize, maxm: usize, s: cuda.Stream) !void {
     if (slots > 32) return error.Slots;
-    var a: cuda.Args = .{};
-    a.add(pick);
-    a.add(uids);
-    a.add(ucount);
-    a.add(members);
-    a.add(int(rows));
-    a.add(int(slots));
-    a.add(int(experts));
-    a.add(int(maxm));
-    try cuda.launch.launch(k.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = group_threads }, .shared = @intCast(sm) }, s, &a);
+    if (rows == 0 or experts == 0) return;
+    if (experts * @sizeOf(i32) > 48 * 1024) return error.TooManyExperts;
+    const n = rows * slots;
+    const tiles = groupTiles(n);
+    if (tiles == 1 and 2 * experts * @sizeOf(i32) <= 48 * 1024) {
+        var one: cuda.Args = .{};
+        one.add(pick);
+        one.add(uids);
+        one.add(ucount);
+        one.add(members);
+        one.add(int(n));
+        one.add(int(slots));
+        one.add(int(experts));
+        one.add(int(maxm));
+        return cuda.launch.launch(k.group_small, .{ .grid = .{ .x = 1 }, .block = .{ .x = 256 }, .shared = @intCast(2 * experts * @sizeOf(i32)) }, s, &one);
+    }
+    try s.d.check(s.d.api.cuMemsetD8Async(work, 0, tiles * experts * @sizeOf(i32), s.handle), "cuMemsetD8Async");
+    const ni = int(n);
+    const ne = int(experts);
+    var hist: cuda.Args = .{};
+    hist.add(pick);
+    hist.add(work);
+    hist.add(ni);
+    hist.add(ne);
+    try cuda.launch.launch(k.group_hist, .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 256 } }, s, &hist);
+    var scan: cuda.Args = .{};
+    scan.add(work);
+    scan.add(uids);
+    scan.add(ucount);
+    scan.add(members);
+    scan.add(ni);
+    scan.add(ne);
+    scan.add(int(maxm));
+    try cuda.launch.launch(k.group_scan, .{ .grid = .{ .x = 1 }, .block = .{ .x = 256 } }, s, &scan);
+    var scatter: cuda.Args = .{};
+    scatter.add(pick);
+    scatter.add(work);
+    scatter.add(members);
+    scatter.add(ni);
+    scatter.add(int(slots));
+    scatter.add(ne);
+    scatter.add(int(maxm));
+    try cuda.launch.launch(k.group_scatter, .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 128 }, .shared = @intCast(experts * @sizeOf(i32)) }, s, &scatter);
+}
+
+/// Host form of the three group kernels: same uids, member ids and -1 pad. `scratch` holds the workspace plus one local counter an expert.
+pub fn groupPlan(pick: []const i32, slots: usize, experts: usize, maxm: usize, uids: []i32, members: []i32, scratch: []i32) usize {
+    const n = pick.len;
+    const tiles = groupTiles(n);
+    const hist_n = tiles * experts;
+    const hist = scratch[0..hist_n];
+    @memset(hist, 0);
+    const totals = scratch[hist_n..][0..experts];
+    const place = scratch[hist_n + experts ..][0..experts];
+    const local = scratch[hist_n + 2 * experts ..][0..experts];
+    for (pick, 0..) |e, i| {
+        if (e < 0 or @as(usize, @intCast(e)) >= experts) continue;
+        hist[(i / group_tile) * experts + @as(usize, @intCast(e))] += 1;
+    }
+    for (0..experts) |e| {
+        var sum: i32 = 0;
+        for (0..tiles) |t| {
+            const c = hist[t * experts + e];
+            hist[t * experts + e] = sum;
+            sum += c;
+        }
+        totals[e] = sum;
+    }
+    var u: usize = 0;
+    for (0..experts) |e| {
+        if (totals[e] == 0) {
+            place[e] = -1;
+            continue;
+        }
+        uids[u] = @intCast(e);
+        place[e] = @intCast(u);
+        u += 1;
+    }
+    @memset(members[0 .. u * maxm], -1);
+    @memset(local, 0);
+    const cap: i32 = @intCast(maxm);
+    var cur: usize = 0;
+    for (pick, 0..) |e, i| {
+        const gt = i / group_tile;
+        if (gt != cur) {
+            @memset(local, 0);
+            cur = gt;
+        }
+        if (e < 0 or @as(usize, @intCast(e)) >= experts) continue;
+        const eu: usize = @intCast(e);
+        const rank = hist[gt * experts + eu] + local[eu];
+        local[eu] += 1;
+        if (rank >= cap) continue;
+        members[@as(usize, @intCast(place[eu])) * maxm + @as(usize, @intCast(rank))] = @intCast((i / slots) * 32 + (i % slots));
+    }
+    return u;
 }
 
 /// The experts' rotated input: gate and up of every routed slot, one launch a matrix (blockIdx.z).
@@ -659,7 +776,7 @@ pub fn gateupEpilogue(k: *const Kernels, z: u64, pick: u64, svh_g: u64, svh_u: u
     a.add(int(experts));
     a.add(limit);
     a.add(act_mode);
-    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = 32 } }, s, &a);
+    try cuda.launch.launch(k.gateup_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock(rows, slots)) } }, s, &a);
 }
 
 /// down epilogue: Y fp32 = (split sums in order) @ H * svh_d.
@@ -674,7 +791,7 @@ pub fn downEpilogue(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, ro
     a.add(int(d));
     a.add(int(sk));
     a.add(int(experts));
-    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = 32 } }, s, &a);
+    try cuda.launch.launch(k.down_epilogue, .{ .grid = dim3(g), .block = .{ .x = @intCast(epilogueBlock(rows, slots)) } }, s, &a);
 }
 
 /// The slots' combination: out[r] = sum over slots of wts[r][k] * y[r*slots + k] (fp32, fma chain from 0).
@@ -708,8 +825,30 @@ pub fn downCombine(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts
     try cuda.launch.launch(k.down_combine, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
 }
 
+/// downCombine with the row rounded to bf16 [rows, D] and no per-slot y stores (the write-back's bf16 branch).
+pub fn downCombineBf16(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts: u64, out: u64, rows: usize, p: usize, d: usize, sk: usize, experts: usize, slots: usize, s: cuda.Stream) !void {
+    if (slots > 32) return error.Slots;
+    const g = downCombineGrid(rows, d);
+    var a: cuda.Args = .{};
+    a.add(z);
+    a.add(pick);
+    a.add(svh_d);
+    a.add(y);
+    a.add(wts);
+    a.add(out);
+    a.add(int(p));
+    a.add(int(d));
+    a.add(int(sk));
+    a.add(int(experts));
+    a.add(int(slots));
+    try cuda.launch.launch(k.down_combine_bf16, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
+}
+
 /// The wide member-pass arm's member-tile count: 2 tiles of 16 = 32 member rows a program, their rows staged.
 pub const wide_member_tiles: usize = 2;
+
+/// grouped_kernel's launched member rows an expert (fn_exl3.cu TF_GROUPED_GRID_MEMBERS); more members loop in the program.
+pub const grouped_grid_members: usize = 512;
 
 /// The wide arm's dynamic shared: MTL*16 rows of the split's k slice (stride 4 mod 32), then the reduction buffer.
 pub fn wideStageSmem(per_split: usize, w: usize) usize {
@@ -734,14 +873,16 @@ pub fn ablateDecode() bool {
     return wideFlag(v);
 }
 
-/// Whether the staged gm arm runs: TF_FLASHNEXT_X3_GM, off by default (upstream's gm_kernel ported as an opt-in arm).
+/// Whether the staged gm arm runs: TF_FLASHNEXT_X3_GM, on by default (one decode a weight tile for 128 member rows); 0 turns it off.
 pub fn gmMembers() bool {
     const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_GM")) |e| std.mem.span(e) else null;
-    return wideFlag(v);
+    return if (v == null) true else wideFlag(v);
 }
 
 /// The gm arm's setting: NT 8 / W 8 / KS 2 / NSA 4, and SUBW 4 (the shipped warp count, so its 4 k sub-ranges).
 pub const gm_nt: usize = 8;
+/// Picks below this (decode, verify, short prompts) skip the gm arm.
+pub const gm_min_picks: usize = 1024;
 pub const gm_warps: usize = 8;
 pub const gm_ks: usize = 2;
 pub const gm_nsa: usize = 4;
@@ -785,12 +926,15 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(maxm));
     a.add(int(slots));
     // The staged gm arm (opt-in): member rows the B operand, decoded weights the A operand; wins over the wide arm.
-    const gm = gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
+    // prompt-sized calls only: decode / verify picks keep the MTL 1 arm (the gm arm is 35% slower there)
+    const gm = p >= gm_min_picks and gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
     if (gm) {
-        const f = k.grouped_gm[range] orelse return error.NoGmKernel;
+        // gate/up takes the 4-tiles-a-stage instance (same k order, sub-range folds per k tile, same 32 KiB)
+        const ks4 = (kk / 16 / sk) % 4 == 0 and mats == 2; // gate/up only (fn_exl3.cu grouped_gm_launch)
+        const f = (if (ks4) k.grouped_gm4[range] else null) orelse k.grouped_gm[range] orelse return error.NoGmKernel;
         const mtiles = (maxm + 127) / 128;
         const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
-        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
+        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[1]), .y = @intCast(g[0]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
     }
     const wide = wideMembers();
     const abl = !wide and ablateDecode();
@@ -798,7 +942,10 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     const stage = wideStageSmem(kk / 16 / sk, t.w);
     const staged = wide and stage <= k.wide_smem_max;
     const mtl: usize = if (staged) wide_member_tiles else 1;
-    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
+    // grouped_kernel (MTL 1) loops over member groups past grouped_grid_members, so its grid keeps the 512-row
+    // shape when the capacity grows to the window's rows; the wide and ablation arms still launch every group.
+    const cap = if (!staged and !abl) @min(maxm, grouped_grid_members) else maxm;
+    const mtiles = (cap + 16 * mtl - 1) / (16 * mtl);
     const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
     const f = if (staged) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else if (abl) (k.grouped_abl[setting][range] orelse return error.NoAblKernel) else k.grouped[setting][range];
     const sh: u32 = if (staged) @intCast(stage) else 0;
@@ -914,23 +1061,93 @@ test "k2 comes from the width, never from the header's mean" {
     try testing.expectEqual(@as(?u8, null), codebookId("nvfp4"));
 }
 
+fn groupSerial(pick: []const i32, slots: usize, experts: usize, maxm: usize, uids: []i32, members: []i32) usize {
+    var u: usize = 0;
+    for (0..experts) |e| {
+        const id: i32 = @intCast(e);
+        var c: usize = 0;
+        for (pick) |p| c += @intFromBool(p == id);
+        if (c == 0) continue;
+        uids[u] = id;
+        var j: usize = 0;
+        for (pick, 0..) |p, i| {
+            if (j >= maxm) break;
+            if (p != id) continue;
+            members[u * maxm + j] = @intCast((i / slots) * 32 + (i % slots));
+            j += 1;
+        }
+        while (j < maxm) : (j += 1) members[u * maxm + j] = -1;
+        u += 1;
+    }
+    return u;
+}
+
+test "grouped expert rows stay in pick order across tiles, with the maxm pad" {
+    const experts: usize = 8;
+    const slots: usize = 5;
+    const maxm: usize = 3;
+    var pick: [2500]i32 = undefined;
+    for (&pick, 0..) |*p, i| {
+        p.* = switch (i % 17) {
+            0 => -1,
+            1 => 99,
+            else => @intCast((i * 3) % experts),
+        };
+    }
+    pick[10] = 4;
+    pick[2000] = 4;
+    for (&pick, 0..) |*p, i| {
+        if (p.* == 4 and i != 10 and i != 2000) p.* = 1;
+    }
+    var uids_s: [8]i32 = undefined;
+    var uids_p: [8]i32 = undefined;
+    var mem_s: [8 * 3]i32 = undefined;
+    var mem_p: [8 * 3]i32 = undefined;
+    var scratch: [64]i32 = undefined;
+    try std.testing.expect(scratch.len >= groupWorkspaceInts(pick.len, experts) + experts);
+    const us = groupSerial(&pick, slots, experts, maxm, &uids_s, &mem_s);
+    const up = groupPlan(&pick, slots, experts, maxm, &uids_p, &mem_p, &scratch);
+    try std.testing.expectEqual(us, up);
+    try std.testing.expectEqualSlices(i32, uids_s[0..us], uids_p[0..up]);
+    try std.testing.expectEqualSlices(i32, mem_s[0 .. us * maxm], mem_p[0 .. up * maxm]);
+    var prev: i32 = -1;
+    var pad = false;
+    for (uids_p[0..up], 0..) |id, ui| {
+        try std.testing.expect(id > prev);
+        prev = id;
+        if (id == 4) {
+            try std.testing.expectEqual(@as(i32, -1), mem_p[ui * maxm + 2]);
+            try std.testing.expectEqual(@as(i32, (10 / slots) * 32 + (10 % slots)), mem_p[ui * maxm]);
+            try std.testing.expectEqual(@as(i32, (2000 / slots) * 32 + (2000 % slots)), mem_p[ui * maxm + 1]);
+            pad = true;
+        }
+    }
+    try std.testing.expect(pad);
+}
+
 test "the launch shapes are the reference's" {
     try testing.expectEqual([2]usize{ 5, 128 }, rotInGrid(2560, 128)); // K/128 = 20 -> 5 blocks, any rows
     try testing.expectEqual([2]usize{ 1, 1 }, rotInGrid(512, 1)); // K/128 = 4 -> one block of four tiles
     try testing.expectEqual([2]usize{ 96, 1 }, linearGrid(12288, 1));
     try testing.expectEqual([2]usize{ 5, 4 }, linearGrid(640, 4));
     try testing.expectEqual(@as(usize, 256), linearBlock(8));
-    try testing.expectEqual(@as(usize, 32768), linearShared(8, 128)); // WK * min(M, 8) * 128 * 4, the cap 48 KiB
-    try testing.expectEqual(@as(usize, 2048), linearShared(2, 2)); // WK * M * 128 * 4, rows under the 8-row cap
+    try testing.expectEqual(@as(usize, 34816), linearShared(8, 128)); // WK * min(M, 8) * 136 * 4, the cap 48 KiB
+    try testing.expectEqual(@as(usize, 2176), linearShared(2, 2)); // WK * M * 136 * 4, rows under the 8-row cap
     try testing.expectEqual([2]usize{ 768, 160 }, unpackGrid(2560, 12288));
-    try testing.expectEqual([2]usize{ 640, 5 }, epilogueGrid(128, 5, 640)); // rows x slots, width / 128
+    try testing.expectEqual([2]usize{ 160, 5 }, epilogueGrid(128, 5, 640)); // ceil(rows*slots / 4 warps), width / 128
+    try testing.expectEqual(@as(usize, 128), epilogueBlock(128, 5));
+    try testing.expectEqual([2]usize{ 30, 5 }, epilogueGrid(3, 10, 640)); // under 256 picks: one warp a pick
+    try testing.expectEqual(@as(usize, 32), epilogueBlock(3, 10));
     try testing.expectEqual([2]usize{ 1, 1 }, combineGrid(1, 256));
     try testing.expectEqual([2]usize{ 1, 2 }, combineGrid(1, 300));
     try testing.expectEqual([2]usize{ 1, 5 }, downCombineGrid(1, 640));
     try testing.expectEqual(@as(usize, 160), downCombineBlock(5));
     try testing.expectEqual([3]usize{ 8, 5, 40 }, groupedGrid(8, 640, 8, 2, 4, 5)); // experts, N/(16*nt), mats*sk*mtiles
     try testing.expectEqual([2]usize{ 160, 40 }, dequantGrid(2560, 640));
-    try testing.expectEqual(@as(usize, 40 * 5 * 4), groupShared(40, 5));
+    try testing.expectEqual(@as(usize, 1), groupTiles(1));
+    try testing.expectEqual(@as(usize, 2), groupTiles(group_tile + 1));
+    // 2048 rows, 11 slots is 22 tiles of 1024: hist plus totals and place
+    try testing.expectEqual(@as(usize, 22 * 512 + 2 * 512), groupWorkspaceInts(2048 * 11, 512));
 }
 
 test "the symbol table carries the widths and planes it claims" {
@@ -955,7 +1172,7 @@ test "the symbol table carries the widths and planes it claims" {
         try testing.expect(std.mem.indexOf(u8, s, t) != null);
     };
     for (sym.rot_in_experts) |s| try testing.expect(std.mem.startsWith(u8, s, "_ZN10tf_fn_exl311tf_exl3_exp13rot_in_kernel"));
-    for ([_][:0]const u8{ sym.rot_in, sym.group, sym.gateup_epilogue, sym.down_epilogue, sym.combine, sym.down_combine }) |s| {
+    for ([_][:0]const u8{ sym.rot_in, sym.group_hist, sym.group_scan, sym.group_scatter, sym.group_small, sym.gateup_epilogue, sym.down_epilogue, sym.combine, sym.down_combine }) |s| {
         try testing.expect(std.mem.startsWith(u8, s, "_ZN10tf_fn_exl311tf_exl3_"));
     }
 }

@@ -237,13 +237,18 @@ pub const Scratch = struct {
     }
 };
 
+/// Rows one rot_in launch rotates for the 128-row linears that follow it (per element the same kernel math).
+const x3_rot_rows: usize = 1024;
+
 /// EXL3's scratch: a dense trellis linear's rotated fp16 input, its split-K partials and one launch's counters.
 const X3Scratch = struct {
     arena: state.Arena,
-    xh: u64, // [128, K] fp16: a dense linear's rotated input, the widest dense K
+    xh: u64, // [x3_rot_rows, K] fp16: a dense linear's rotated input (one rot_in for several 128-row linears), the widest dense K
     z: u64, // fp32: the most split-K partials a dense linear leaves
     ctr: u64, // int32: a dense linear's counters, the widest N; zeroed once, every launch re-zeroes its own slots
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
+    side: [4]u64, // the side stream's xh, z, ctr and face, sized as the main ones
+    mo: u64, // [max_rows, D] bf16: the experts' combined rows (downCombineBf16), the write-back's branch
     ple_dev: u64, // [max_rows * heads, WORDS] int16: the staged PLE rows as the table stores them (exl3_mm.Scratch.ple_dev)
     ple_hb: u64, // [heads * DH] fp16: the mul1 codebook's per-head bias, the table's own file, uploaded once
     // the grouped experts' rows: P = x3MoeWindow() * slots
@@ -255,14 +260,15 @@ const X3Scratch = struct {
     mids: u64, // [maxu] int32
     mcnt: u64, // [1] int32
     mmem: u64, // [maxu, x3MoeWindow()] int32
+    gwork: u64, // group histogram, totals and place (groupWorkspaceBytes)
+    rows: usize, // grouped-expert window this scratch was sized for
 
     fn deinit(x: *X3Scratch) void {
         x.arena.buf.free();
     }
 
     /// The scratch a model's trellis matrices need: widest K, split-K partials and counters, and the experts' buffers.
-    /// `k3` sizes the grouped-expert window: the runtime pass never asks for more rows than group_kernel's shared memory.
-    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize, k3: ?*const exl3.Kernels) !X3Scratch {
+    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize) !X3Scratch {
         var kmax: usize = @max(g.hidden, g.heads * g.head_dim);
         var zmax: usize = 0;
         var ctrmax: usize = 0;
@@ -299,7 +305,7 @@ const X3Scratch = struct {
             if (ng.exl3) |e| plew = @max(plew, e.words);
             pleh = ng.head_bias.len;
         }
-        const mrows = @min(max_rows, x3MoeRows(g, k3));
+        const mrows = @min(max_rows, x3MoeWindow());
         const slots = g.slots();
         const P = mrows * slots;
         const maxu = @min(P, g.experts);
@@ -313,11 +319,12 @@ const X3Scratch = struct {
             else => return e,
         };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
-        const sizes = [14]usize{
-            128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
-            P * g.hidden * 2,                    P * g.hidden * 2,  P * g.moe_width * 2, @max(mz, 1) * 4,
-            4,                                   @max(maxu, 1) * 4, 4,                   @max(maxu, 1) * mrows * 4,
-            @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),
+        const sizes = [20]usize{
+            x3_rot_rows * kmax * 2,                            @max(zmax, 1) * 4,                   @max(ctrmax, 8) * 4, 128 * face * 2,
+            P * g.hidden * 2,                                  P * g.hidden * 2,                    P * g.moe_width * 2, @max(mz, 1) * 4,
+            4,                                                 @max(maxu, 1) * 4,                   4,                   @max(maxu, 1) * mrows * 4,
+            exl3.groupWorkspaceBytes(mrows, slots, g.experts), @max(max_rows * plef * plew, 1) * 2, @max(pleh, 1),       x3_rot_rows * kmax * 2,
+            @max(zmax, 1) * 4,                                 @max(ctrmax, 8) * 4,                 128 * face * 2,      max_rows * g.hidden * 2,
         };
         var total: usize = 0;
         for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
@@ -325,18 +332,30 @@ const X3Scratch = struct {
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer s.arena.buf.free();
         try s.arena.buf.fill8(0, null);
-        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.ple_dev, &s.ple_hb };
+        const ptrs = [_]*u64{ &s.xh, &s.z, &s.ctr, &s.face, &s.mg, &s.mu, &s.md, &s.mz, &s.my, &s.mids, &s.mcnt, &s.mmem, &s.gwork, &s.ple_dev, &s.ple_hb, &s.side[0], &s.side[1], &s.side[2], &s.side[3], &s.mo };
         for (ptrs, sizes) |p, n| p.* = s.arena.take(n);
+        s.rows = mrows;
         return s;
     }
 };
 
 /// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
+/// TF_FLASHNEXT_X3_COMBINE=0 keeps the per-slot rows and the write-back's MoE mode (the same bits).
+fn x3Direct() bool {
+    if (std.c.getenv("TF_FLASHNEXT_X3_DIRECT")) |v| return v[0] != '0';
+    return true;
+}
+
+fn x3Combine() bool {
+    if (std.c.getenv("TF_FLASHNEXT_X3_COMBINE")) |v| return v[0] != '0';
+    return true;
+}
+
 pub fn x3MoeWindow() usize {
-    // TF_FLASHNEXT_X3_MOE_WINDOW (default 2048: +7.0-7.6% over 1024 at identical bits) trades scratch for fewer passes.
+    // TF_FLASHNEXT_X3_MOE_WINDOW (default 4096: with every member kept, 4096 is +8-9% over 2048 at identical bits) trades scratch for fewer passes.
     // One read: a forward asks again at every MoE layer, and the process does not change the variable.
-    const v = x3MoeWindowEnv() orelse return 2048;
-    return @max(@min(std.fmt.parseInt(usize, v, 10) catch 2048, 16384), 128);
+    const v = x3MoeWindowEnv() orelse return 4096;
+    return @max(@min(std.fmt.parseInt(usize, v, 10) catch 4096, 16384), 128);
 }
 
 fn x3MoeWindowEnv() ?[]const u8 {
@@ -349,20 +368,6 @@ fn x3MoeWindowEnv() ?[]const u8 {
         held.read = true;
     }
     return held.text;
-}
-
-/// Rows the grouped-expert scratch must hold. The pass uses min(the env window, the shared-memory cap), and the cap
-/// is larger for the smaller slot count, so both the main path and the MTP path fit. With one slot count this is
-/// exactly the pass's window.
-fn x3MoeRows(g: state.Geometry, k3: ?*const exl3.Kernels) usize {
-    const window = x3MoeWindow();
-    const k = k3 orelse return window;
-    const hi = g.slots();
-    const lo = @min(g.topKFor(false), g.topKFor(true)) + 1;
-    const rows_hi = @min(window, exl3.groupWindowMax(k, hi));
-    const rows_lo = @min(window, exl3.groupWindowMax(k, lo));
-    const cover = (rows_lo * lo + hi - 1) / hi;
-    return @max(rows_hi, cover);
 }
 
 /// A trellis matrix `a`'s share of an EXL3 scratch's sizes: the widest K, the most split-K partials and counters.
@@ -693,7 +698,7 @@ pub const Forward = struct {
     /// fn_qsa_scores.cu for the prompt indexer's scores (`_scores`' bits); null: Python's `_scores`
     qsa_fast: ?*const prompt.QsaScores = null,
 
-    pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize, k3: ?*const exl3.Kernels) !Forward {
+    pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize) !Forward {
         var f: Forward = .{ .gpa = gpa, .d = d, .s = s, .ops = ops, .t = t, .th = th, .w = w, .c = c, .dims = dims, .g = g, .sc = undefined, .pin = undefined, .pin_rows = max_rows, .staged = undefined, .eps = @floatCast(c.eps), .vocab_offset = w.vocab_offset };
         f.sc = try Scratch.init(d, g, max_rows, partBytes(g, max_rows));
         errdefer f.sc.deinit();
@@ -702,7 +707,7 @@ pub const Forward = struct {
         errdefer f.pin.free();
         f.staged = try cuda.Event.init(d, false);
         try f.staged.record(s);
-        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows, k3);
+        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows);
         errdefer if (f.x3) |*q| q.deinit();
         if (f.x3) |*q| {
             // the mul1 codebook's per-head bias: `_ple_rows` reads it as its HB operand, so it lives on the device too
@@ -1024,15 +1029,24 @@ pub const Forward = struct {
 
     /// An EXL3 trellis projection's `m` rows (128 at a time): the rotated fp16 input, then the 3-bit matmul.
     pub fn x3mm(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_dtype: c_int, m: usize) !void {
+        return f.x3mmLd(part, x, x_stride, x_dtype, q, out, q.n, out_dtype, m);
+    }
+
+    /// x3mm with output rows `ldy` elements apart (a stacked projection's columns written in place).
+    fn x3mmLd(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, ldy: usize, out_dtype: c_int, m: usize) !void {
         const xs = &(f.x3 orelse return error.NoExl3Scratch);
         const k3 = f.k3 orelse return error.NoExl3Kernels;
         const st = exl3.strides(.strips, q.k, q.n, q.k2);
         const esz: usize = if (out_dtype == 2) 4 else 2;
-        var r0: usize = 0;
-        while (r0 < m) : (r0 += 128) {
-            const nn = @min(128, m - r0);
-            try exl3.rotIn(k3, x + r0 * x_stride, x_dtype, q.suh, xs.xh, nn, q.k, f.s);
-            try exl3.linear(k3, q.k2, q.cb, xs.xh, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * @as(usize, q.n) * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, f.s);
+        var g0: usize = 0;
+        while (g0 < m) : (g0 += x3_rot_rows) {
+            const gn = @min(x3_rot_rows, m - g0);
+            try exl3.rotIn(k3, x + g0 * x_stride, x_dtype, q.suh, xs.xh, gn, q.k, f.s);
+            var r0 = g0;
+            while (r0 < g0 + gn) : (r0 += 128) {
+                const nn = @min(128, g0 + gn - r0);
+                try exl3.linear(k3, q.k2, q.cb, xs.xh + (r0 - g0) * q.k * 2, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + r0 * ldy * esz, out_dtype, if (q.split.sk > 1) xs.z else 0, xs.ctr, nn, q.k, q.n, q.split, ldy, f.s);
+            }
         }
         if (part) |p| try f.mark(p);
     }
@@ -1040,11 +1054,19 @@ pub const Forward = struct {
     /// One trellis part of an EXL3 stack: `q`'s columns into `out` from column `col`, through the scratch and a copy.
     fn x3Col(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, x_dtype: c_int, q: W.X3, out: u64, out_w: usize, col: usize, m: usize) !void {
         const xs = &(f.x3 orelse return error.NoExl3Scratch);
+        if (x3Direct()) {
+            // the linear's rows straight into `out`'s columns (the same values the face and copy left)
+            try f.x3mmLd(null, x, x_stride, x_dtype, q, out + col * 2, out_w, 1, m);
+            if (part) |p| try f.mark(p);
+            return;
+        }
         var r0: usize = 0;
         while (r0 < m) : (r0 += 128) {
             const nn = @min(128, m - r0);
-            try f.x3mm(null, x + r0 * x_stride, x_stride, x_dtype, q, xs.face, 1, nn);
-            try f.th.slotCopy(xs.face, q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+            {
+                try f.x3mm(null, x + r0 * x_stride, x_stride, x_dtype, q, xs.face, 1, nn);
+                try f.th.slotCopy(xs.face, q.n * 2, out + col * 2 + r0 * out_w * 2, out_w * 2, q.n * 2, nn);
+            }
         }
         if (part) |p| try f.mark(p);
     }
@@ -1062,10 +1084,45 @@ pub const Forward = struct {
     }
 
     /// The stack an EXL3 gdn/attention projection is: qkv3, z3, b, a rows into `out`, in the GDN proj's order.
+    /// The side stream for a prompt's independent dense parts (TF_FLASHNEXT_X3_SIDE=0 off): over 128 rows only.
+    fn x3Side(f: *Forward, R: usize) ?Side {
+        if (R <= 128) return null;
+        if (std.c.getenv("TF_FLASHNEXT_X3_SIDE")) |v| if (v[0] == '0') return null;
+        return f.side;
+    }
+
+    /// x3Col on the side stream with its own scratch: the same kernels on the same inputs, so the same bits.
+    fn x3ColSide(f: *Forward, sd: Side, x: u64, x_stride: usize, q: W.X3, out: u64, out_w: usize, col: usize, m: usize) !void {
+        const k3 = f.k3 orelse return error.NoExl3Kernels;
+        const d = (f.x3 orelse return error.NoExl3Scratch).side;
+        const st = exl3.strides(.strips, q.k, q.n, q.k2);
+        var th2 = f.th;
+        th2.s = sd.s;
+        var g0: usize = 0;
+        while (g0 < m) : (g0 += x3_rot_rows) {
+            const gn = @min(x3_rot_rows, m - g0);
+            try exl3.rotIn(k3, x + g0 * x_stride, 1, q.suh, d[0], gn, q.k, sd.s);
+            var r0 = g0;
+            while (r0 < g0 + gn) : (r0 += 128) {
+                const nn = @min(128, g0 + gn - r0);
+                try exl3.linear(k3, q.k2, q.cb, d[0] + (r0 - g0) * q.k * 2, q.words, @intCast(st[0]), @intCast(st[1]), q.svh, q.bias, out + col * 2 + r0 * out_w * 2, 1, if (q.split.sk > 1) d[1] else 0, d[2], nn, q.k, q.n, q.split, out_w, sd.s);
+            }
+        }
+    }
+
     fn x3GdnProj(f: *Forward, gd: *const W.Gdn, x: *const Bufs, out: u64, out_w: usize, R: usize) !void {
         const g = f.g;
-        try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
-        try f.x3Col(null, x.b.mixed, g.hidden, 1, gd.z3.?, out, out_w, g.gdnConv(), R);
+        if (f.x3Side(R)) |sd| {
+            try sd.fork.record(f.s);
+            try sd.s.wait(sd.fork);
+            try f.x3ColSide(sd, x.b.mixed, g.hidden, gd.z3.?, out, out_w, g.gdnConv(), R);
+            try sd.join.record(sd.s);
+            try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
+            try f.s.wait(sd.join);
+        } else {
+            try f.x3Col(.gdn_proj, x.b.mixed, g.hidden, 1, gd.qkv3.?, out, out_w, 0, R);
+            try f.x3Col(null, x.b.mixed, g.hidden, 1, gd.z3.?, out, out_w, g.gdnConv(), R);
+        }
         try f.rowsCol(null, x.b.mixed, g.hidden, gd.ba3.?, out, out_w, g.gdnConv() + g.nv * state.gdn_dv, R);
     }
 
@@ -1754,10 +1811,22 @@ pub const Forward = struct {
         if (a.q3 != null) {
             // the pack quantizes every attention linear whole: q (with its gate), k, v, the indexer's rows
             const hd = g.head_dim;
-            try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
-            try f.x3Col(null, b.mixed, g.hidden, 1, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
-            try f.x3Col(null, b.mixed, g.hidden, 1, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
-            try f.x3Col(null, b.mixed, g.hidden, 1, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+            if (f.x3Side(R)) |sd| {
+                // k, v and the indexer's rows (a few programs each) beside q, on the side stream's scratch
+                try sd.fork.record(f.s);
+                try sd.s.wait(sd.fork);
+                try f.x3ColSide(sd, b.mixed, g.hidden, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
+                try f.x3ColSide(sd, b.mixed, g.hidden, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
+                try f.x3ColSide(sd, b.mixed, g.hidden, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+                try sd.join.record(sd.s);
+                try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
+                try f.s.wait(sd.join);
+            } else {
+                try f.x3Col(.attn_proj, b.mixed, g.hidden, 1, a.q3.?, b.pa, g.attnWidth(), 0, R);
+                try f.x3Col(null, b.mixed, g.hidden, 1, a.k3.?, b.pa, g.attnWidth(), g.heads * 2 * hd, R);
+                try f.x3Col(null, b.mixed, g.hidden, 1, a.v3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + g.kv_heads * hd, R);
+                try f.x3Col(null, b.mixed, g.hidden, 1, a.iq3.?, b.pa, g.attnWidth(), g.heads * 2 * hd + 2 * g.kv_heads * hd, R);
+            }
             try f.mark(.attn_proj);
         } else if (a.proj8 != null) try f.projFace(.attn_proj, b.mixed, g.hidden, a.proj8, a.proj, b.pa, g.attnWidth(), R) else try f.mmxAt(.attn_proj, b.mixed, g.hidden, b.xs_mixed, a.proj, b.pa, false, R);
         const ci: usize = if (mtp) g.attention_layers else f.sub[@intCast(layer.index)];
@@ -1987,6 +2056,7 @@ pub const Forward = struct {
             try f.mark(.moe_gather);
             return .{ .ranks = .{ .part = b.g_moe, .world = cm.world } };
         }
+        if (m.x3 != null and x3Combine()) return .{ .bf16 = (f.x3 orelse return error.NoExl3Scratch).mo };
         return .{ .moe = .{ .y = b.moe_y, .y_f32 = x.y_f32, .wts = b.moe_wts, .slots = slots } };
     }
 
@@ -2090,25 +2160,27 @@ pub const Forward = struct {
         const rng_gu = exl3.rangeIndex(ex.k2_gu[0], ex.k2_gu[1]);
         const rng_d = exl3.rangeIndex(ex.k2_d[0], ex.k2_d[1]);
         const es: usize = if (x.y_f32) 4 else 2;
-        // Clamp once: rows*slots*4 <= group_smem_max. Rows change passes not bits; the halving replay was unsound.
-        const win = @min(x3MoeWindow(), exl3.groupWindowMax(k3, slots));
+        const win = xs.rows; // the env window this scratch was sized for; grouping does not split it
         var r0: usize = 0;
         while (r0 < n) {
             const R = @min(win, n - r0);
             const P = R * slots;
             const maxu = @min(P, E);
+            _ = maxu;
             const at = a0 + r0;
             const pick = b.moe_pick + at * slots * 4;
             const xin = b.mixed + at * D * 2;
             const y = b.moe_y + at * slots * D * es;
-            try exl3.group(k3, pick, xs.mids, xs.mcnt, xs.mmem, R, slots, E, maxu, f.s);
+            try exl3.group(k3, pick, xs.mids, xs.mcnt, xs.mmem, xs.gwork, R, slots, E, R, f.s);
             try f.mark(.topk_plan);
             try exl3.rotInExperts(k3, true, xin, @intCast(D), pick, ex.suh_g, ex.suh_u, xs.mg, xs.mu, R, D, slots, E, f.s);
-            try exl3.grouped(k3, set_gu, rng_gu, xs.mg, xs.mu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, D, I, P, gu.sk, maxu, slots, E, 2, f.s);
+            try exl3.grouped(k3, set_gu, rng_gu, xs.mg, xs.mu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, D, I, P, gu.sk, R, slots, E, 2, f.s);
             try exl3.gateupEpilogue(k3, xs.mz, pick, ex.svh_g, ex.svh_u, ex.suh_d, xs.md, R, slots, P, I, gu.sk, E, std.math.inf(f32), 0, f.s);
             try f.mark(.experts_gate_up);
-            try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, maxu, slots, E, 1, f.s);
-            try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
+            try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, R, slots, E, 1, f.s);
+            if (x3Combine()) {
+                try exl3.downCombineBf16(k3, xs.mz, pick, ex.svh_d, y, b.moe_wts + at * slots * 4, xs.mo + at * D * 2, R, P, D, dn.sk, E, slots, f.s);
+            } else try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
             try f.mark(.experts_down);
             r0 += R;
         }

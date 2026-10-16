@@ -10,7 +10,8 @@
 //     mangles with a hash of the source path (cuobjdump shows _GLOBAL__N__b46678aa_10_fn_exl3_cu_...), which
 //     would make the names the Zig launcher resolves depend on the build directory;
 //   - the reference's per-codebook instantiation TUs (experts_cb{0,1,2}.cu) folded in, and instance drivers
-//     added so one fatbin carries every kernel the family can ask for.
+//     added so one fatbin carries every kernel the family can ask for;
+//   - group_kernel replaced by a multi-block histogram, exclusive scan and stable scatter (same member order).
 // The reference's own namespaces are kept (tf_exl3 for the tile decoder, tf_exl3x for the expert GEMM); the whole
 // translation unit sits in tf_fn_exl3, this tree's one-namespace-a-fatbin convention, and the Zig launcher
 // resolves the kernels by the mangled names recorded in cuda_kernels.zig (cuobjdump -symbols of this fatbin).
@@ -313,11 +314,14 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     store4(xh, F16, (size_t)row * K + k, v);
 }
 
+// red rows padded to 136 floats: the 8 g rows of a warp store land in distinct banks (128 put them all in one)
+constexpr int TF_LIN_LDR = 136;
+
 template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
-    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
+    float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK, int ldy) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
     extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
@@ -338,21 +342,28 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
         prev = word != lane / (8 / K2);
     }
 
-    for (int m0 = 0, pass = 0; m0 < M; m0 += 16, ++pass) {
-        const int R = min(16, M - m0);
-
-        float acc[8][2][4];
+    // MT 16-row m tiles share each decoded weight tile (a row's mma sums do not depend on the other rows: same bits)
+    constexpr int MT = 2;
+    for (int mb = 0; mb < M; mb += 16 * MT) {
+        float acc[MT][8][2][4];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int u = 0; u < MT; ++u)
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[u][i][h][c] = 0.f;
 
         // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
-        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
-        const half* x0 = xh + (size_t)r0 * K;
-        const half* x1 = xh + (size_t)r1 * K;
+        const half* x0[MT];
+        const half* x1[MT];
+#pragma unroll
+        for (int u = 0; u < MT; ++u) {
+            const int m0 = mb + 16 * u, Rm = M - m0;
+            x0[u] = xh + (size_t)(m0 + (g < Rm ? g : Rm - 1)) * K;
+            x1[u] = xh + (size_t)(m0 + (g + 8 < Rm ? g + 8 : Rm - 1)) * K;
+        }
         const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
         // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
         constexpr bool PF = K2 <= 12;
@@ -362,11 +373,16 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
 #pragma unroll 1
         for (int i = 0; i < per_warp; ++i) {
             const int kt = kt0 + i;
-            uint32_t a[4];
-            a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
-            a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
-            a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
-            a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
+            uint32_t a[MT][4];
+#pragma unroll
+            for (int u = 0; u < MT; ++u) {
+                if (mb + 16 * u < M) {
+                    a[u][0] = __ldg(reinterpret_cast<const uint32_t*>(x0[u] + kt * 16 + 2 * t));
+                    a[u][1] = __ldg(reinterpret_cast<const uint32_t*>(x1[u] + kt * 16 + 2 * t));
+                    a[u][2] = __ldg(reinterpret_cast<const uint32_t*>(x0[u] + kt * 16 + 2 * t + 8));
+                    a[u][3] = __ldg(reinterpret_cast<const uint32_t*>(x1[u] + kt * 16 + 2 * t + 8));
+                }
+            }
             if constexpr (PF) {
                 if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
             }
@@ -377,8 +393,13 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                 else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
                 uint32_t b0[2], b1[2];
                 decode_lane<K2, CB>(w, lane, b0, b1);
-                mma16816(acc[j][0], a, b0);
-                mma16816(acc[j][1], a, b1);
+#pragma unroll
+                for (int u = 0; u < MT; ++u) {
+                    if (mb + 16 * u < M) {
+                        mma16816(acc[u][j][0], a[u], b0);
+                        mma16816(acc[u][j][1], a[u], b1);
+                    }
+                }
             }
             if constexpr (PF) {
 #pragma unroll
@@ -386,6 +407,11 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             }
         }
 
+#pragma unroll
+      for (int u = 0; u < MT; ++u) {
+        const int m0 = mb + 16 * u, pass = m0 >> 4;
+        if (m0 >= M) break;
+        const int R = min(16, M - m0);
         // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
         for (int rlo = 0; rlo < R; rlo += 8) {
             const int rn = min(R - rlo, 8);
@@ -396,8 +422,8 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const int col = i * 16 + h * 8 + 2 * t;
-                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
-                            rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
+                        *reinterpret_cast<float2*>(red + (warp * RH + g) * TF_LIN_LDR + col) =
+                            rlo ? make_float2(acc[u][i][h][2], acc[u][i][h][3]) : make_float2(acc[u][i][h][0], acc[u][i][h][1]);
                     }
             }
             __syncthreads();
@@ -405,23 +431,23 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
             if (SK == 1) {
                 for (int r = warp; r < rn; r += WK) {
                     float v[4];
-                    const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
+                    const float4 u = *reinterpret_cast<const float4*>(red + r * TF_LIN_LDR + 4 * lane);
                     v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
 #pragma unroll
                     for (int w = 1; w < WK; ++w) {
-                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * TF_LIN_LDR + 4 * lane);
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + rlo + r) * ldy + col0 + 4 * lane, v);
                 }
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
                     const int r = idx >> 5, c = 4 * (idx & 31);
-                    float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+                    float4 s = *reinterpret_cast<const float4*>(red + r * TF_LIN_LDR + c);
 #pragma unroll
                     for (int w = 1; w < WK; ++w) {
-                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * TF_LIN_LDR + c);
                         s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
                     }
                     *reinterpret_cast<float4*>(Z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = s;
@@ -444,12 +470,13 @@ __global__ void __launch_bounds__(WK * 32) linear_kernel(
                     }
                     float v[4] = {s.x, s.y, s.z, s.w};
                     finish(v, lane, svh, bias, col0 + 4 * lane);
-                    store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                    store4(y, y_dtype, (size_t)(m0 + r) * ldy + col0 + 4 * lane, v);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
         }
         __syncthreads();                             // red is reused in the next pass
+      }
     }
 }
 
@@ -495,10 +522,10 @@ void exl3_linear_instances(const half* xh, const uint32_t* T, long long stride_k
         auto kernel = WK == 2   ? linear_kernel<K2_, CB_, 2>                                                           \
                       : WK == 4 ? linear_kernel<K2_, CB_, 4>                                                           \
                                 : linear_kernel<K2_, CB_, 8>;                                                          \
-        const int smem = (int)(WK * (M < 8 ? M : 8) * 128 * sizeof(float));                                             \
+        const int smem = (int)(WK * (M < 8 ? M : 8) * TF_LIN_LDR * sizeof(float));                                             \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);           \
         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, Z,       \
-                                                            counters, M, K, N, SK);                                     \
+                                                            counters, M, K, N, SK, N);                                  \
         return;                                                                                                        \
     }
     TF_EXL3_ALL(TF_LAUNCH)
@@ -539,62 +566,134 @@ namespace tf_exl3_exp {
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
 
-// Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
-constexpr int GROUP_THREADS = 1024;
-constexpr int GROUP_PER_THREAD = 4;
+// Grouping: distinct experts (< E) in id order, members (row * 32 + slot) in pick order, -1 after the last.
+// Three kernels, one stream: a tile histogram, an exclusive scan that compacts uids, then a stable scatter.
+// Tile size matches cuda_exl3.zig group_tile. Counts may use atomics; write order does not.
+constexpr int GROUP_TILE = 1024;
 
-__global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
-                                                              int* __restrict__ ucount, int* __restrict__ members,
-                                                              int R, int slots, int E, int maxm) {
-    extern __shared__ int sh_pick[];
-    __shared__ int warp_tot[GROUP_THREADS / 32];
-    const int n = R * slots;
-    for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
-    __syncthreads();
-    int cnt[GROUP_PER_THREAD];
-    int used = 0;
-#pragma unroll
-    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        int c = 0;
-        if (e < E)
-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
-        cnt[q] = c;
-        used += c > 0;
+__device__ __forceinline__ int group_tiles(int n) { return (n + GROUP_TILE - 1) / GROUP_TILE; }
+
+// work: hist[tiles * E], then totals[E], then place[E]. hist is zero on entry.
+__global__ void group_hist_kernel(const int* __restrict__ pick, int* __restrict__ work, int n, int E) {
+    const int tile = (int)blockIdx.x;
+    const int begin = tile * GROUP_TILE;
+    int end = begin + GROUP_TILE;
+    if (end > n) end = n;
+    int* hist = work + (size_t)tile * E;
+    for (int i = begin + (int)threadIdx.x; i < end; i += (int)blockDim.x) {
+        const int e = pick[i];
+        if ((unsigned)e >= (unsigned)E) continue;
+        atomicAdd(hist + e, 1);
     }
-    // exclusive scan of `used` over threads
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int inc = used;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        int v = __shfl_up_sync(0xffffffffu, inc, o);
-        if (lane >= o) inc += v;
-    }
-    if (lane == 31) warp_tot[warp] = inc;
-    __syncthreads();
-    if (warp == 0) {
-        int v = warp_tot[lane];
-        int s = v;
-#pragma unroll
-        for (int o = 1; o < 32; o <<= 1) {
-            int x = __shfl_up_sync(0xffffffffu, s, o);
-            if (lane >= o) s += x;
+}
+
+// Exclusive scan of each expert across tiles (in place), uids in id order, members filled with -1.
+__global__ void group_scan_kernel(int* __restrict__ work, int* __restrict__ uids, int* __restrict__ ucount,
+                                  int* __restrict__ members, int n, int E, int maxm) {
+    const int tiles = group_tiles(n);
+    int* totals = work + (size_t)tiles * E;
+    int* place = totals + E;
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) {
+        int sum = 0;
+        for (int t = 0; t < tiles; ++t) {
+            int* bin = work + (size_t)t * E + e;
+            const int c = *bin;
+            *bin = sum;
+            sum += c;
         }
-        warp_tot[lane] = s - v;                                   // exclusive per warp
-        if (lane == 31) ucount[0] = s;
+        totals[e] = sum;
     }
     __syncthreads();
-    int place = warp_tot[warp] + inc - used;
-#pragma unroll
-    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        if (cnt[q] == 0) continue;
-        const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        uids[place] = e;
-        int j = 0;
-        for (int i = 0; i < n && j < maxm; ++i)
-            if (sh_pick[i] == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
-        for (; j < maxm; ++j) members[place * maxm + j] = -1;
-        ++place;
+    if (threadIdx.x == 0) {
+        int u = 0;
+        for (int e = 0; e < E; ++e) {
+            if (totals[e] == 0) {
+                place[e] = -1;
+                continue;
+            }
+            uids[u] = e;
+            place[e] = u;
+            ++u;
+        }
+        ucount[0] = u;
+    }
+    __syncthreads();
+    const size_t nfill = (size_t)ucount[0] * (size_t)maxm;
+    for (size_t i = threadIdx.x; i < nfill; i += blockDim.x) members[i] = -1;
+}
+
+// One block a tile, picks in index order: rank is earlier tiles' count plus this tile's running count.
+__global__ void group_scatter_kernel(const int* __restrict__ pick, const int* __restrict__ work,
+                                     int* __restrict__ members, int n, int slots, int E, int maxm) {
+    extern __shared__ int tf_group_local[];
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) tf_group_local[e] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const int tile = (int)blockIdx.x;
+    const int begin = tile * GROUP_TILE;
+    int end = begin + GROUP_TILE;
+    if (end > n) end = n;
+    const int* off = work + (size_t)tile * E;
+    const int tiles = group_tiles(n);
+    const int* place = work + (size_t)tiles * E + E;
+    for (int i = begin; i < end; ++i) {
+        const int e = pick[i];
+        if ((unsigned)e >= (unsigned)E) continue;
+        const int rank = off[e] + tf_group_local[e];
+        tf_group_local[e] += 1;
+        if (rank >= maxm) continue;
+        members[(size_t)place[e] * maxm + rank] = (i / slots) * 32 + (i % slots);
+    }
+}
+
+// n <= GROUP_TILE: one block does hist, compaction and the stable scatter in shared memory (no workspace, no memset).
+// Same uids (id order), same member ids in pick order, same -1 pad as the three-kernel path.
+__global__ void group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids, int* __restrict__ ucount,
+                                   int* __restrict__ members, int n, int slots, int E, int maxm) {
+    extern __shared__ int tf_group_small[];
+    int* cnt = tf_group_small;
+    int* place = tf_group_small + E;
+    __shared__ int su;
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        const int e = pick[i];
+        if ((unsigned)e < (unsigned)E) atomicAdd(cnt + e, 1);
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int lane = (int)threadIdx.x;
+        int u = 0;
+        for (int base = 0; base < E; base += 32) {
+            const int e = base + lane;
+            const bool hit = e < E && cnt[e] > 0;
+            const unsigned m = __ballot_sync(0xffffffffu, hit);
+            if (e < E) {
+                if (hit) {
+                    const int r = u + __popc(m & ((1u << lane) - 1u));
+                    uids[r] = e;
+                    place[e] = r;
+                } else {
+                    place[e] = -1;
+                }
+            }
+            u += __popc(m);
+        }
+        if (lane == 0) { ucount[0] = u; su = u; }
+    }
+    __syncthreads();
+    const int nfill = su * maxm;
+    for (int i = (int)threadIdx.x; i < nfill; i += (int)blockDim.x) members[i] = -1;
+    for (int e = (int)threadIdx.x; e < E; e += (int)blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    for (int i = 0; i < n; ++i) {
+        const int e = pick[i];
+        if ((unsigned)e >= (unsigned)E) continue;
+        const int rank = cnt[e];
+        cnt[e] = rank + 1;
+        if (rank >= maxm) continue;
+        members[(size_t)place[e] * maxm + rank] = (i / slots) * 32 + (i % slots);
     }
 }
 
@@ -644,10 +743,11 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
                                        int E, float limit, int act_mode) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+    const int warps = (int)blockDim.x >> 5, warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
+    const int p = (int)blockIdx.x * warps + warp, blk = (int)blockIdx.y;
+    if (p >= P) return;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
-    const int lane = threadIdx.x;
     const int n = blk * 128 + 4 * lane;
     float gv[4], uv[4];
 #pragma unroll
@@ -688,10 +788,11 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
 __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                      const half* __restrict__ svh_d, float* __restrict__ y, int P, int D, int SK,
                                      int E) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+    const int warps = (int)blockDim.x >> 5, warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
+    const int p = (int)blockIdx.x * warps + warp, blk = (int)blockIdx.y;
+    if (p >= P) return;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
-    const int lane = threadIdx.x;
     const int n = blk * 128 + 4 * lane;
     float v[4];
 #pragma unroll
@@ -776,17 +877,64 @@ void exl3x_rot_in_instances(const __nv_bfloat16* xb, const half* xh, int x_strid
 }
 
 // The rest of the expert kernels' launch contract, for the Zig side:
-//   group_kernel (experts.cu:19)   1 block, GROUP_THREADS=1024, R*slots*4 dynamic bytes (lifted past 48 KiB,
-//                                  against the device's own sharedMemPerBlockOptin minus its static use)
-//   gateup_epilogue_kernel (:116)  grid (rows*slots, N/128), block 32
-//   down_epilogue_kernel   (:161)  grid (rows*slots, D/128), block 32
+//   group_hist_kernel              grid (tiles), block 256; tiles of GROUP_TILE picks, histogram in work
+//   group_scan_kernel              1 block of 256: exclusive scan, uids in id order, members set to -1
+//   group_scatter_kernel           grid (tiles), block 128, E*4 shared: stable scatter, same member ids
+//   gateup_epilogue_kernel          grid (ceil(rows*slots/4), N/128), block 128 (4 warps, one pick a warp)
+//   down_epilogue_kernel            grid (ceil(rows*slots/4), D/128), block 128 (4 warps, one pick a warp)
 //   combine_kernel         (:183)  grid (rows, ceil(D/256)), block 256
 //   down_combine_kernel    (:194)  grid (rows, D/128), block 32*slots (slots <= 32)
 //   grouped_kernel (experts_grouped.cuh:191)  grid (nexp_max, N/(16*nt), mats*SK*mtiles), block W*32, no smem
 //   dequant_kernel (experts_grouped.cuh:288)  grid (K/16, N/16), block 32
 
 
+// down_combine_kernel with the combined row rounded to bf16 (the write-back's MODE 2 rounding) and no per-slot y
+// stores: the write-back then takes it as a bf16 branch, so the same bits as down_epilogue + _hc_writeback MODE 2.
+__global__ void down_combine_bf16_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                         const half* __restrict__ svh_d, const float* __restrict__ y,
+                                         const float* __restrict__ wts, __nv_bfloat16* __restrict__ out, int P, int D,
+                                         int SK, int E, int slots) {
+    __shared__ float4 part[32][32];
+    const int r = blockIdx.x, blk = blockIdx.y;
+    const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blk * 128 + 4 * lane;
+    const int p = r * slots + k;
+    const int e = pick[p];
+    float o[4];
+    if (e >= 0 && e < E) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.f;
+            for (int q = 0; q < SK; ++q) s += Z[((size_t)q * P + p) * D + n + j];
+            v[j] = s;
+        }
+        fwht128(v, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = y[(size_t)p * D + n + j];
+    }
+    part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
+    __syncthreads();
+    if (k != 0) return;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q = 0; q < slots; ++q) {
+        const float w = wts[r * slots + q];
+        const float4 u = part[q][lane];
+        acc[0] = fmaf(w, u.x, acc[0]);
+        acc[1] = fmaf(w, u.y, acc[1]);
+        acc[2] = fmaf(w, u.z, acc[2]);
+        acc[3] = fmaf(w, u.w, acc[3]);
+    }
+    __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(out + (size_t)r * D + n);
+    o2[0] = __floats2bfloat162_rn(acc[0], acc[1]);
+    o2[1] = __floats2bfloat162_rn(acc[2], acc[3]);
+}
+
 }  // namespace tf_exl3_exp
+
 
 
 // ===============================================================================================================
@@ -1166,6 +1314,19 @@ __device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32
     gm_cp_wait<NSA - 2>();
     __syncthreads();
 
+    // weight words one stage ahead in registers (same words, same decode: only the load issues earlier)
+    uint32_t wq[KS][MTL][Fmt<K2>::LW];
+#pragma unroll
+    for (int kk = 0; kk < KS; ++kk)
+#pragma unroll
+        for (int l = 0; l < MTL; ++l)
+            load_words<K2>(wq[kk][l], T + ((size_t)(split * per_split + kk) * NTILES + nt0 + slice * MTL + l) * TW + lane, lane);
+    uint32_t wq2[KS][MTL][Fmt<K2>::LW] = {};
+#pragma unroll
+    for (int kk = 0; kk < KS; ++kk)
+#pragma unroll
+        for (int l = 0; l < MTL; ++l)
+            if (S > 1) load_words<K2>(wq2[kk][l], T + ((size_t)(split * per_split + KS + kk) * NTILES + nt0 + slice * MTL + l) * TW + lane, lane);
     for (int s = 0; s < S; ++s) {
         if (s + NSA - 1 < S) load_stage(s + NSA - 1);
         gm_cp_commit();
@@ -1176,8 +1337,10 @@ __device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32
 #pragma unroll
             for (int l = 0; l < MTL; ++l) {
                 uint32_t w[Fmt<K2>::LW];
-                const int nt = slice * MTL + l;
-                load_words<K2>(w, T + ((size_t)(split * per_split + s * KS + kk) * NTILES + nt0 + nt) * TW + lane, lane);
+#pragma unroll
+                for (int q = 0; q < Fmt<K2>::LW; ++q) { w[q] = wq[kk][l][q]; wq[kk][l][q] = wq2[kk][l][q]; }
+                if (s + 2 < S)                               // stage s+2's words for this kk: two stages in flight
+                    load_words<K2>(wq2[kk][l], T + ((size_t)(split * per_split + (s + 2) * KS + kk) * NTILES + nt0 + slice * MTL + l) * TW + lane, lane);
                 uint32_t b0[2], b1[2];
                 decode_tile<CB, K2>(w, map, lane, b0, b1);
                 af[l][0] = b0[0]; af[l][1] = b1[0]; af[l][2] = b0[1]; af[l][3] = b1[1];  // weights as the A fragment
@@ -1196,17 +1359,18 @@ __device__ __forceinline__ void gm_item(const half* __restrict__ X, const uint32
                     }
                 }
             }
-        }
-        if (((s + 1) * KS) % sub_len == 0) {                 // a shipped sub-range closed: fold its partial into run
+            // a shipped sub-range closed after this k tile (it may end inside a stage): fold its partial into run
+            if ((s * KS + kk + 1) % sub_len == 0) {
 #pragma unroll
-            for (int l = 0; l < MTL; ++l)
+                for (int l = 0; l < MTL; ++l)
 #pragma unroll
-                for (int n = 0; n < NG; ++n)
+                    for (int n = 0; n < NG; ++n)
 #pragma unroll
-                    for (int c = 0; c < 4; ++c) {
-                        run[l][n][c] += work[l][n][c];
-                        work[l][n][c] = 0.f;
-                    }
+                        for (int c = 0; c < 4; ++c) {
+                            run[l][n][c] += work[l][n][c];
+                            work[l][n][c] = 0.f;
+                        }
+            }
         }
         gm_cp_wait<NSA - 2>();
         __syncthreads();
@@ -1242,7 +1406,7 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
-    const int u = blockIdx.x;
+    const int u = blockIdx.y;   // n blocks of one expert item run side by side, so its staged rows hit in L2
     if (u >= ucount[0]) return;
     constexpr int BM = 128;
     const int MG = (maxm + BM - 1) / BM;
@@ -1256,8 +1420,8 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int KT = K >> 4, NTILES = N >> 4;
     const int per_split = KT / SK, sub_len = per_split / SUBW;
-    const int nt0 = blockIdx.y * NT;
-    if (per_split % SUBW != 0 || sub_len % KS != 0) return;   // cuda_exl3.zig refuses this launch first
+    const int nt0 = blockIdx.x * NT;
+    if (per_split % SUBW != 0 || per_split % KS != 0) return;   // cuda_exl3.zig refuses this launch first
 
     __shared__ int rows_sh[BM];
     for (int i = threadIdx.x; i < BM; i += W * 32) {
@@ -1303,6 +1467,9 @@ __global__ void __launch_bounds__(W * 32, gm_minb<W, NT, KS, NSA>()) grouped_gm_
     }
 }
 
+// grouped_kernel launches at most this many member rows an expert; larger groups loop (cuda_exl3.zig grouped_grid_members)
+constexpr int TF_GROUPED_GRID_MEMBERS = 512;
+
 // Program (expert u, n block, split and MTL member tiles): MTL * 16 members times W_q; warps summed in order.
 template <int CB, int NT, int W, int PF, int LO, int HI, int MTL>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
@@ -1313,9 +1480,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int u = blockIdx.x;
     if (u >= ucount[0]) return;
     const int MTG = (maxm + 16 * MTL - 1) / (16 * MTL);
-    const int mg = blockIdx.z % MTG;
-    const int split = (blockIdx.z / MTG) % SK;
-    const int mat = blockIdx.z / MTG / SK;
+    // The grid holds G member groups (TF_GROUPED_GRID_MEMBERS rows); a program walks mg0, mg0+G, ...
+    // Each member row's sums are unchanged; only which program computes it moves.
+    // MTL 1 launches at most TF_GROUPED_GRID_MEMBERS rows; the wide arm (MTL > 1) launches every group (host grid)
+    const int G = MTL == 1 ? min(MTG, (TF_GROUPED_GRID_MEMBERS + 15) / 16) : MTG;
+    const int mg0 = blockIdx.z % G;
+    const int split = (blockIdx.z / G) % SK;
+    const int mat = blockIdx.z / G / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -1329,6 +1500,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     // Deferred: upstream stages these rows in a swizzled cp.async A-tile (B via ldsm4); here they are global reads.
     __shared__ int rows_sh[16 * MTL];
+    for (int mg = mg0; mg < MTG; mg += G) {
+    if (mg != mg0) __syncthreads();       // rows_sh / red are reused by the next group
     for (int i = threadIdx.x; i < 16 * MTL; i += W * 32) {
         const int m = mg * 16 * MTL + i;
         const int code = m < maxm ? members[u * maxm + m] : -1;
@@ -1486,6 +1659,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             for (int w = 1; w < W; ++w) s += red[w][row][col];
             Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
         }
+    }
     }
     }
 }
@@ -1715,7 +1889,10 @@ struct GroupedArgs {
 template <int CB, int MTL>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MTG = (a.maxm + 16 * MTL - 1) / (16 * MTL);
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MTG));
+    const char* abl_g = getenv("TF_EXL3_ABL_DECODE");
+    // grouped_kernel walks member groups past TF_GROUPED_GRID_MEMBERS; the ablation probe still launches each one
+    const int MTGL = (MTL > 1 || (abl_g != nullptr && abl_g[0] != '0')) ? MTG : min(MTG, (TF_GROUPED_GRID_MEMBERS + 15) / 16);
+    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MTGL));
     const char* abl_e = getenv("TF_EXL3_ABL_DECODE");
     const bool abl = abl_e != nullptr && abl_e[0] != '0';   // timing probe: unset or "0" is off (the repo's getenv idiom)
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
@@ -1747,15 +1924,9 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
 // sub-ranges and the bits match it. Opt-in, for a shape the guard admits: per_split = KT/SK divisible by SUBW and W,
 
 // and the shipped sub-range per_split/SUBW by KS. cuda_exl3.zig checks the same first (gmShapeOk).
-template <int CB>
-bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
-    constexpr int NT = 8, W = 8, KS = 2, NSA = 4, SUBW = 4;
-    const int KT = a.K / 16;
-    if (KT % a.SK != 0 || a.N % (16 * NT) != 0) return false;
-    const int per_split = KT / a.SK, sub_len = per_split / SUBW;
-    if (a.warps != SUBW || per_split % SUBW != 0 || sub_len % KS != 0) return false;
-    const int MG = (a.maxm + 127) / 128;
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * NT)), (unsigned)(a.mats * a.SK * MG));
+template <int CB, int KS, int NSA>
+void grouped_gm_launch_ks(const GroupedArgs& a, cudaStream_t stream, dim3 grid) {
+    constexpr int NT = 8, W = 8, SUBW = 4;
     const size_t smem = (size_t)NSA * gm_lmem<KS>();
 #define TF_GM_LAUNCH(LO_, HI_)                                                                                         \
     grouped_gm_kernel<CB, NT, W, LO_, HI_, KS, NSA, SUBW><<<grid, W * 32, smem, stream>>>(                             \
@@ -1765,6 +1936,24 @@ bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
     else if (a.lo >= 2 && a.hi <= 10) TF_GM_LAUNCH(2, 10);
     else TF_GM_LAUNCH(2, 16);
 #undef TF_GM_LAUNCH
+}
+
+#ifndef TF_GM4_DOWN
+#define TF_GM4_DOWN 0
+#endif
+template <int CB>
+bool grouped_gm_launch(const GroupedArgs& a, cudaStream_t stream) {
+    constexpr int NT = 8, SUBW = 4;
+    const int KT = a.K / 16;
+    if (KT % a.SK != 0 || a.N % (16 * NT) != 0) return false;
+    const int per_split = KT / a.SK, sub_len = per_split / SUBW;
+    if (a.warps != SUBW || per_split % SUBW != 0 || sub_len % 2 != 0) return false;
+    const int MG = (a.maxm + 127) / 128;
+    dim3 grid((unsigned)(a.N / (16 * NT)), (unsigned)a.nexp_max, (unsigned)(a.mats * a.SK * MG));
+    // 4 k tiles a stage in a 2-deep ring (the same 32 KiB) where the sub-range allows it (gate/up): same k order and
+    // sums, bit for bit; otherwise (down) 2 tiles a stage in a 4-deep ring as before
+    if (TF_GM4_DOWN ? per_split % 4 == 0 : (per_split % 4 == 0 && a.mats == 2)) grouped_gm_launch_ks<CB, 4, 2>(a, stream, grid);
+    else grouped_gm_launch_ks<CB, 2, 4>(a, stream, grid);
     return true;
 }
 

@@ -264,10 +264,9 @@ fn envOff(name: [:0]const u8) bool {
     return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
 }
 
-/// TF_FLASHNEXT_PREFILL_ROWS: the prompt chunk's rows (both ranks the same; any chunking gives the same bits), else
-/// the caller's.
-/// Two ranks' prompt chunk rows: with the in-program K slices and the prompt expert kernel 4096 rows a call are
-/// faster than 2048 (TP=2 A/B, work/research/R2-measured.md); one GPU keeps Python's 2048.
+/// TF_FLASHNEXT_PREFILL_ROWS: the prompt chunk's rows (both ranks the same), else the caller's.
+/// Chunk size changes the bits: 8192-row chunks hash token_sha afccd937e6ac, 4096-row chunks hash 50502fa4bfb2.
+/// Two ranks default to 4096 rows a call; one GPU keeps Python's 2048.
 pub const tp2_prefill_rows: usize = 4096;
 
 fn promptRows(default: usize) !usize {
@@ -326,7 +325,7 @@ pub const Engine = struct {
     world: u32,
     prefill_rows: usize,
     /// a prompt's last chunk takes up to this many rows past `prefill_rows` rather than leave them to a chunk of
-    /// their own (prompt chunks are chunk-invariant: same bits); the prompt buffers hold prefill_rows + this.
+    /// their own (a different cut changes the bits); the prompt buffers hold prefill_rows + this.
     /// TF_FLASHNEXT_PREFILL_TAIL (rows, a multiple of 16)
     prefill_tail: usize = 0,
     sampling: ?lanes.Sampling = null,
@@ -433,11 +432,10 @@ pub const Engine = struct {
         const th = e.torch.on(e.stream);
         e.memo = .{ .gpa = gpa };
         errdefer e.memo.deinit();
-        // EXL3's grouped window is capped by group_kernel's shared memory, which the scratch sizing reads.
-        // Loaded before Forward.init so the scratch is not sized for an env window the pass cannot use.
+        // EXL3 kernels, loaded before the forward that launches them. The grouped window is the env window.
         if (e.c.quant == .exl3) e.k3 = try exl3.Kernels.load(ctx);
         errdefer if (e.k3) |*q| q.deinit();
-        e.f = try fwd.Forward.init(gpa, d, e.stream, .{ .k = &e.k, .s = e.stream }, .{ .set = &e.set, .s = e.stream, .memo = &e.memo }, th, &e.w, &e.c, e.g, e.dims, e.prefill_rows + e.prefill_tail, if (e.k3) |*k| k else null);
+        e.f = try fwd.Forward.init(gpa, d, e.stream, .{ .k = &e.k, .s = e.stream }, .{ .set = &e.set, .s = e.stream, .memo = &e.memo }, th, &e.w, &e.c, e.g, e.dims, e.prefill_rows + e.prefill_tail);
         errdefer e.f.deinit();
         if (e.k3) |*k| e.f.k3 = k;
         e.f.comm = o.comm;
