@@ -47,6 +47,8 @@ pub const Options = struct {
     draft_head: bool = true,
     /// the n-gram table's rows on the GPU (a rank's heads); null: on the GPU at two ranks, host-mapped at one
     ngram_on_gpu: ?bool = null,
+    /// MXFP8 attention and DeltaNet projections on the lane matmul's MXFP8 mode (false: widened to bf16 rows)
+    mxfp8: bool = false,
     mode: Mode = .device,
     /// the CUDA driver (its context current) for `.device`
     driver: ?*const cuda.Driver = null,
@@ -501,6 +503,8 @@ const Loader = struct {
     prefix: []const u8 = "",
     mbase: []const u8 = "model.",
     around_one: bool = true,
+    /// Options.mxfp8 on a checkpoint with MXFP8 linears
+    mx8: bool = false,
     /// the shard paths in the checkpoint's file order (Checkpoint.openModel opens shardFiles' list)
     paths: []const [:0]u8 = &.{},
     /// the rope (YaRN folds its attention factor into the rotated norms' gammas: yarn.py apply)
@@ -1360,6 +1364,72 @@ const Loader = struct {
     /// blocks), row ranges (all when empty) and an input-column range (out_proj's and o_proj's TP split).
     const Part8 = struct { name: []const u8, rows: []const [2]usize = &.{}, cols: ?[2]usize = null };
 
+    /// An MXFP8 linear (FP4-Local): e4m3 ".weight" with UE8M0 ".weight_scale" bytes a 32 inputs.
+    fn isMx(L: *Loader, name: []const u8) !bool {
+        var b: [256]u8 = undefined;
+        const wn = try std.fmt.bufPrint(&b, "{s}.weight", .{name});
+        return (try L.get(wn)).dtype == .f8_e4m3 and L.has(try std.fmt.bufPrint(&b, "{s}{s}.weight_scale", .{ L.prefix, name }));
+    }
+
+    /// fp8Face for MXFP8 parts: the checkpoint's codes and scale bytes as they are (no rescaling), in the lane
+    /// matmul's MXFP8 order ("<path>.w8" codes, "<path>.bs" scale bytes). Scale bytes 0 and 255 are refused
+    /// (fn_qmmf.cu reads a byte as 2^(b-127) without UE8M0's two specials).
+    fn mxFace(L: *Loader, path: []const u8, parts: []const Part8) !fp8.Linear {
+        var n: usize = 0;
+        var k: usize = 0;
+        var ts: [4]Tensor = undefined;
+        var ss: [4]Tensor = undefined;
+        if (parts.len > ts.len) return error.UnexpectedTensor;
+        for (parts, 0..) |p, i| {
+            var b: [256]u8 = undefined;
+            ts[i] = try L.get(try std.fmt.bufPrint(&b, "{s}.weight", .{p.name}));
+            const t = ts[i];
+            if (t.dtype != .f8_e4m3 or t.rank != 2 or t.dim(1) % 64 != 0) return error.UnexpectedTensor;
+            ss[i] = try L.expect(try std.fmt.bufPrint(&b, "{s}.weight_scale", .{p.name}), .u8, &.{ t.dim(0), t.dim(1) / 32 });
+            const kk = if (p.cols) |c| c[1] - c[0] else t.dim(1);
+            if (i == 0) k = kk else if (kk != k) return error.UnexpectedTensor;
+            if (p.rows.len == 0) n += t.dim(0) else for (p.rows) |r| {
+                n += r[1] - r[0];
+            }
+        }
+        if (k % 64 != 0) return error.UnexpectedTensor;
+        const codes = try L.gpa.alloc(u8, n * k);
+        defer L.gpa.free(codes);
+        const sc = try L.gpa.alloc(u8, n * (k / 32));
+        defer L.gpa.free(sc);
+        var at: usize = 0;
+        for (parts, 0..) |p, i| {
+            const t = ts[i];
+            const pk = t.dim(1);
+            const c0 = if (p.cols) |c| c[0] else 0;
+            if (c0 % 64 != 0) return error.UnexpectedTensor;
+            const all = [_][2]usize{.{ 0, t.dim(0) }};
+            const ranges = if (p.rows.len == 0) &all else p.rows;
+            for (ranges) |r| for (r[0]..r[1]) |row| {
+                @memcpy(codes[at * k ..][0..k], t.bytes[row * pk + c0 ..][0..k]);
+                const src = ss[i].bytes[row * (pk / 32) + c0 / 32 ..][0 .. k / 32];
+                for (src) |v| if (v == 0 or v == 255) {
+                    std.log.err("{s}{s}.weight_scale: UE8M0 byte {d} (zero or NaN) is not served natively", .{ L.prefix, p.name, v });
+                    return error.UnsupportedQuantization;
+                };
+                @memcpy(sc[at * (k / 32) ..][0 .. k / 32], src);
+                at += 1;
+            };
+        }
+        const npad = fp8.npadOf(n);
+        const w8 = try L.staging(npad * k);
+        try fp8.fragmentOrder(codes, n, k, npad, w8);
+        var pb: [192]u8 = undefined;
+        var l: fp8.Linear = .{ .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad), .mx = true };
+        l.w8 = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.w8", .{path}), "uint8", &.{npad * k}, w8);
+        L.out.ours();
+        const bs = try L.staging(npad * (k / 64) * 2);
+        try fp8.tileMxScales(sc, n, k, npad, bs);
+        l.bs = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.bs", .{path}), "uint8", &.{ npad / 64, k / 64, 64, 2 }, L.host.items);
+        L.out.ours();
+        return l;
+    }
+
     fn isFp8(L: *Loader, name: []const u8) !bool {
         var b: [256]u8 = undefined;
         return L.has(try std.fmt.bufPrint(&b, "{s}{s}.weight_scale_inv", .{ L.prefix, name }));
@@ -1368,6 +1438,7 @@ const Loader = struct {
     /// Fp8BlockLinear.from_rows of the parts' rows stacked (each row's fp32 scale per 64 inputs from its 128x128
     /// block), in the FP8G lane matmul's fragment order: "<path>.w8" and "<path>.bs".
     fn fp8Face(L: *Loader, path: []const u8, parts: []const Part8) !fp8.Linear {
+        if (!try L.isFp8(parts[0].name)) return L.mxFace(path, parts);
         var n: usize = 0;
         var k: usize = 0;
         var ts: [4]Tensor = undefined;
@@ -1991,12 +2062,14 @@ const Loader = struct {
         lw.mlp_hc = try L.hc(try std.fmt.bufPrint(&pb, "{s}.mlp_hc", .{path}), try std.fmt.bufPrint(&nb, "{s}.mlp_hyper_connection", .{base}), true);
         // INT4-AutoRound: block-FP8 mixers, GPTQ int4 experts with the block-FP8 shared expert (the MTP layer is bf16)
         const int4ar = L.c.int4ar() and i >= 0;
+        // FP4-Local: its MXFP8 mixers on the lane matmul's MXFP8 mode (TF_FLASHNEXT_MXFP8=0: widened to bf16 rows)
+        const mx8 = L.mx8 and i >= 0;
         if (kind == .linear) {
             const nm = try std.fmt.bufPrint(&nb, "{s}.linear_attn", .{base});
-            lw.gdn = if (int4ar and try L.isFp8(try L.nameOf("{s}.in_proj_qkv", .{nm}))) try L.gdn8(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm) else try L.gdn(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm);
+            lw.gdn = if (mx8 and try L.isMx(try L.nameOf("{s}.in_proj_qkv", .{nm}))) try L.gdn8(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm) else if (int4ar and try L.isFp8(try L.nameOf("{s}.in_proj_qkv", .{nm}))) try L.gdn8(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm) else try L.gdn(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm);
         } else {
             const nm = try std.fmt.bufPrint(&nb, "{s}.self_attn", .{base});
-            lw.attn = if (int4ar and try L.isFp8(try L.nameOf("{s}.q_proj", .{nm}))) try L.attention8(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm) else try L.attention(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm);
+            lw.attn = if (mx8 and try L.isMx(try L.nameOf("{s}.q_proj", .{nm}))) try L.attention8(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm) else if (int4ar and try L.isFp8(try L.nameOf("{s}.q_proj", .{nm}))) try L.attention8(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm) else try L.attention(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm);
         }
         lw.moe = if (int4ar) try L.moe8(try std.fmt.bufPrint(&pb, "{s}.moe", .{path}), try std.fmt.bufPrint(&nb, "{s}.mlp", .{base})) else try L.moe(try std.fmt.bufPrint(&pb, "{s}.moe", .{path}), try std.fmt.bufPrint(&nb, "{s}.mlp", .{base}), i < 0);
         if (with_ple and i >= 0) if (L.c.pleIndex(@intCast(i))) |pi| {
@@ -2117,7 +2190,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     const paths = try core.checkpoint.shardFiles(gpa, io, dir);
     defer core.checkpoint.freeShardFiles(gpa, paths);
     if (paths.len != ck.files.items.len) return error.CheckpointChanged;
-    var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c) };
+    var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c), .mx8 = o.mxfp8 and c.hasMxfp8() };
     defer L.deinit();
     L.prefix = if (L.has("language_model.model.embed_tokens.weight")) "language_model." else "";
     try L.openExtra(dir);
