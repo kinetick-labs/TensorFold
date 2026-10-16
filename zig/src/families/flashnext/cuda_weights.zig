@@ -150,6 +150,9 @@ pub const NgramTable = struct {
     lut: [256]u16 = @splat(0),
     /// EXL3 (NgramTable): one int16 `trellis` of [rows, words] rows -- word 0 the scale, the rest DH mul1 states.
     exl3: ?struct { words: u32, bits: u32 } = null,
+    /// NVFP4 (FP4-Local): each shard's e4m3 scales [rows, width / 16] beside its e2m1 codes [rows, width / 2], and the
+    /// table's fp32 weight_scale_2; a value is bf16_rne(e2m1 x e4m3 x global)
+    nvfp4: ?struct { scales: std.ArrayList([]const u8) = .empty, global: f32 = 1 } = null,
     /// EXL3: the decode's head bias fp16 [heads, DH], mapped from the table's own file
     head_bias: []const u8 = &.{},
     /// on the GPU: rows [base, base + count) as stored, the LUT ([256] bf16 bits), heads [head0, head0 + heads)
@@ -160,17 +163,30 @@ pub const NgramTable = struct {
         t.files.deinit(t.gpa);
         t.shards.deinit(t.gpa);
         t.starts.deinit(t.gpa);
+        if (t.nvfp4) |*n| n.scales.deinit(t.gpa);
         t.* = undefined;
     }
 
-    fn row(t: *const NgramTable, id: u64) []const u8 {
+    fn shardOf(t: *const NgramTable, id: u64) usize {
         // shards are equal but for the last: a division finds the shard, a step corrects it
         var s: usize = @intCast(@min(id / (t.starts.items[1] - t.starts.items[0]), t.shards.items.len - 1));
         while (t.starts.items[s] > id) s -= 1;
         while (t.starts.items[s + 1] <= id) s += 1;
+        return s;
+    }
+
+    fn row(t: *const NgramTable, id: u64) []const u8 {
+        const s = t.shardOf(id);
         // EXL3: the rows are `words` int16 (word 0 the fp16 scale), NOT `width` values (`width` is what they decode to)
-        const bytes: usize = if (t.exl3) |e| 2 * @as(usize, e.words) else if (t.fp8) t.width else 2 * t.width;
+        const bytes: usize = if (t.exl3) |e| 2 * @as(usize, e.words) else if (t.nvfp4 != null) t.width / 2 else if (t.fp8) t.width else 2 * t.width;
         return t.shards.items[s][@intCast((id - t.starts.items[s]) * bytes)..][0..bytes];
+    }
+
+    /// NVFP4: row `id`'s e4m3 block scales (one a 16 values)
+    fn rowScales(t: *const NgramTable, id: u64) []const u8 {
+        const s = t.shardOf(id);
+        const n = t.width / 16;
+        return t.nvfp4.?.scales.items[s][@intCast((id - t.starts.items[s]) * n)..][0..n];
     }
 
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
@@ -180,7 +196,9 @@ pub const NgramTable = struct {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
             const src = t.row(@intCast(id));
             const dst = out[i * t.width ..][0..t.width];
-            if (t.fp8) {
+            if (t.nvfp4) |n| {
+                decodeNvfp4Row(src, t.rowScales(@intCast(id)), n.global, dst);
+            } else if (t.fp8) {
                 for (dst, src) |*d, c| d.* = t.lut[c];
             } else {
                 for (dst, 0..) |*d, j| d.* = std.mem.readInt(u16, src[2 * j ..][0..2], .little);
@@ -200,6 +218,50 @@ pub const NgramTable = struct {
         }
     }
 };
+
+/// One NVFP4 row: value j = e2m1(code j: the low nibble even, the high odd) x e4m3(scale j / 16) x global, bf16 RNE.
+pub fn decodeNvfp4Row(codes: []const u8, scales: []const u8, global: f32, dst: []u16) void {
+    for (dst, 0..) |*d, j| {
+        const nib: u8 = if (j % 2 == 0) codes[j / 2] & 15 else codes[j / 2] >> 4;
+        d.* = lay.bf16Rne(@as(f32, @floatCast(core.quant.nvfp4.e2m1(nib))) * lay.e4m3ToF32(scales[j / 16]) * global);
+    }
+}
+
+test "an NVFP4 n-gram row decodes as e2m1 x e4m3 x global" {
+    const codes = [_]u8{ 0x71, 0xF8 }; // 0.5, 6, -0, -6
+    const scales = [_]u8{0x38}; // e4m3 1.0
+    var out: [4]u16 = undefined;
+    decodeNvfp4Row(&codes, &scales, 2, &out);
+    try std.testing.expectEqual([4]u16{ lay.bf16Rne(1), lay.bf16Rne(12), lay.bf16Rne(-0.0), lay.bf16Rne(-12) }, out);
+}
+
+/// MXFP8 [n, k] -> bf16 bits: value = e4m3(code) x 2^(scale - 127), one scale a 32 inputs. Refuses NaN scales (255)
+/// and products bf16 cannot hold exactly (they never occur in ModelOpt exports: |scale - 127| stays small).
+pub fn mxfp8ToBf16(codes: []const u8, scales: []const u8, n: usize, k: usize, out: []align(1) u16) !void {
+    for (0..n) |r| for (0..k / 32) |g| {
+        const e = scales[r * (k / 32) + g];
+        if (e == 255) return error.UnexpectedTensor;
+        const f = std.math.ldexp(@as(f32, 1), @as(i32, e) - 127);
+        for (0..32) |j| {
+            const i = r * k + g * 32 + j;
+            const v = lay.e4m3ToF32(codes[i]) * f;
+            const h = lay.bf16Rne(v);
+            if (std.math.isNan(v) or lay.bf16ToF32(h) != v) return error.UnexpectedTensor;
+            out[i] = h;
+        }
+    };
+}
+
+test "MXFP8 widens to bf16 exactly" {
+    var codes: [64]u8 = undefined;
+    for (&codes, 0..) |*c, i| c.* = ([_]u8{ 0x38, 0xC0, 0x01, 0x7E })[i % 4]; // 1, -2, the smallest subnormal, 448
+    const scales = [_]u8{ 127 + 3, 127 - 2 };
+    var out: [64]u16 = undefined;
+    try mxfp8ToBf16(&codes, &scales, 1, 64, &out);
+    try std.testing.expectEqual(@as(f32, 8), lay.bf16ToF32(out[0]));
+    try std.testing.expectEqual(@as(f32, -16), lay.bf16ToF32(out[1]));
+    try std.testing.expectEqual(@as(f32, 448.0 / 4.0), lay.bf16ToF32(out[35]));
+}
 
 /// The n-gram table's GPU gather (zig/kernels/cuda/fn_pack.cu): a window's global row ids (device int64
 /// [tokens][ids_stride], every head's) -> `out` bf16 bits [tokens][heads * width] for the rank's heads, the host
@@ -447,6 +509,8 @@ const Loader = struct {
     ring_at: usize = 0,
     /// mapped ranges read since the last release
     touched: std.ArrayList(struct { file: usize, bytes: []const u8 }) = .empty,
+    /// host buffers decoded from the checkpoint (CSF scales, MXFP8 linears as bf16), freed by release()
+    owned: std.ArrayList([]u8) = .empty,
     /// safetensors beside the checkpoint's index that only the n-gram table reads (INT4-AutoRound's ple-table/)
     extra: std.ArrayList(st.File) = .empty,
     extra_paths: std.ArrayList([:0]u8) = .empty,
@@ -456,6 +520,8 @@ const Loader = struct {
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
         L.touched.deinit(L.gpa);
+        L.freeOwned();
+        L.owned.deinit(L.gpa);
         for (L.extra.items) |*f| f.close(L.io);
         L.extra.deinit(L.gpa);
         for (L.extra_paths.items) |x| L.gpa.free(x);
@@ -702,11 +768,30 @@ const Loader = struct {
         return t;
     }
 
+    /// An MXFP8 linear (FP4-Local's attention, indexer, DeltaNet projections and shared expert): e4m3 codes [n, k] and
+    /// one UE8M0 `.weight_scale` byte a 32 inputs, widened to bf16. Exact: an e4m3 value times a power of two is a
+    /// bf16 value unless it leaves bf16's range (refused), so the engine's bf16 paths see the checkpoint's numbers.
+    fn mxfp8Bf16(L: *Loader, name: []const u8, t: Tensor, n: usize, k: usize) !Tensor {
+        var b: [256]u8 = undefined;
+        if (t.rank != 2 or t.dim(0) != n or t.dim(1) != k or k % 32 != 0) return error.UnexpectedTensor;
+        const s = try L.expect(try std.fmt.bufPrint(&b, "{s}.weight_scale", .{name}), .u8, &.{ n, k / 32 });
+        const out = try L.ownBytes(n * k * 2);
+        mxfp8ToBf16(t.bytes, s.bytes, n, k, std.mem.bytesAsSlice(u16, out)) catch |err| {
+            std.log.err("{s}{s}: MXFP8 scale out of bf16 range", .{ L.prefix, name });
+            return err;
+        };
+        var r: Tensor = .{ .dtype = .bf16, .rank = 2, .shape = undefined, .bytes = out };
+        r.shape[0] = n;
+        r.shape[1] = k;
+        return r;
+    }
+
     /// A bf16 or fp16 linear [n, k] (`_plain`: quantized bytes are refused); callers convert via bf16Bytes/face.
     fn linear(L: *Loader, name: []const u8, n: usize, k: usize) !Tensor {
         var b: [256]u8 = undefined;
         const wn = try std.fmt.bufPrint(&b, "{s}.weight", .{name});
         const t = try L.get(wn);
+        if (t.dtype == .f8_e4m3) return L.mxfp8Bf16(name, t, n, k);
         if (t.dtype != .bf16 and t.dtype != .f16) {
             std.log.err("{s}{s}: {t} weights; this engine reads Flash Next's non-expert linears as bf16 or fp16", .{ L.prefix, wn, t.dtype });
             return error.UnsupportedQuantization;
@@ -729,8 +814,42 @@ const Loader = struct {
     }
 
     /// Drop the pages of what the last layer read (madvise, then fadvise: the page cache never holds both copies).
+    fn freeOwned(L: *Loader) void {
+        for (L.owned.items) |x| L.gpa.free(x);
+        L.owned.clearRetainingCapacity();
+    }
+
+    fn ownBytes(L: *Loader, bytes: usize) ![]u8 {
+        const x = try L.gpa.alloc(u8, bytes);
+        errdefer L.gpa.free(x);
+        try L.owned.append(L.gpa, x);
+        return x;
+    }
+
+    /// `name` (".weight_scale" of an NVFP4 matrix [n, k/16]): as stored, else decoded losslessly from the checkpoint's
+    /// byte-window CSF planes (`.nvfp4_csf_fixed` u8 + `.nvfp4_csf_exceptions` u32; core.nvfp4_csf, upstream #904).
+    fn nvfp4Scales(L: *Loader, name: []const u8, n: usize, kb: usize) !Tensor {
+        var b: [2][256]u8 = undefined;
+        const fixed_name = try std.fmt.bufPrint(&b[0], "{s}.nvfp4_csf_fixed", .{name});
+        if (!L.has(try L.nameOf("{s}{s}", .{ L.prefix, fixed_name }))) return L.expect(name, .f8_e4m3, &.{ n, kb });
+        const fixed = try L.get(fixed_name);
+        const exc = try L.get(try std.fmt.bufPrint(&b[1], "{s}.nvfp4_csf_exceptions", .{name}));
+        if (fixed.dtype != .u8 or (exc.dtype != .u32 and exc.dtype != .i32)) return error.UnexpectedTensor;
+        const plane = core.nvfp4_csf.Plane.init(n, kb, fixed.bytes, exc.bytes) catch |err| {
+            std.log.err("{s}{s}: CSF planes do not fit [{d}, {d}] ({t})", .{ L.prefix, name, n, kb, err });
+            return error.UnexpectedTensor;
+        };
+        const out = try L.ownBytes(n * kb);
+        try plane.decode(out, 0, n, 0, kb);
+        var t: Tensor = .{ .dtype = .f8_e4m3, .rank = 2, .shape = undefined, .bytes = out };
+        t.shape[0] = n;
+        t.shape[1] = kb;
+        return t;
+    }
+
     fn release(L: *Loader) void {
         defer L.touched.clearRetainingCapacity();
+        L.freeOwned();
         if (!L.o.release_pages) return;
         const page: usize = 64 << 10;
         for (L.touched.items) |t| {
@@ -1020,7 +1139,8 @@ const Loader = struct {
 
         m.routed = .{ .count = e, .width = @intCast(ni), .dims = d };
         var b2: [192]u8 = undefined;
-        if (mtp) {
+        const nvfp4_mtp = mtp and (try L.get(try L.nameOf("{s}.experts.0.gate_proj.weight", .{name}))).dtype == .u8;
+        if (mtp and !nvfp4_mtp) {
             try L.mtpExperts(path, name, &m.routed, lo, hi);
         } else {
             if (L.has(try L.nameOf("{s}{s}.experts.0.gate_proj.weight_scale_inv", .{ L.prefix, name }))) return error.UnsupportedQuantization;
@@ -1499,12 +1619,16 @@ const Loader = struct {
         for (0..e) |x| for (projs, 0..) |proj, m| {
             var b: [3][256]u8 = undefined;
             const w = try L.expect(try std.fmt.bufPrint(&b[0], "{s}.experts.{d}.{s}.weight", .{ name, x, proj }), .u8, &.{ full_n, full_k / 2 });
-            const s = try L.expect(try std.fmt.bufPrint(&b[1], "{s}.experts.{d}.{s}.weight_scale", .{ name, x, proj }), .f8_e4m3, &.{ full_n, full_k / 16 });
+            const s = try L.nvfp4Scales(try std.fmt.bufPrint(&b[1], "{s}.experts.{d}.{s}.weight_scale", .{ name, x, proj }), full_n, full_k / 16);
             const t2 = try L.expect(try std.fmt.bufPrint(&b[2], "{s}.experts.{d}.{s}.weight_scale_2", .{ name, x, proj }), .f32, &.{});
             s2[x * m_count + m] = @bitCast(std.mem.readInt(u32, t2.bytes[0..4], .little));
-            // the activations' input_scale: ModelOpt's W4A4 calibration; the engine runs bf16 activations
-            _ = try L.expect(try std.fmt.bufPrint(&b[2], "{s}.experts.{d}.{s}.input_scale", .{ name, x, proj }), .f32, &.{});
-            L.out.w.skipped += 1;
+            // the activations' input_scale: ModelOpt's W4A4 calibration; the engine runs bf16 activations (W4A16 MTP
+            // experts ship none)
+            const iname = try std.fmt.bufPrint(&b[2], "{s}.experts.{d}.{s}.input_scale", .{ name, x, proj });
+            if (L.has(try L.nameOf("{s}{s}", .{ L.prefix, iname }))) {
+                _ = try L.expect(iname, .f32, &.{});
+                L.out.w.skipped += 1;
+            }
             jobs[x * m_count + m] = .{ .src = .{ .words = w.bytes, .word_pitch = full_k / 2, .scales = s.bytes, .scale_pitch = full_k / 16, .row0 = if (down) 0 else lo, .k0 = if (down) lo else 0 }, .e = x, .m = m };
         };
         const Ctx = struct {
@@ -1662,7 +1786,13 @@ const Loader = struct {
         } else {
             w.table = try L.openTable(base, g);
             const gpu = L.o.ngram_on_gpu orelse (L.o.world > 1);
-            if (gpu and w.table.?.exl3 == null) try L.tableToGpu(path, &w.table.?, g);
+            // an NVFP4 table stays memory-mapped on the host (read from disk a lookup at a time): no GPU gather yet
+            if (gpu and w.table.?.nvfp4 != null) {
+                if (L.o.world > 1) {
+                    std.log.err("an NVFP4 n-gram table is gathered on the host; tensor parallel ranks need it on the GPU", .{});
+                    return error.UnsupportedQuantization;
+                }
+            } else if (gpu and w.table.?.exl3 == null) try L.tableToGpu(path, &w.table.?, g);
         }
         var pb: [192]u8 = undefined;
         const sd = c.streams * c.hidden;
@@ -1718,20 +1848,34 @@ const Loader = struct {
             const tensor = t.files.items[own.value_ptr.*].get(key).?;
             if (kind) |k| if (k != tensor.dtype) return error.NgramShardsMixLayouts;
             kind = tensor.dtype;
-            if (tensor.dtype != .f8_e4m3 and tensor.dtype != .bf16) {
-                std.log.err("{s}: {t} n-gram rows; this engine reads FP8 (e4m3) or bf16 tables", .{ key, tensor.dtype });
+            if (tensor.dtype != .f8_e4m3 and tensor.dtype != .bf16 and tensor.dtype != .u8) {
+                std.log.err("{s}: {t} n-gram rows; this engine reads NVFP4 (u8 e2m1 pairs), FP8 (e4m3) or bf16 tables", .{ key, tensor.dtype });
                 return error.UnsupportedQuantization;
             }
             if (tensor.rank != 2) return error.UnexpectedTensor;
-            if (t.width == 0) t.width = @intCast(tensor.dim(1));
-            if (tensor.dim(1) != t.width) return error.NgramShardsDiffer;
+            // NVFP4 rows: two e2m1 codes a byte, their e4m3 scales in `<shard>.weight_scale` [rows, width / 16]
+            const values: usize = if (tensor.dtype == .u8) 2 * tensor.dim(1) else tensor.dim(1);
+            if (t.width == 0) t.width = @intCast(values);
+            if (values != t.width) return error.NgramShardsDiffer;
+            if (tensor.dtype == .u8) {
+                if (t.nvfp4 == null) t.nvfp4 = .{};
+                var sb: [256]u8 = undefined;
+                const skey = try std.fmt.bufPrint(&sb, "{s}_scale", .{key});
+                const sc = t.files.items[own.value_ptr.*].get(skey) orelse {
+                    std.log.err("NVFP4 n-gram shard {s} has no {s}", .{ key, skey });
+                    return error.MissingTensor;
+                };
+                if (sc.dtype != .f8_e4m3 or sc.rank != 2 or sc.dim(0) != tensor.dim(0) or sc.dim(1) != values / 16) return error.UnexpectedTensor;
+                if (file_i) |fi| if (L.ck.files.items[fi].names.getKey(skey)) |k| try L.ck.used.put(L.gpa, k, {});
+                try t.nvfp4.?.scales.append(L.gpa, sc.bytes);
+            }
             try t.shards.append(L.gpa, tensor.bytes);
             try t.starts.append(L.gpa, t.starts.items[t.starts.items.len - 1] + tensor.dim(0));
         }
         t.rows = t.starts.items[t.starts.items.len - 1];
         t.fp8 = kind.? == .f8_e4m3;
         var b: [256]u8 = undefined;
-        const sname = try std.fmt.bufPrint(&b, "{s}ngram_embedding.weight_scale", .{base});
+        const sname = try std.fmt.bufPrint(&b, "{s}ngram_embedding.weight_scale{s}", .{ base, if (t.nvfp4 != null) "_2" else "" });
         const sfull = try L.nameOf("{s}{s}", .{ L.prefix, sname });
         const in_ck = L.has(sfull);
         if (in_ck or L.extraIndex(sfull) != null) {
@@ -1743,7 +1887,9 @@ const Loader = struct {
                 else => return error.UnexpectedTensor,
             };
         }
-        if (t.fp8) t.lut = lay.ngramLut(t.scale) else if (t.scale != 1) return error.UnsupportedQuantization;
+        if (t.nvfp4) |*n| {
+            n.global = t.scale;
+        } else if (t.fp8) t.lut = lay.ngramLut(t.scale) else if (t.scale != 1) return error.UnsupportedQuantization;
         if (t.width != g.dims) {
             std.log.err("the n-gram rows hold {d} values, expected {d}", .{ t.width, g.dims });
             return error.NgramWidth;
