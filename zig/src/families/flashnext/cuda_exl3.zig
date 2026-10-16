@@ -118,6 +118,73 @@ pub fn defaultTile(k: usize, n: usize, gateup: bool) !Tile {
     return error.NoTileSetting;
 }
 
+// The tile sweep: TF_FLASHNEXT_X3_TILE names a variant for the grouped GEMM's gate/up and down classes; unset is today.
+
+/// A tile variant a sweep may name: the same (nt, w, sk, pf) `defaultTile` returns, in the reference's spelling.
+pub const Variant = struct { nt: usize, w: usize, sk: usize, pf: usize };
+
+/// id 0, GLM's gate/up tile (experts.py:134): today's gate/up default, and the pack's expected best.
+pub const v_glm_gu: Variant = .{ .nt = 8, .w = 4, .sk = 4, .pf = 1 };
+/// id 1, GLM's down tile (experts.py:134): today's down default (one K split, the reference's pick for I -> D).
+pub const v_glm_dn: Variant = .{ .nt = 8, .w = 4, .sk = 1, .pf = 1 };
+/// id 2, the reference's first fallback when GLM's tile does not divide (experts.py:134): two K splits, one in flight.
+pub const v_narrow: Variant = .{ .nt = 8, .w = 4, .sk = 2, .pf = 1 };
+/// id 3, the reference's (8, 4, 2) instance at one K split; upstream's prefill tiles keep 2 k tiles in flight.
+pub const v_pf2: Variant = .{ .nt = 8, .w = 4, .sk = 1, .pf = 2 };
+/// id 4, the reference's (8, 4, 2) instance at two K splits: its narrow-N fallback with two tiles in flight.
+pub const v_pf2_sk2: Variant = .{ .nt = 8, .w = 4, .sk = 2, .pf = 2 };
+/// id 5, the reference's 4-tile-warp setting (experts.py:134), 2 in flight: half the columns a warp, more overlap.
+pub const v_nt4: Variant = .{ .nt = 4, .w = 4, .sk = 2, .pf = 2 };
+/// id 6, the 4-tile-warp setting at one K split, two tiles in flight (no measured effect known).
+pub const v_nt4_sk1: Variant = .{ .nt = 4, .w = 4, .sk = 1, .pf = 2 };
+/// id 7, 4 tiles a warp, one in flight, a 4-way split: upstream's one-tile-a-warp regime (x3gm GM_GU2/GU3, NG 16).
+pub const v_nt4_pf1: Variant = .{ .nt = 4, .w = 4, .sk = 4, .pf = 1 };
+
+/// The variants the switch's ids index; the parent sweeps. Upstream's own tile retune is +4-12% prefill there.
+pub const variants = [_]Variant{ v_glm_gu, v_glm_dn, v_narrow, v_pf2, v_pf2_sk2, v_nt4, v_nt4_sk1, v_nt4_pf1 };
+
+/// The switch's name (the repo's TF_FLASHNEXT_* idiom).
+const tile_env = "TF_FLASHNEXT_X3_TILE";
+
+/// The variant the switch names for a class: "<gu>[,<dn>]", ids into `variants`; one id means both; unset is null.
+pub fn tileVariant(v: ?[]const u8, gateup: bool) !?Variant {
+    const text = v orelse return null;
+    if (text.len == 0) return null;
+    var it = std.mem.tokenizeScalar(u8, text, ',');
+    const gu = it.next() orelse return null;
+    const dn = it.next() orelse gu;
+    const id = std.fmt.parseInt(usize, if (gateup) gu else dn, 10) catch return error.NoTileVariant;
+    if (id >= variants.len) return error.NoTileVariant;
+    const t = variants[id];
+    if (tileIndex(t.nt, t.w, t.pf) == null) return error.NoTileKernel;
+    return t;
+}
+
+/// A variant's Tile for one shape: (K/16) | (sk * w) and (N/16) | nt, else NoTileShape, never launched wrong.
+pub fn variantTile(t: Variant, k: usize, n: usize) !Tile {
+    if (k % (16 * t.sk * t.w) != 0 or n % (16 * t.nt) != 0) return error.NoTileShape;
+    return .{ .nt = t.nt, .w = t.w, .sk = t.sk, .pf = t.pf };
+}
+
+/// The tile a class's grouped GEMM takes: the switch's variant when set, else `defaultTile`'s shape walk, unchanged.
+pub fn tile(k: usize, n: usize, gateup: bool) !Tile {
+    if (try tileVariant(tileEnvText(), gateup)) |t| return variantTile(t, k, n); // a bad id/kernel/shape errors
+    return defaultTile(k, n, gateup);
+}
+
+/// TF_FLASHNEXT_X3_TILE, read once. A forward asks per MoE layer, and the text does not change during the process.
+fn tileEnvText() ?[]const u8 {
+    const state = struct {
+        var text: ?[]const u8 = null;
+        var read: bool = false;
+    };
+    if (!state.read) {
+        state.text = if (std.c.getenv(tile_env)) |p| std.mem.span(p) else null;
+        state.read = true;
+    }
+    return state.text;
+}
+
 /// Trellis bytes one expert's gate, up and down read: (D*I/256) * (k2g + k2u + k2d) * 16 (experts.py:120).
 pub fn expertBytes(dims: usize, width: usize, k2_g: u32, k2_u: u32, k2_d: u32) u64 {
     return @as(u64, @intCast(dims * width / 256)) * (k2_g + k2_u + k2_d) * 16;
@@ -197,6 +264,11 @@ pub fn groupShared(rows: usize, slots: usize) usize {
     return rows * slots * @sizeOf(c_int);
 }
 
+/// The largest window the grouping buffer fits: groupShared(rows, slots) <= k.group_smem_max, never below 128.
+pub fn groupWindowMax(k: *const Kernels, slots: usize) usize {
+    return @max(@as(usize, k.group_smem_max) / groupShared(1, slots), 128);
+}
+
 /// gateup_epilogue_kernel (experts.cu:116) and down_epilogue_kernel (:161): grid (rows*slots, width/128), block 32.
 pub fn epilogueGrid(rows: usize, slots: usize, width: usize) [2]usize {
     return .{ rows * slots, width / 128 };
@@ -236,10 +308,11 @@ pub const k2s = [3]u32{ 8, 10, 12 };
 pub const wks = [3]usize{ 2, 4, 8 };
 
 /// (tiles a warp, warps a program, tiles in flight) the reference's grouped_launch picks from (experts_grouped.cuh:336).
-pub const tile_settings = [3]struct { nt: usize, w: usize, pf: usize }{
+pub const tile_settings = [4]struct { nt: usize, w: usize, pf: usize }{
     .{ .nt = 8, .w = 4, .pf = 1 },
     .{ .nt = 8, .w = 4, .pf = 2 },
     .{ .nt = 4, .w = 4, .pf = 2 },
+    .{ .nt = 4, .w = 4, .pf = 1 }, // (4, 4, 1): completes the NT 4/8 x PF 1/2 grid the reference's candidates cover
 };
 
 /// The k2 ranges a compiled instance covers: (8, 8) exactly, else (2, 10) when it fits, else (2, 16).
@@ -308,23 +381,80 @@ pub const sym = struct {
     pub const down_epilogue = "_ZN10tf_fn_exl311tf_exl3_exp20down_epilogue_kernelEPKfPKiPK6__halfPfiiii";
     pub const combine = "_ZN10tf_fn_exl311tf_exl3_exp14combine_kernelEPKfS2_Pfii";
     pub const down_combine = "_ZN10tf_fn_exl311tf_exl3_exp19down_combine_kernelEPKfPKiPK6__halfPfS2_S8_iiiii";
-    /// tf_exl3x (experts_grouped.cuh): [tile setting][k2 range]
-    pub const grouped = [3][3][:0]const u8{
+    /// tf_exl3x (experts_grouped.cuh): [tile setting][k2 range], MTL 1 (one 16-member tile a program).
+    pub const grouped = [4][3][:0]const u8{
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
         .{
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
-            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
         },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+    };
+    /// tf_exl3x: the wide member-pass arm (MTL 2, 32 members a program, rows staged in dynamic shared), mul1, opt-in.
+    pub const grouped_wide = [4][3][:0]const u8{
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x14grouped_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi2EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+    };
+    /// tf_exl3x: the decode ablation (grouped_abl_kernel, timing probe only, garbage output), same table order, MTL 1.
+    pub const grouped_abl = [4][3][:0]const u8{
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi8ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi2ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi2ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi2ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+        .{
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi8ELi8ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi2ELi10ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+            "_ZN10tf_fn_exl38tf_exl3x18grouped_abl_kernelILi2ELi4ELi4ELi1ELi2ELi16ELi1EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        },
+    };
+    /// tf_exl3x: the staged gm arm (128 members a program, the member rows the B operand), opt-in (TF_FLASHNEXT_X3_GM).
+    pub const grouped_gm = [3][:0]const u8{
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi8ELi8ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi10ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
+        "_ZN10tf_fn_exl38tf_exl3x17grouped_gm_kernelILi2ELi8ELi8ELi2ELi16ELi2ELi4ELi4EEEvPK6__halfS4_PKlS6_PKiS8_S8_S8_S8_Pfiiiiii",
     };
     /// tf_exl3x: the width's dequantize-to-dense (the grouped path's own decoder)
     pub const dequant = [3][:0]const u8{
@@ -346,10 +476,20 @@ pub const Kernels = struct {
     down_epilogue: cuda.Function,
     combine: cuda.Function,
     down_combine: cuda.Function,
-    grouped: [3][3]cuda.Function,
+    grouped: [4][3]cuda.Function,
+    /// the wide arm's instances: null when the embedded fatbin predates them, so the default path still loads
+    grouped_wide: [4][3]?cuda.Function,
+    /// the decode ablation's instances: null when the embedded fatbin predates them (a timing probe, off by default)
+    grouped_abl: [4][3]?cuda.Function,
+    /// the staged gm arm's instances: null when the embedded fatbin predates them (opt-in, off by default)
+    grouped_gm: [3]?cuda.Function,
     dequant: [3]cuda.Function,
     /// dynamic shared memory group_kernel was opted into (the device's ceiling less its static use)
     group_smem_max: u32,
+    /// the wide arm's dynamic ceiling (the device's opt-in less its static use), for the staged A tile
+    wide_smem_max: u32,
+    /// the gm arm's dynamic ceiling (the device's opt-in less its static use), for the staged member ring
+    gm_smem_max: u32,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -370,6 +510,13 @@ pub const Kernels = struct {
         for (sym.grouped, 0..) |row, i| for (row, 0..) |s, j| {
             k.grouped[i][j] = try k.module.function(s);
         };
+        for (sym.grouped_wide, 0..) |row, i| for (row, 0..) |s, j| {
+            k.grouped_wide[i][j] = k.module.function(s) catch null;
+        };
+        for (sym.grouped_abl, 0..) |row, i| for (row, 0..) |s, j| {
+            k.grouped_abl[i][j] = k.module.function(s) catch null;
+        };
+        for (sym.grouped_gm, 0..) |s, i| k.grouped_gm[i] = k.module.function(s) catch null;
         for (sym.dequant, 0..) |s, i| k.dequant[i] = try k.module.function(s);
         // group_kernel's grouping buffer: R*slots ints, which passes 48 KiB once a call has enough routed slots.
         // experts.cu:296 lifts the limit against the device's own opt-in ceiling less the kernel's static use.
@@ -377,6 +524,18 @@ pub const Kernels = struct {
         const statics: usize = @intCast(try k.group.attribute(.shared_size_bytes));
         k.group_smem_max = @intCast(ceiling -| statics);
         try k.group.allowDynamicShared(k.group_smem_max);
+        // the wide arm stages its A tile in dynamic shared: opt the staged instances in against the same ceiling
+        const wstatic: usize = if (k.grouped_wide[0][0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
+        k.wide_smem_max = @intCast(ceiling -| wstatic);
+        for (k.grouped_wide) |row| for (row) |maybe| {
+            if (maybe) |f| try f.allowDynamicShared(k.wide_smem_max);
+        };
+        // the gm arm stages its member ring in dynamic shared: opt the staged instances in against the same ceiling
+        const gstatic: usize = if (k.grouped_gm[0]) |f| @intCast(try f.attribute(.shared_size_bytes)) else 0;
+        k.gm_smem_max = @intCast(ceiling -| gstatic);
+        for (k.grouped_gm) |maybe| {
+            if (maybe) |f| try f.allowDynamicShared(k.gm_smem_max);
+        }
         return k;
     }
 
@@ -549,11 +708,65 @@ pub fn downCombine(k: *const Kernels, z: u64, pick: u64, svh_d: u64, y: u64, wts
     try cuda.launch.launch(k.down_combine, .{ .grid = dim3(g), .block = .{ .x = @intCast(downCombineBlock(slots)) } }, s, &a);
 }
 
-/// The grouped expert GEMM: up to 16 members a program, per-expert trellis pointers and widths.
+/// The wide member-pass arm's member-tile count: 2 tiles of 16 = 32 member rows a program, their rows staged.
+pub const wide_member_tiles: usize = 2;
+
+/// The wide arm's dynamic shared: MTL*16 rows of the split's k slice (stride 4 mod 32), then the reduction buffer.
+pub fn wideStageSmem(per_split: usize, w: usize) usize {
+    const words = per_split * 8;
+    const sw = words + ((4 + 32 - (words & 31)) & 31);
+    return 16 * wide_member_tiles * sw * 4 + w * 16 * wide_member_tiles * 16 * 4;
+}
+
+/// The opt-in switch's reading: unset or "0" is off, anything else on (the repo's getenv idiom).
+fn wideFlag(v: ?[]const u8) bool {
+    return if (v) |s| !std.mem.eql(u8, s, "0") else false;
+}
+/// Whether the wide arm runs: TF_FLASHNEXT_X3_WIDE_MEMBERS, off by default (the staged A tile arm, unmeasured).
+pub fn wideMembers() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_WIDE_MEMBERS")) |e| std.mem.span(e) else null;
+    return wideFlag(v);
+}
+
+/// Whether the grouped GEMM runs the decode ablation (TF_EXL3_ABL_DECODE): a timing probe, off by default.
+pub fn ablateDecode() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_EXL3_ABL_DECODE")) |e| std.mem.span(e) else null;
+    return wideFlag(v);
+}
+
+/// Whether the staged gm arm runs: TF_FLASHNEXT_X3_GM, off by default (upstream's gm_kernel ported as an opt-in arm).
+pub fn gmMembers() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_GM")) |e| std.mem.span(e) else null;
+    return wideFlag(v);
+}
+
+/// The gm arm's setting: NT 8 / W 8 / KS 2 / NSA 4, and SUBW 4 (the shipped warp count, so its 4 k sub-ranges).
+pub const gm_nt: usize = 8;
+pub const gm_warps: usize = 8;
+pub const gm_ks: usize = 2;
+pub const gm_nsa: usize = 4;
+pub const gm_subw: usize = 4;
+
+/// The gm arm's dynamic shared: NSA stages of 128 rows of the stage's KS k tiles (swizzled); run is in registers.
+pub fn gmStageSmem(ks: usize) usize {
+    return gm_nsa * (128 * ks * 16 * 2);
+}
+/// The gm arm's dynamic shared a block: KS 2 stages of 128 rows.
+pub fn gmSmem() usize {
+    return gmStageSmem(gm_ks);
+}
+/// The gm arm runs where the shipped arm uses SUBW 4 warps and its sub-range per_split/SUBW is a whole KS-tile count.
+pub fn gmShapeOk(kk: usize, n: usize, sk: usize, shipped_w: usize) bool {
+    if (shipped_w != gm_subw or sk == 0 or n % (16 * gm_nt) != 0 or kk % 16 != 0) return false;
+    if (kk / 16 % sk != 0) return false;
+    const per_split = kk / 16 / sk;
+    if (per_split % gm_subw != 0) return false;
+    return (per_split / gm_subw) % gm_ks == 0;
+}
+
+/// The grouped expert GEMM: 16 members a program, or 32 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
-    const mtiles = (maxm + 15) / 16;
     const t = tile_settings[setting];
-    const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
     var a: cuda.Args = .{};
     a.add(x0);
     a.add(x1);
@@ -571,8 +784,25 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
     a.add(int(sk));
     a.add(int(maxm));
     a.add(int(slots));
-    const f = k.grouped[setting][range];
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) } }, s, &a);
+    // The staged gm arm (opt-in): member rows the B operand, decoded weights the A operand; wins over the wide arm.
+    const gm = gmMembers() and gmShapeOk(kk, n, sk, t.w) and gmSmem() <= k.gm_smem_max;
+    if (gm) {
+        const f = k.grouped_gm[range] orelse return error.NoGmKernel;
+        const mtiles = (maxm + 127) / 128;
+        const g = groupedGrid(experts, n, gm_nt, mats, sk, mtiles);
+        return cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(gm_warps * 32) }, .shared = @intCast(gmSmem()) }, s, &a);
+    }
+    const wide = wideMembers();
+    const abl = !wide and ablateDecode();
+    // the staged arm runs only where its A tile fits the device opt-in; a wider split (sk 1 or 2) falls back to MTL 1
+    const stage = wideStageSmem(kk / 16 / sk, t.w);
+    const staged = wide and stage <= k.wide_smem_max;
+    const mtl: usize = if (staged) wide_member_tiles else 1;
+    const mtiles = (maxm + 16 * mtl - 1) / (16 * mtl);
+    const g = groupedGrid(experts, n, t.nt, mats, sk, mtiles);
+    const f = if (staged) (k.grouped_wide[setting][range] orelse return error.NoWideKernel) else if (abl) (k.grouped_abl[setting][range] orelse return error.NoAblKernel) else k.grouped[setting][range];
+    const sh: u32 = if (staged) @intCast(stage) else 0;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(g[0]), .y = @intCast(g[1]), .z = @intCast(g[2]) }, .block = .{ .x = @intCast(t.w * 32) }, .shared = sh }, s, &a);
 }
 
 /// The experts' dequantize-to-dense: W_q fp16 [K, N] of one matrix (the tests' path).
@@ -590,6 +820,31 @@ pub fn dequant(k: *const Kernels, k2: u32, words: u64, out: u64, kk: usize, n: u
 // ---------------------------------------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the wide member-pass arm is off unless the switch is set" {
+    try testing.expect(!wideFlag(null)); // unset: the 16-member path
+    try testing.expect(!wideFlag("0")); // the repo's explicit off
+    try testing.expect(wideFlag("1"));
+    try testing.expect(wideFlag("anything"));
+    try testing.expectEqual(@as(usize, 2), wide_member_tiles);
+    // maxm 200: the 16-member path runs 13 member-tile programs, the wide arm 7 groups of 32 rows
+    try testing.expectEqual(@as(usize, 13), (200 + 15) / 16);
+    try testing.expectEqual(@as(usize, 7), (200 + 16 * 2 - 1) / (16 * 2));
+}
+
+test "the staged A tile is sized from the split and padded off the row banks" {
+    // moe gate/up: K 2560, sk 4 -> per_split 40 -> 320 words a row, +4 so a lane's four words take 32 banks
+    try testing.expectEqual(@as(usize, 49664), wideStageSmem(40, 4));
+    // moe down: K 640, sk 2 -> per_split 20 -> 160 words a row
+    try testing.expectEqual(@as(usize, 29184), wideStageSmem(20, 4));
+    // the row stride is 4 mod 32 for the served split (the pad is address space, never read)
+    try testing.expectEqual(@as(usize, 4), (40 * 8 + ((4 + 32 - (40 * 8 & 31)) & 31)) % 32);
+}
+
+test "the decode ablation shares the wide arm's opt-in reading" {
+    try testing.expect(!wideFlag(null) and !wideFlag("0")); // unset / "0": grouped_kernel, the default path
+    try testing.expect(wideFlag("1")); // set: grouped_abl_kernel, the timing probe
+}
 
 test "plan matches linear.py across the pack's shapes" {
     // Expected values from linear.py's own plan() (the reference file, executed as it stands).
@@ -751,6 +1006,13 @@ test "bitsOf reads the width off the trellis, per tensor" {
     try testing.expectEqual(@as(?f64, null), bitsOf(&.{}));
 }
 
+test "tile keeps the setting it read" {
+    const gu = try tile(2560, 640, true);
+    try testing.expectEqual(gu, try tile(2560, 640, true));
+    const dn = try tile(640, 2560, false);
+    try testing.expectEqual(dn, try tile(640, 2560, false));
+}
+
 test "the tile setting defaultTile picks is one the fatbin carries" {
     // The pack's projection: D 2560 -> I 640 for gate and up, I 640 -> D 2560 for down.
     const gu = try defaultTile(2560, 640, true);
@@ -768,6 +1030,29 @@ test "the tile setting defaultTile picks is one the fatbin carries" {
         try testing.expect(tileIndex(t.nt, t.w, t.pf) != null);
     }
     try testing.expectError(error.NoTileSetting, defaultTile(80, 640, true));
+}
+
+test "the tile sweep names a variant the fatbin carries, and never falls back silently" {
+    // unset or blank: defaultTile's shape walk, exactly today's choice
+    try testing.expectEqual(@as(?Variant, null), try tileVariant(null, true));
+    try testing.expectEqual(@as(?Variant, null), try tileVariant("", false));
+    // every row resolves to a setting tile_settings lists, so the fatbin carries its (nt, w, pf) constexprs
+    for (variants) |t| try testing.expect(tileIndex(t.nt, t.w, t.pf) != null);
+    // one id names both classes, "gu,dn" names each, and a trailing field is ignored past the second
+    try testing.expectEqual(v_glm_gu, (try tileVariant("0", true)).?);
+    try testing.expectEqual(v_glm_gu, (try tileVariant("0", false)).?);
+    try testing.expectEqual(v_glm_gu, (try tileVariant("0,1", true)).?);
+    try testing.expectEqual(v_glm_dn, (try tileVariant("0,1", false)).?);
+    try testing.expectEqual(v_nt4_pf1, (try tileVariant("7,7", true)).?);
+    // an id past the table is loud, never a silent fall back onto the defaults
+    try testing.expectError(error.NoTileVariant, tileVariant("8", true));
+    try testing.expectError(error.NoTileVariant, tileVariant("x", false));
+    // the defaults the switch reproduces: gu -> GLM's gate/up tile, dn -> GLM's down tile, for the pack's shapes
+    try testing.expectEqual(glm_gateup, try variantTile(v_glm_gu, 2560, 640));
+    try testing.expectEqual(glm_down, try variantTile(v_glm_dn, 640, 2560));
+    // a variant that does not divide the shape (640/16 = 40, not a multiple of sk*w = 16) is loud, not a fall back
+    try testing.expectError(error.NoTileShape, variantTile(v_nt4_pf1, 640, 512));
+    try testing.expectEqual(@as(usize, 4), (try variantTile(v_glm_gu, 2560, 512)).sk);
 }
 
 test "an expert's trellis bytes and a layer's width envelope" {

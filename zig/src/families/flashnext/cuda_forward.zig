@@ -246,7 +246,7 @@ const X3Scratch = struct {
     face: u64, // [rows, N] fp16: one stacked part's columns, the widest stacked part's N
     ple_dev: u64, // [max_rows * heads, WORDS] int16: the staged PLE rows as the table stores them (exl3_mm.Scratch.ple_dev)
     ple_hb: u64, // [heads * DH] fp16: the mul1 codebook's per-head bias, the table's own file, uploaded once
-    // the grouped experts' rows: P = x3_moe_window * slots
+    // the grouped experts' rows: P = x3MoeWindow() * slots
     mg: u64, // [P, D] fp16: the rotated gate input
     mu: u64, // [P, D] fp16: the rotated up input
     md: u64, // [P, I] fp16: the SwiGLU's rotated down input
@@ -254,14 +254,15 @@ const X3Scratch = struct {
     my: u64, // [P, D] fp32: a window's per-slot rows
     mids: u64, // [maxu] int32
     mcnt: u64, // [1] int32
-    mmem: u64, // [maxu, x3_moe_window] int32
+    mmem: u64, // [maxu, x3MoeWindow()] int32
 
     fn deinit(x: *X3Scratch) void {
         x.arena.buf.free();
     }
 
     /// The scratch a model's trellis matrices need: widest K, split-K partials and counters, and the experts' buffers.
-    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize) !X3Scratch {
+    /// `k3` sizes the grouped-expert window: the runtime pass never asks for more rows than group_kernel's shared memory.
+    fn init(d: *const cuda.Driver, w: *const W.Weights, g: state.Geometry, max_rows: usize, k3: ?*const exl3.Kernels) !X3Scratch {
         var kmax: usize = @max(g.hidden, g.heads * g.head_dim);
         var zmax: usize = 0;
         var ctrmax: usize = 0;
@@ -298,12 +299,19 @@ const X3Scratch = struct {
             if (ng.exl3) |e| plew = @max(plew, e.words);
             pleh = ng.head_bias.len;
         }
-        const mrows = @min(max_rows, x3_moe_window);
+        const mrows = @min(max_rows, x3MoeRows(g, k3));
         const slots = g.slots();
         const P = mrows * slots;
         const maxu = @min(P, g.experts);
-        const gu = exl3.defaultTile(g.hidden, g.moe_width, true) catch exl3.glm_gateup;
-        const dn = exl3.defaultTile(g.moe_width, g.hidden, false) catch exl3.glm_down;
+        // the sweep switch's variant when set (a bad one fails here, not silently), else the shape walk's GLM tile
+        const gu = exl3.tile(g.hidden, g.moe_width, true) catch |e| switch (e) {
+            error.NoTileSetting => exl3.glm_gateup,
+            else => return e,
+        };
+        const dn = exl3.tile(g.moe_width, g.hidden, false) catch |e| switch (e) {
+            error.NoTileSetting => exl3.glm_down,
+            else => return e,
+        };
         const mz = @max(2 * gu.sk * g.moe_width, dn.sk * g.hidden) * P;
         const sizes = [14]usize{
             128 * kmax * 2,                      @max(zmax, 1) * 4, @max(ctrmax, 8) * 4, 128 * face * 2,
@@ -324,7 +332,38 @@ const X3Scratch = struct {
 };
 
 /// The rows a grouped-expert window holds (Python's MOE_WINDOW); rows never depend on it, it only bounds the scratch.
-pub const x3_moe_window = 1024;
+pub fn x3MoeWindow() usize {
+    // TF_FLASHNEXT_X3_MOE_WINDOW (default 2048: +7.0-7.6% over 1024 at identical bits) trades scratch for fewer passes.
+    // One read: a forward asks again at every MoE layer, and the process does not change the variable.
+    const v = x3MoeWindowEnv() orelse return 2048;
+    return @max(@min(std.fmt.parseInt(usize, v, 10) catch 2048, 16384), 128);
+}
+
+fn x3MoeWindowEnv() ?[]const u8 {
+    const held = struct {
+        var text: ?[]const u8 = null;
+        var read: bool = false;
+    };
+    if (!held.read) {
+        held.text = if (std.c.getenv("TF_FLASHNEXT_X3_MOE_WINDOW")) |p| std.mem.span(p) else null;
+        held.read = true;
+    }
+    return held.text;
+}
+
+/// Rows the grouped-expert scratch must hold. The pass uses min(the env window, the shared-memory cap), and the cap
+/// is larger for the smaller slot count, so both the main path and the MTP path fit. With one slot count this is
+/// exactly the pass's window.
+fn x3MoeRows(g: state.Geometry, k3: ?*const exl3.Kernels) usize {
+    const window = x3MoeWindow();
+    const k = k3 orelse return window;
+    const hi = g.slots();
+    const lo = @min(g.topKFor(false), g.topKFor(true)) + 1;
+    const rows_hi = @min(window, exl3.groupWindowMax(k, hi));
+    const rows_lo = @min(window, exl3.groupWindowMax(k, lo));
+    const cover = (rows_lo * lo + hi - 1) / hi;
+    return @max(rows_hi, cover);
+}
 
 /// A trellis matrix `a`'s share of an EXL3 scratch's sizes: the widest K, the most split-K partials and counters.
 fn x3Fold(a: ?W.X3, kmax: *usize, zmax: *usize, ctrmax: *usize) void {
@@ -654,7 +693,7 @@ pub const Forward = struct {
     /// fn_qsa_scores.cu for the prompt indexer's scores (`_scores`' bits); null: Python's `_scores`
     qsa_fast: ?*const prompt.QsaScores = null,
 
-    pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize) !Forward {
+    pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize, k3: ?*const exl3.Kernels) !Forward {
         var f: Forward = .{ .gpa = gpa, .d = d, .s = s, .ops = ops, .t = t, .th = th, .w = w, .c = c, .dims = dims, .g = g, .sc = undefined, .pin = undefined, .pin_rows = max_rows, .staged = undefined, .eps = @floatCast(c.eps), .vocab_offset = w.vocab_offset };
         f.sc = try Scratch.init(d, g, max_rows, partBytes(g, max_rows));
         errdefer f.sc.deinit();
@@ -663,7 +702,7 @@ pub const Forward = struct {
         errdefer f.pin.free();
         f.staged = try cuda.Event.init(d, false);
         try f.staged.record(s);
-        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows);
+        if (c.quant == .exl3) f.x3 = try X3Scratch.init(d, w, g, max_rows, k3);
         errdefer if (f.x3) |*q| q.deinit();
         if (f.x3) |*q| {
             // the mul1 codebook's per-head bias: `_ple_rows` reads it as its HB operand, so it lives on the device too
@@ -2044,16 +2083,18 @@ pub const Forward = struct {
         const E = g.experts;
         const slots = top + 1;
         if (ex.width != I or ex.dims != D) return error.ExpertShape;
-        const gu = exl3.defaultTile(D, I, true) catch return error.NoTileSetting;
-        const dn = exl3.defaultTile(I, D, false) catch return error.NoTileSetting;
+        const gu = try exl3.tile(D, I, true);
+        const dn = try exl3.tile(I, D, false);
         const set_gu = exl3.tileIndex(gu.nt, gu.w, gu.pf) orelse return error.NoTileSetting;
         const set_d = exl3.tileIndex(dn.nt, dn.w, dn.pf) orelse return error.NoTileSetting;
         const rng_gu = exl3.rangeIndex(ex.k2_gu[0], ex.k2_gu[1]);
         const rng_d = exl3.rangeIndex(ex.k2_d[0], ex.k2_d[1]);
         const es: usize = if (x.y_f32) 4 else 2;
+        // Clamp once: rows*slots*4 <= group_smem_max. Rows change passes not bits; the halving replay was unsound.
+        const win = @min(x3MoeWindow(), exl3.groupWindowMax(k3, slots));
         var r0: usize = 0;
-        while (r0 < n) : (r0 += x3_moe_window) {
-            const R = @min(x3_moe_window, n - r0);
+        while (r0 < n) {
+            const R = @min(win, n - r0);
             const P = R * slots;
             const maxu = @min(P, E);
             const at = a0 + r0;
@@ -2069,6 +2110,7 @@ pub const Forward = struct {
             try exl3.grouped(k3, set_d, rng_d, xs.md, xs.md, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, xs.mids, xs.mcnt, xs.mmem, xs.mz, I, D, P, dn.sk, maxu, slots, E, 1, f.s);
             try exl3.downEpilogue(k3, xs.mz, pick, ex.svh_d, y, R, slots, P, D, dn.sk, E, f.s);
             try f.mark(.experts_down);
+            r0 += R;
         }
     }
 
@@ -2247,6 +2289,12 @@ test "the partial scratch covers the widest split-K matmul of a prompt chunk" {
     try std.testing.expectEqual(@as(usize, 4 * 4 * 2048 * 2560 * 4), partBytes(g, 2048));
     // the MTP head's fc_h at 8 rows takes 32 stream rows of [2560, 2560]
     try std.testing.expect(partBytes(g, 8) >= tri.b16PartBytes(32, 2560, 2560));
+}
+
+test "the grouped-expert window is one clamped value" {
+    const w = x3MoeWindow();
+    try std.testing.expectEqual(w, x3MoeWindow());
+    try std.testing.expect(w >= 128 and w <= 16384);
 }
 
 test {
