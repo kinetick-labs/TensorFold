@@ -61,6 +61,8 @@ pub const Geometry = struct {
     shared_width: usize = 0,
     /// INT4-AutoRound: block-FP8 mixers and shared expert, GPTQ int4 experts and head (cuda_forward's scratch for them)
     int4ar: bool = false,
+    /// FP4-Local served with MXFP8 faces (fp8.Linear mx): cuda_forward's face scratch as INT4-AutoRound's
+    mx8: bool = false,
     /// the MTP layer's routed experts a row (0: top_k); drafts only (TF_FLASHNEXT_MTP_TOPK: INT4-AutoRound's MTP layer
     /// was trained at top-10 while its main layers route 5)
     mtp_top_k: usize = 0,

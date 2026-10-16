@@ -12,7 +12,8 @@ const std = @import("std");
 const cuda = @import("cuda");
 
 /// Fp8BlockLinear: w8 uint8 [npad/64][K/64][8][32][2][8] (fragment order), bs fp32 [npad/64][K/64][64].
-pub const Linear = struct { w8: u64 = 0, bs: u64 = 0, n: u32 = 0, k: u32 = 0, npad: u32 = 0 };
+/// `mx`: MXFP8 (bs holds UE8M0 bytes [npad/64][k/64][64][2], one a 32 inputs) instead of FP8G's fp32 a 64.
+pub const Linear = struct { w8: u64 = 0, bs: u64 = 0, n: u32 = 0, k: u32 = 0, npad: u32 = 0, mx: bool = false };
 
 /// linear.py FUSED_ROWS (TF_QMMF_FUSED_ROWS default): rows from which a block sums its tile's K slices itself.
 pub const fused_rows: usize = 256;
@@ -51,7 +52,10 @@ pub fn l2Group(rows_t: usize, bm: usize, k: usize) usize {
 /// Mangled names of the FP8G instantiations (fn_qmmf.cu's footer): [F32][cluster][bm 16, 32, 64], and the fused [F32].
 pub const sym = struct {
     fn name(comptime bm: u32, comptime f32_out: bool, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
-        return std.fmt.comptimePrint("_ZN10tf_fn_qmmf11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi4ELb{d}ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ bm, @intFromBool(f32_out), @intFromBool(cluster), @intFromBool(fuse) });
+        return nameM(3, bm, f32_out, cluster, fuse);
+    }
+    fn nameM(comptime mode: u32, comptime bm: u32, comptime f32_out: bool, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN10tf_fn_qmmf11qmmf_kernelILi{d}ELi{d}ELi64ELi1ELi4ELi4ELb{d}ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ mode, bm, @intFromBool(f32_out), @intFromBool(cluster), @intFromBool(fuse) });
     }
     pub const tiled = blk: {
         var out: [2][2][3][:0]const u8 = undefined;
@@ -61,9 +65,20 @@ pub const sym = struct {
         break :blk out;
     };
     pub const fused = [2][:0]const u8{ name(64, false, false, true), name(64, true, false, true) };
+    pub const tiled_mx = blk: {
+        var out: [2][2][3][:0]const u8 = undefined;
+        for (0..2) |f| for (0..2) |c| for (0..3) |b| {
+            out[f][c][b] = nameM(2, 16 << b, f == 1, c == 1, false);
+        };
+        break :blk out;
+    };
+    pub const fused_mx = [2][:0]const u8{ nameM(2, 64, false, false, true), nameM(2, 64, true, false, true) };
     /// fn_qmmf_ld.cu's (tools/zig/flashnext_qmmf_ld.py): bf16 out with a row stride, [cluster][bm 16, 32, 64] and fused
     fn ldName(comptime bm: u32, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
-        return std.fmt.comptimePrint("_ZN13tf_fn_qmmf_ld11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi4ELb0ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", .{ bm, @intFromBool(cluster), @intFromBool(fuse) });
+        return ldNameM(3, bm, cluster, fuse);
+    }
+    fn ldNameM(comptime mode: u32, comptime bm: u32, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN13tf_fn_qmmf_ld11qmmf_kernelILi{d}ELi{d}ELi64ELi1ELi4ELi4ELb0ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", .{ mode, bm, @intFromBool(cluster), @intFromBool(fuse) });
     }
     pub const ld_tiled = blk: {
         var out: [2][3][:0]const u8 = undefined;
@@ -73,6 +88,14 @@ pub const sym = struct {
         break :blk out;
     };
     pub const ld_fused = ldName(64, false, true);
+    pub const ld_tiled_mx = blk: {
+        var out: [2][3][:0]const u8 = undefined;
+        for (0..2) |c| for (0..3) |b| {
+            out[c][b] = ldNameM(2, 16 << b, c == 1, false);
+        };
+        break :blk out;
+    };
+    pub const ld_fused_mx = ldNameM(2, 64, false, true);
 };
 
 pub const Kernels = struct {
@@ -83,6 +106,11 @@ pub const Kernels = struct {
     ld_module: cuda.Module,
     ld_tiled: [2][3]cuda.Function,
     ld_fused: cuda.Function,
+    /// the MXFP8 instances of the same kernels (Linear.mx)
+    tiled_mx: [2][2][3]cuda.Function,
+    fused_mx: [2]cuda.Function,
+    ld_tiled_mx: [2][3]cuda.Function,
+    ld_fused_mx: cuda.Function,
     major: c_int,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -97,6 +125,12 @@ pub const Kernels = struct {
             };
             k.fused[f] = try k.module.function(sym.fused[f]);
             try k.fused[f].allowDynamicShared(smem(64));
+            for (0..2) |c| for (0..3) |b| {
+                k.tiled_mx[f][c][b] = try k.module.function(sym.tiled_mx[f][c][b]);
+                try k.tiled_mx[f][c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
+            };
+            k.fused_mx[f] = try k.module.function(sym.fused_mx[f]);
+            try k.fused_mx[f].allowDynamicShared(smem(64));
         }
         k.ld_module = try cuda.Module.load(ctx.d, cuda.kernels.fn_qmmf_ld);
         errdefer k.ld_module.unload();
@@ -106,6 +140,12 @@ pub const Kernels = struct {
         };
         k.ld_fused = try k.ld_module.function(sym.ld_fused);
         try k.ld_fused.allowDynamicShared(smem(64));
+        for (0..2) |c| for (0..3) |b| {
+            k.ld_tiled_mx[c][b] = try k.ld_module.function(sym.ld_tiled_mx[c][b]);
+            try k.ld_tiled_mx[c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
+        };
+        k.ld_fused_mx = try k.ld_module.function(sym.ld_fused_mx);
+        try k.ld_fused_mx.allowDynamicShared(smem(64));
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
     }
@@ -151,7 +191,9 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     if (!fused and sk > 1 and !cluster) return error.SplitWithoutCluster;
     const tile: usize = if (fused) 64 else bm;
     const rows_t = (m + tile - 1) / tile;
-    const f = if (ldo != null) (if (fused) k.ld_fused else k.ld_tiled[@intFromBool(cluster)][bucketIndex(bm)]) else if (fused) k.fused[@intFromBool(f32_out)] else k.tiled[@intFromBool(f32_out)][@intFromBool(cluster)][bucketIndex(bm)];
+    const f = if (l.mx)
+        (if (ldo != null) (if (fused) k.ld_fused_mx else k.ld_tiled_mx[@intFromBool(cluster)][bucketIndex(bm)]) else if (fused) k.fused_mx[@intFromBool(f32_out)] else k.tiled_mx[@intFromBool(f32_out)][@intFromBool(cluster)][bucketIndex(bm)])
+    else if (ldo != null) (if (fused) k.ld_fused else k.ld_tiled[@intFromBool(cluster)][bucketIndex(bm)]) else if (fused) k.fused[@intFromBool(f32_out)] else k.tiled[@intFromBool(f32_out)][@intFromBool(cluster)][bucketIndex(bm)];
     var a: cuda.Args = .{};
     a.add(x);
     a.add(l.w8);
@@ -196,6 +238,16 @@ pub fn fragmentOrder(codes: []const u8, n: usize, k: usize, npad: usize, out: []
         const col = b * 64 + h * 32 + kin(lane, byte);
         out[i] = if (row < n) codes[row * k + col] else 0;
         i += 1;
+    };
+}
+
+/// MXFP8 scale bytes [n, k/32] (127, 2^0, for rows past n up to npad) -> [npad/64][k/64][64][2] (qmmf.cu's MXFP8 S).
+pub fn tileMxScales(sc: []const u8, n: usize, k: usize, npad: usize, out: []u8) !void {
+    const kg = k / 64;
+    if (k % 64 != 0 or npad % 64 != 0 or npad < n or sc.len != n * (k / 32) or out.len != npad * kg * 2) return error.BadFp8Shape;
+    for (0..npad / 64) |a| for (0..kg) |g| for (0..64) |r| for (0..2) |h| {
+        const row = a * 64 + r;
+        out[((a * kg + g) * 64 + r) * 2 + h] = if (row < n) sc[row * (k / 32) + g * 2 + h] else 127;
     };
 }
 
