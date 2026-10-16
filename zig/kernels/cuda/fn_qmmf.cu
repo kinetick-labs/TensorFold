@@ -310,3 +310,22 @@ TF_QMMF(32, true, true, false)
 TF_QMMF(64, true, true, false)
 TF_QMMF(64, false, false, true)
 TF_QMMF(64, true, false, true)
+
+// MXFP8 (e4m3 with a UE8M0 byte per 32 inputs: FP4-Local's dense linears), the same tiles and slices.
+#define TF_QMMF_MX(BM, F32, CLUSTER, FUSE) template __global__ void tf_fn_qmmf::qmmf_kernel<2, BM, 64, 1, 4, 4, F32, \
+    CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, \
+    int, int, int, int);
+TF_QMMF_MX(16, false, false, false)
+TF_QMMF_MX(32, false, false, false)
+TF_QMMF_MX(64, false, false, false)
+TF_QMMF_MX(16, true, false, false)
+TF_QMMF_MX(32, true, false, false)
+TF_QMMF_MX(64, true, false, false)
+TF_QMMF_MX(16, false, true, false)
+TF_QMMF_MX(32, false, true, false)
+TF_QMMF_MX(64, false, true, false)
+TF_QMMF_MX(16, true, true, false)
+TF_QMMF_MX(32, true, true, false)
+TF_QMMF_MX(64, true, true, false)
+TF_QMMF_MX(64, false, false, true)
+TF_QMMF_MX(64, true, false, true)

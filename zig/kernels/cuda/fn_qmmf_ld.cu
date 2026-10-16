@@ -305,3 +305,15 @@ TF_QMMF_LD(16, true, false)
 TF_QMMF_LD(32, true, false)
 TF_QMMF_LD(64, true, false)
 TF_QMMF_LD(64, false, true)
+
+// MXFP8 (FP4-Local's dense linears), the same tiles.
+#define TF_QMMF_LD_MX(BM, CLUSTER, FUSE) template __global__ void tf_fn_qmmf_ld::qmmf_kernel<2, BM, 64, 1, 4, 4, false, \
+    CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, \
+    int, int, int, int, int);
+TF_QMMF_LD_MX(16, false, false)
+TF_QMMF_LD_MX(32, false, false)
+TF_QMMF_LD_MX(64, false, false)
+TF_QMMF_LD_MX(16, true, false)
+TF_QMMF_LD_MX(32, true, false)
+TF_QMMF_LD_MX(64, true, false)
+TF_QMMF_LD_MX(64, false, true)
