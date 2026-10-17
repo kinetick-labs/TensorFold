@@ -261,6 +261,12 @@ fn envGet(name: [:0]const u8) ?[]const u8 {
 }
 
 /// TF_FLASHNEXT_MXFP8 (default on): FP4-Local's MXFP8 mixers natively (0: widened to bf16, the same values).
+/// TF_FLASHNEXT_HC_LANE=1: FP4-Local's hyper-connections' decode rows on the lane matmul's BF16 mode.
+fn hcLaneOf(c: *const cfgs.Config) bool {
+    const v = envGet("TF_FLASHNEXT_HC_LANE") orelse return false;
+    return c.hasMxfp8() and std.mem.eql(u8, v, "1");
+}
+
 fn mx8Of(c: *const cfgs.Config) bool {
     return c.hasMxfp8() and !envOff("TF_FLASHNEXT_MXFP8");
 }
@@ -373,6 +379,8 @@ pub const Engine = struct {
     digest: bool = false,
     /// INT4-AutoRound: the block-FP8 lane matmul (cuda_fp8.zig) and the GPTQ int4 kernels (cuda_int4.zig)
     k8: ?fp8.Kernels = null,
+    /// TF_FLASHNEXT_HC_LANE: the lane matmul for the hyper-connections' decode rows
+    lane: ?cuda.qmmf.Lane = null,
     k4: ?int4.Kernels = null,
     /// EXL3 (an ExLlamaV3 pack): the trellis linear and grouped expert kernels (cuda_exl3.zig)
     k3: ?exl3.Kernels = null,
@@ -409,7 +417,7 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay, .mxfp8 = mx8Of(&e.c) });
+        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay, .mxfp8 = mx8Of(&e.c), .hc_lane = hcLaneOf(&e.c) });
         errdefer e.w.deinit();
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
@@ -447,6 +455,10 @@ pub const Engine = struct {
         e.f.comm = o.comm;
         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
         try e.f.initRound(rows, @max(1, o.streams));
+        if (hcLaneOf(&e.c)) {
+            e.lane = try cuda.qmmf.Lane.load(d, @intCast(try ctx.attribute(.compute_capability_major)));
+            e.f.lane = &e.lane.?;
+        }
         if (mx8Of(&e.c)) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.f.k8 = &e.k8.?;
