@@ -1149,12 +1149,18 @@ pub const Forward = struct {
     /// mm with the input's group sums `xs` known: a matrix with a 4-bit copy in mtp_q4 (the MTP head's, D5) runs qmm
     /// on it; every other matrix (and xs 0) the bf16 matmul as `mm`.
     pub fn mmx(f: *Forward, x: u64, x_stride: usize, xs: u64, r: W.Rows, out: u64, fp32: bool, m: usize) !void {
+        if (f.mtp_q4) |t| if (t.findMx(r.weight)) |l| return fp8.matmul(f.k8 orelse return error.NoFp8Kernels, f.s, x, x_stride, l, out, fp32, m);
         if (xs != 0) if (f.mtp_q4) |t| if (t.find(r.weight)) |q| return f.ops.qmm32Split(x, x_stride, xs, q, out, m, fp32);
         try f.mm(x, x_stride, r, out, fp32, m);
     }
 
     /// mmAt (the profiled part) with the 4-bit MTP copy as `mmx`.
     pub fn mmxAt(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, xs: u64, r: W.Rows, out: u64, fp32: bool, m: usize) !void {
+        if (f.mtp_q4) |t| if (t.findMx(r.weight)) |l| {
+            try fp8.matmul(f.k8 orelse return error.NoFp8Kernels, f.s, x, x_stride, l, out, fp32, m);
+            if (part) |p| try f.mark(p);
+            return;
+        };
         if (xs != 0) if (f.mtp_q4) |t| if (t.find(r.weight)) |q| {
             try f.ops.qmm32Split(x, x_stride, xs, q, out, m, fp32);
             if (part) |p| try f.mark(p);
