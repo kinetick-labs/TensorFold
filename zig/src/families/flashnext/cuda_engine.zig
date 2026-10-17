@@ -1346,6 +1346,31 @@ pub const Engine = struct {
         try e.drawRowsRaw(logits_base, cand_all, total, row0, rows, first_position, s, out);
         if (envGet("TF_FLASHNEXT_FORCE")) |path| try e.forceRows(path, first_position, out[0..rows]);
         if (envGet("TF_FLASHNEXT_LOGIT_DUMP")) |path| try e.dumpRows(path, logits_base, row0, rows, first_position, out);
+        if (envGet("TF_FLASHNEXT_MIXED_DUMP")) |path| try e.dumpMixed(path, row0, rows, out);
+    }
+
+    var mixed_file: ?*std.c.FILE = null;
+    var mixed_rows: usize = 0;
+
+    /// TF_FLASHNEXT_MIXED_DUMP=path (diagnostics, one GPU, the first 4096 rows): per window row its draw (u32) and
+    /// the head's input row (hidden bf16), raw, appended (the lm_head screening harness's inputs).
+    fn dumpMixed(e: *Engine, path: []const u8, row0: usize, rows: usize, out: []const u32) !void {
+        if (e.world > 1 or mixed_rows >= 4096) return;
+        if (mixed_file == null) {
+            var pb: [512]u8 = undefined;
+            const z = try std.fmt.bufPrintSentinel(&pb, "{s}", .{path}, 0);
+            mixed_file = std.c.fopen(z, "a") orelse return error.DumpOpen;
+        }
+        const D = e.g.hidden;
+        const host = try e.gpa.alloc(u16, rows * D);
+        defer e.gpa.free(host);
+        try e.read(e.buf.b.mixed + row0 * D * 2, std.mem.sliceAsBytes(host));
+        for (0..rows) |r| {
+            _ = std.c.fwrite(std.mem.asBytes(&out[r]).ptr, 4, 1, mixed_file.?);
+            _ = std.c.fwrite(std.mem.sliceAsBytes(host[r * D ..][0..D]).ptr, 2, D, mixed_file.?);
+        }
+        _ = c_fflush(mixed_file.?);
+        mixed_rows += rows;
     }
 
     fn drawRowsRaw(e: *Engine, logits_base: u64, cand_all: u64, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, out: []u32) !void {
