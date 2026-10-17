@@ -2119,6 +2119,11 @@ pub const Forward = struct {
         c.layers += 1;
         c.distinct += seen.count();
         c.rows += R;
+        // the lane core never prints the rounds summary: report every 2400 layers (50 rounds of 48) here
+        if (c.layers >= 2400) {
+            std.debug.print("count experts ({s}): {d:.1} distinct routed experts a MoE layer over {d:.2} rows ({d} layers)\n", .{ if (f.prof.?.mtp) "MTP head" else "main", @as(f64, @floatFromInt(c.distinct)) / @as(f64, @floatFromInt(c.layers)), @as(f64, @floatFromInt(c.rows)) / @as(f64, @floatFromInt(c.layers)), c.layers });
+            c.* = .{};
+        }
     }
 
     /// The experts, the shared expert and the slots of rows [a0, a0 + n) (the router's picks made for every row), `top`
