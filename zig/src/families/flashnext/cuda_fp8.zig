@@ -212,7 +212,7 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
         a.add(l.bs);
         a.add(out);
         for ([_]usize{ m, n, kk, if (m == 1) kk else x_stride, ldo orelse n }) |v| a.add(@as(c_int, @intCast(v)));
-        return cuda.launch.launch(g[@intFromBool(f32_out)][b], .{ .grid = .{ .x = @intCast((n + 7) / 8), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = 0, .cluster = null }, s, &a);
+        return cuda.launch.launch(g[@intFromBool(f32_out)][b], .{ .grid = .{ .x = @intCast((n + 7) / 8), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = 0, .cluster = null }, s, &a);
     };
     const sk = splitK(n, kk);
     const bm: usize = if (sk > 1 and m >= fused_rows) 0 else bucket(m);
