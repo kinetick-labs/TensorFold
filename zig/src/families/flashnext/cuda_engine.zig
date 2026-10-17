@@ -1588,7 +1588,7 @@ pub const Engine = struct {
             if (r + 1 >= rows) done = true;
         }
         const n = e.spec_kept + e.spec_taken + e.spec_plain;
-        if (n / 2000 != (n - @min(n, rows)) / 2000) std.log.info("spec sample: {d} drafts kept, {d} refused (residual draws), {d} plain rows", .{ e.spec_kept, e.spec_taken, e.spec_plain });
+        if (n / 2000 != (n - @min(n, rows)) / 2000) std.log.warn("spec sample: {d} drafts kept, {d} refused (residual draws), {d} plain rows", .{ e.spec_kept, e.spec_taken, e.spec_plain });
     }
 
     /// TF_FLASHNEXT_FORCE=path (diagnostics): "pos token" lines, read again each window; a row at a listed position
