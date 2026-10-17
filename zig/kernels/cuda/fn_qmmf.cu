@@ -346,10 +346,25 @@ __device__ __forceinline__ void mx_gemv(const __nv_bfloat16* __restrict__ x, con
     float acc[MR];
 #pragma unroll
     for (int i = 0; i < MR; ++i) acc[i] = 0.f;
-    for (int g = warp; g < kg; g += WARPS) {
-        const size_t blk = (size_t)tile * kg + g;
-        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(w8 + blk * 4096 + c * 512) + lane);
-        const uint16_t sv = __ldg(reinterpret_cast<const uint16_t*>(bs + (blk * 64 + r_in) * 2));
+    constexpr int U = 4;
+    for (int g0 = warp * U; g0 < kg; g0 += WARPS * U) {
+        uint4 wvs[U];
+        uint16_t svs[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int g = g0 + u;
+            if (g < kg) {
+                const size_t blk = (size_t)tile * kg + g;
+                wvs[u] = __ldg(reinterpret_cast<const uint4*>(w8 + blk * 4096 + c * 512) + lane);
+                svs[u] = __ldg(reinterpret_cast<const uint16_t*>(bs + (blk * 64 + r_in) * 2));
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+        const int g = g0 + u;
+        if (g >= kg) break;
+        const uint4 wv = wvs[u];
+        const uint16_t sv = svs[u];
         const float s0 = __uint_as_float((uint32_t)(sv & 0xFF) << 23), s1 = __uint_as_float((uint32_t)(sv >> 8) << 23);
         float wf[16];
         const uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
@@ -386,6 +401,7 @@ __device__ __forceinline__ void mx_gemv(const __nv_bfloat16* __restrict__ x, con
                 acc[i] = fmaf(sh[0], s0, fmaf(sh[1], s1, acc[i]));
             }
         }
+        }
     }
     __shared__ float red[WARPS][MR][32];
 #pragma unroll
@@ -411,9 +427,9 @@ __device__ __forceinline__ void mx_gemv(const __nv_bfloat16* __restrict__ x, con
     }
 }
 }   // namespace tf_fn_mxgemv
-#define TF_MXGEMV(MR, F32, NAME) extern "C" __global__ void __launch_bounds__(128) NAME(const __nv_bfloat16* x, \
+#define TF_MXGEMV(MR, F32, NAME) extern "C" __global__ void __launch_bounds__(256) NAME(const __nv_bfloat16* x, \
     const unsigned char* w8, const uint8_t* bs, void* out, int m, int n, int k, int ldx, int ldo) { \
-    tf_fn_mxgemv::mx_gemv<MR, 4, F32>(x, w8, bs, out, m, n, k, ldx, ldo); }
+    tf_fn_mxgemv::mx_gemv<MR, 8, F32>(x, w8, bs, out, m, n, k, ldx, ldo); }
 TF_MXGEMV(2, false, tf_fn_mxgemv_r2_b16)
 TF_MXGEMV(4, false, tf_fn_mxgemv_r4_b16)
 TF_MXGEMV(8, false, tf_fn_mxgemv_r8_b16)
