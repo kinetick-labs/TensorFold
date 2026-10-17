@@ -24,6 +24,9 @@ pub const Table = struct {
     mx: [max_entries]?fp8.Linear = @splat(null),
     bufs: [max_entries]cuda.DeviceBuffer = undefined,
     n: usize = 0,
+    /// the down weights of the MTP head's hyper-connections (its layer's two and the mixer), whatever `parts`: their
+    /// read-outs keep the 32-group sums the table's matrices read (Forward.q4Hc); the other ones need none
+    hcs: [3]u64 = @splat(0),
     bytes_bf16: usize = 0,
     bytes_q4: usize = 0,
 
@@ -36,6 +39,13 @@ pub const Table = struct {
     pub fn find(t: *const Table, weight: u64) ?kern.Q4 {
         for (t.keys[0..t.n], t.qs[0..t.n], t.mx[0..t.n]) |k, q, m| if (k == weight and m == null) return q;
         return null;
+    }
+
+    /// Whether `down` (an Hc's down weight) is one of the MTP head's hyper-connections.
+    pub fn ownsHc(t: *const Table, down: u64) bool {
+        if (down == 0) return false;
+        for (t.hcs) |h| if (h == down) return true;
+        return false;
     }
 
     /// The MXFP8 copy of the bf16 matrix at `weight`.
@@ -56,6 +66,7 @@ pub const Table = struct {
         errdefer t.deinit();
         const m = w.mtp orelse return error.NoMtpHead;
         const l = &m.layer;
+        t.hcs = .{ l.attn_hc.down.weight, l.mlp_hc.down.weight, m.mixer.down.weight };
         const a = l.attn orelse return error.NoMtpAttention;
         const Group = struct { name: []const u8, rows: []const W.Rows };
         const groups = [_]Group{
