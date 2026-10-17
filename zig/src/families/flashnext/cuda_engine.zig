@@ -453,11 +453,11 @@ pub const Engine = struct {
             // prompt chunks' MXFP8 faces widened to bf16 rows: the widest face's bytes
             var widest: usize = 0;
             for (e.w.layers) |l| {
-                if (l.gdn) |g| for ([_]?fp8.Linear{ g.proj8, g.out8 }) |x| if (x) |q| {
-                    widest = @max(widest, @as(usize, q.n) * q.k * 2);
+                if (l.gdn) |g| for ([_]?fp8.Linear{ g.proj8, g.out8 }, [_]u32{ g.proj.n, 0 }) |x, extra| if (x) |q| {
+                    widest = @max(widest, (@as(usize, q.n) + extra) * q.k * 2);
                 };
-                if (l.attn) |at| for ([_]?fp8.Linear{ at.proj8, at.o8 }) |x| if (x) |q| {
-                    widest = @max(widest, @as(usize, q.n) * q.k * 2);
+                if (l.attn) |at| for ([_]?fp8.Linear{ at.proj8, at.o8 }, [_]u32{ at.proj.n, 0 }) |x, extra| if (x) |q| {
+                    widest = @max(widest, (@as(usize, q.n) + extra) * q.k * 2);
                 };
             }
             if (envGet("TF_FLASHNEXT_MX_PROMPT_ROWS")) |v| e.f.mx_prompt_rows = std.fmt.parseInt(usize, v, 10) catch 256;
