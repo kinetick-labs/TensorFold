@@ -495,6 +495,7 @@ pub const Engine = struct {
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 2048;
         if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 0;
         e.ngram_prefetch = std.mem.eql(u8, envGet("TF_FLASHNEXT_NGRAM_PREFETCH") orelse "0", "1");
+        e.ngram_prefetch = !std.mem.eql(u8, envGet("TF_FLASHNEXT_NGRAM_PREFETCH") orelse "1", "0"); // default on: cold prose c1 +7%
         if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 32;
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 16;
         if (mx8Of(&e.c)) {
