@@ -201,6 +201,7 @@ pub const Api = struct {
     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,
+    cuEventRecordWithFlags: *const fn (Event, Stream, c_uint) callconv(.c) R,
     cuEventSynchronize: *const fn (Event) callconv(.c) R,
     cuEventQuery: *const fn (Event) callconv(.c) R,
     cuEventElapsedTime: *const fn (*f32, Event, Event) callconv(.c) R,

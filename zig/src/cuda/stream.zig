@@ -60,6 +60,11 @@ pub const Event = struct {
         try self.d.check(self.d.api.cuEventRecord(self.handle, stream.handle), "cuEventRecord");
     }
 
+    /// A record that a stream capture keeps as an event record node (CU_EVENT_RECORD_EXTERNAL), not a dependency.
+    pub fn recordExternal(self: Event, stream: Stream) Error!void {
+        try self.d.check(self.d.api.cuEventRecordWithFlags(self.handle, stream.handle, 1), "cuEventRecordWithFlags");
+    }
+
     pub fn synchronize(self: Event) Error!void {
         try self.d.check(self.d.api.cuEventSynchronize(self.handle), "cuEventSynchronize");
     }
