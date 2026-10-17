@@ -492,6 +492,7 @@ pub const Engine = struct {
             e.f.lane = &e.lane.?;
         }
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 2048;
+        if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 16;
         if (mx8Of(&e.c)) {
             e.k8 = try fp8.Kernels.load(ctx);
