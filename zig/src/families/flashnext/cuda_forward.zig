@@ -1615,7 +1615,7 @@ pub const Forward = struct {
             const o = q.o;
             const hh = h + o * g.wide() * 2;
             const ps = b.pss + o * pssRow(g);
-            const fuse = f.fusesNorm(hc, b, pending);
+            const fuse = f.fusesNorm(hc, b, pending, q.rh);
             const nm: ?tri.Tri.NormOut = if (fuse) .{ .scale = hc.scale, .normed = b.normed, .eps = f.eps } else null;
             if (pending) |p| {
                 try f.t.hcWritebackNorm(hh, hh, ps, p.inject + o * g.streams * 2, p.branch, q.rh, g.hidden, g.streams, nm);
@@ -1626,7 +1626,7 @@ pub const Forward = struct {
             try f.mark(.gather);
             return;
         }
-        const fuse = f.fusesNorm(hc, b, pending);
+        const fuse = f.fusesNorm(hc, b, pending, R);
         const nm: ?tri.Tri.NormOut = if (fuse) .{ .scale = hc.scale, .normed = b.normed, .eps = f.eps } else null;
         if (pending) |p| {
             try f.t.hcWritebackNorm(h, h, x.b.pss, p.inject, p.branch, R, g.hidden, g.streams, nm);
@@ -1634,6 +1634,9 @@ pub const Forward = struct {
         try f.mark(.hc_writeback);
         try f.readoutAt(hc, x, h, x.b.pss, R, if (hc.inject) inject_out else null, x.b.mixed, x.b.xs_mixed, fuse);
     }
+
+    /// The fewest prompt-chunk rows `_hc_wb_norm` takes (below, `_hc_writeback` + `_hc_normed`).
+    const wb_norm_min: usize = 256;
 
     /// Whether `hc`'s read-out must keep its 32-group sums (xs_normed, xs_mixed): an MTP head hyper-connection with
     /// the 4-bit MTP table on (its matrices read them); the main model's never feed a table matrix.
@@ -1644,8 +1647,10 @@ pub const Forward = struct {
 
     /// Whether this write-back also makes the read-out's normed rows (`_hc_wb_norm`): prompt chunks, no 4-bit MTP
     /// matrices on this hyper-connection (the only readers of normed's 32-group sums, q4Hc), and a branch the kernel set has an entry for.
-    fn fusesNorm(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, pending: ?Pending) bool {
-        if (!f.wb_norm or !b.prefill or f.q4Hc(hc)) return false;
+    fn fusesNorm(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, pending: ?Pending, rows: usize) bool {
+        // one row a program: short chunks (a cached prompt's last rows) are faster on the two kernels (5 rows: 4.0
+        // vs 1.2 ms a pass), so only chunks of wb_norm_min rows or more (the same bits either way)
+        if (!f.wb_norm or !b.prefill or f.q4Hc(hc) or rows < wb_norm_min) return false;
         if (pending) |p| switch (p.branch) {
             .slices => return false,
             else => {},
