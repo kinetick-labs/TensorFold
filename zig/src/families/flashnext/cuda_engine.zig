@@ -484,6 +484,7 @@ pub const Engine = struct {
             e.lane = try cuda.qmmf.Lane.load(d, @intCast(try ctx.attribute(.compute_capability_major)));
             e.f.lane = &e.lane.?;
         }
+        if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 2048;
         if (mx8Of(&e.c)) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.f.k8 = &e.k8.?;

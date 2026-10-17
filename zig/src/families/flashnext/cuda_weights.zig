@@ -178,6 +178,40 @@ pub const NgramTable = struct {
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
+    /// NVFP4 prompt chunks: the rows split over threads (a mapped table's page reads overlap; the same bits).
+    /// TF_FLASHNEXT_GATHER_MIN (default 2048): the fewest ids split over threads (decode rounds' page reads overlap)
+    pub var gather_min: usize = 2048;
+
+        if (t.nvfp4 != null and ids.len >= gather_min) {
+            const n_threads = 16;
+            var threads: [n_threads]std.Thread = undefined;
+            var errs: [n_threads]?anyerror = @splat(null);
+            const per = (ids.len + n_threads - 1) / n_threads;
+            const Run = struct {
+                fn go(tt: *const NgramTable, a: []const i64, o: []u16, e: *?anyerror) void {
+                    tt.gatherSerial(a, o) catch |x| {
+                        e.* = x;
+                    };
+                }
+            };
+            var spawned: usize = 0;
+            for (0..n_threads) |i| {
+                const lo = @min(i * per, ids.len);
+                const hi = @min(lo + per, ids.len);
+                threads[i] = std.Thread.spawn(.{}, Run.go, .{ t, ids[lo..hi], out[lo * t.width .. hi * t.width], &errs[i] }) catch {
+                    for (threads[0..spawned]) |th| th.join();
+                    return t.gatherSerial(ids, out);
+                };
+                spawned += 1;
+            }
+            for (threads[0..spawned]) |th| th.join();
+            for (errs) |e| if (e) |x| return x;
+            return;
+        }
+        return t.gatherSerial(ids, out);
+    }
+
+    fn gatherSerial(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         for (ids, 0..) |id, i| {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
             const src = t.row(@intCast(id));
