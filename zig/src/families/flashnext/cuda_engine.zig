@@ -577,7 +577,7 @@ pub const Engine = struct {
                 e.screen = try hs.HeadScreen.build(gpa, d, e.w.head);
                 e.f.screen = &e.screen.?;
                 std.log.info("head screen: MXFP8 copy of the {d} x {d} head for greedy verify rounds (exact draws)", .{ e.w.head.n, e.w.head.k });
-            } else std.log.warn("head screen: needs one GPU, a bf16 head and the FP8 kernels; off", .{});
+            } else if (envGet("TF_FLASHNEXT_HEAD_SCREEN") != null) std.log.warn("head screen: needs one GPU, a bf16 head and the FP8 kernels; off", .{});
         }
         errdefer if (e.screen) |*x| x.deinit();
         // EXL3: a 4-bit draft head from the trellis lm_head (drafts only); TF_FLASHNEXT_X3_DRAFT_HEAD=0: the whole head
