@@ -1420,7 +1420,10 @@ pub const Forward = struct {
         // a prompt chunk runs from the committed DeltaNet state: last round's kept rows folded in first
         if (x.b.prefill) for (windows) |w| try f.flush(w.seq);
         // the previous step's copies out of the pinned buffer are done
+        const t0 = stageNs();
         try f.staged.synchronize();
+        const t1 = stageNs();
+        var t_ids: u64 = 0;
         const ids = std.mem.bytesAsSlice(i32, f.pin.bytes[0 .. R * 4]);
         for (segs[0..windows.len], windows) |sg, w| for (ids[sg.a0..sg.a1], w.tokens) |*a, t| {
             a.* = @intCast(t);
@@ -1432,6 +1435,7 @@ pub const Forward = struct {
             const nid = try f.gpa.alloc(i64, R * heads);
             defer f.gpa.free(nid);
             for (segs[0..windows.len]) |sg| try p.ngram.ids(sg.seq.st.history[0 .. p.ngram.n - 1], sg.seq.window.items, nid[sg.a0 * heads .. sg.a1 * heads]);
+            t_ids = stageNs();
             const table = &(f.w.table orelse return error.NoNgramTable);
             if (table.gpu != null) {
                 // the ids on the device, then the rank's heads' rows gathered there (W4's Gather, the host bits)
@@ -1453,10 +1457,34 @@ pub const Forward = struct {
             try table.gather(nid, @alignCast(out));
             try f.upload(x.b.ple_v, rows_at, R * heads * table.width * 2);
         };
+        if (!x.b.prefill) stageLog(R, t0, t1, t_ids, stageNs());
         for (windows) |w| w.seq.staged = true;
         try f.staged.record(f.s);
         if (!x.b.prefill and f.round != null and f.g.linear_layers > 0) try f.roundTables(segs[0..windows.len], 1 - f.cur_par);
         return R;
+    }
+
+    var stage_acc: [4]u64 = @splat(0);
+    var stage_n: u64 = 0;
+    fn stageNs() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    /// TF_FLASHNEXT_STAGE_LOG: decode stages' host time (the wait on the last copy, ids, gather+upload), every 64.
+    fn stageLog(R: usize, t0: u64, t1: u64, t_ids: u64, t3: u64) void {
+        if (std.c.getenv("TF_FLASHNEXT_STAGE_LOG") == null) return;
+        const ti = if (t_ids == 0) t1 else t_ids;
+        stage_acc[0] += t1 - t0;
+        stage_acc[1] += ti - t1;
+        stage_acc[2] += t3 - ti;
+        stage_acc[3] += R;
+        stage_n += 1;
+        if (stage_n % 64 == 0) {
+            const n: f64 = 64e3;
+            std.debug.print("tf-stage n=64 rows={d:.1} wait_us={d:.1} ids_us={d:.1} gather_us={d:.1}\n", .{ @as(f64, @floatFromInt(stage_acc[3])) / 64.0, @as(f64, @floatFromInt(stage_acc[0])) / n, @as(f64, @floatFromInt(stage_acc[1])) / n, @as(f64, @floatFromInt(stage_acc[2])) / n });
+            stage_acc = @splat(0);
+        }
     }
 
     /// forward.stage for one stream (its rows from 0).
