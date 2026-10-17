@@ -1022,14 +1022,12 @@ pub const Forward = struct {
     /// into a scratch and copied into `out`'s columns (rows `out_w` wide; Python's Concat); without `l8`, `rb` alone.
     fn projFace(f: *Forward, part: profs.Part, x: u64, x_stride: usize, l8: ?fp8.Linear, rb: W.Rows, out: u64, out_w: usize, m: usize) !void {
         const l = l8 orelse return f.mmAt(part, x, x_stride, rb, out, false, m);
-        if (try f.mxWide(l8, m)) |wr| {
-            try f.mmAt(null, x, x_stride, wr, f.sc.p8, false, m);
-            try f.th.slotCopy(f.sc.p8, l.n * 2, out, out_w * 2, l.n * 2, m);
-            try f.mmAt(null, x, x_stride, rb, f.sc.pb, false, m);
-            try f.th.slotCopy(f.sc.pb, rb.n * 2, out + l.n * 2, out_w * 2, rb.n * 2, m);
-            if (l.n + rb.n != out_w) return error.ProjectionWidth;
-            return f.mark(part);
-        }
+        if (l.n + rb.n == out_w and f.mx_wide != null and @as(usize, out_w) * l.k * 2 <= f.mx_wide.?.len) if (try f.mxWide(l8, m)) |wr| {
+            // the widened rows then the bf16 rows: the face the widened build holds, on one bf16 prompt matmul
+            if (rb.k != l.k) return error.ProjectionWidth;
+            try f.th.slotCopy(rb.weight, rb.n * rb.k * 2, wr.weight + @as(u64, l.n) * l.k * 2, rb.n * rb.k * 2, rb.n * rb.k * 2, 1);
+            return f.mmAt(part, x, x_stride, .{ .weight = wr.weight, .n = @intCast(out_w), .k = l.k }, out, false, m);
+        };
         // the block-FP8 columns stored straight into `out`'s rows (fn_qmmf_ld; TF_FLASHNEXT_FP8_LD=0: through the
         // scratch and a copy, the same bytes)
         if (f.fp8_ld) {
