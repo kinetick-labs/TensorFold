@@ -649,6 +649,9 @@ pub const Forward = struct {
     /// TF_FLASHNEXT_COUNT_EXPERTS=1 (with the profile): every decode MoE layer's distinct routed experts and rows
     /// counted on the host (a wait a layer); the main model's and the MTP head's, since the last report
     count_experts: bool = false,
+    /// mxWide's bf16 rows (FP4-Local, the widest MXFP8 face) and the prompt rows from which it serves
+    mx_wide: ?cuda.DeviceBuffer = null,
+    mx_prompt_rows: usize = 256,
     /// the shared expert's stream (initSide): it runs beside the routed experts, joined before their sum
     side: ?Side = null,
     /// `_fp4mm` SK 1 launches of 9 to fp4SerialRows(n) rows on fn_ops' K-serial kernel (fp4Serial)
@@ -899,6 +902,7 @@ pub const Forward = struct {
     }
 
     pub fn deinit(f: *Forward) void {
+        if (f.mx_wide) |*b| b.free();
         if (f.side) |*sd| {
             sd.join.deinit();
             sd.fork.deinit();
@@ -993,8 +997,20 @@ pub const Forward = struct {
         if (part) |pp| try f.mark(pp);
     }
 
+    /// TF_FLASHNEXT_MX_PROMPT_ROWS (default 256; 0 off): an MXFP8 linear on `m` >= that many rows widened to bf16 rows
+    /// in `mx_wide` (exact), for the bf16 prompt matmul; null: the MXFP8 lane.
+    fn mxWide(f: *Forward, l8: ?fp8.Linear, m: usize) !?W.Rows {
+        const l = l8 orelse return null;
+        if (!l.mx or f.mx_wide == null or f.mx_prompt_rows == 0 or m < f.mx_prompt_rows) return null;
+        const buf = f.mx_wide.?;
+        if (@as(usize, l.n) * l.k * 2 > buf.len) return null;
+        try fp8.widen(f.k8.?, f.s, l, buf.ptr);
+        return .{ .weight = buf.ptr, .n = l.n, .k = l.k };
+    }
+
     /// A linear on its kernel: block FP8 (`l8`) or bf16 rows, marked as `part` when profiling.
     fn denseAt(f: *Forward, part: profs.Part, x: u64, x_stride: usize, xs: u64, r: W.Rows, l8: ?fp8.Linear, out: u64, fp32: bool, m: usize) !void {
+        if (try f.mxWide(l8, m)) |wr| return f.mmAt(part, x, x_stride, wr, out, fp32, m);
         if (l8) |l| {
             try fp8.matmul(f.k8 orelse return error.NoFp8Kernels, f.s, x, x_stride, l, out, fp32, m);
             return f.mark(part);
@@ -1006,6 +1022,14 @@ pub const Forward = struct {
     /// into a scratch and copied into `out`'s columns (rows `out_w` wide; Python's Concat); without `l8`, `rb` alone.
     fn projFace(f: *Forward, part: profs.Part, x: u64, x_stride: usize, l8: ?fp8.Linear, rb: W.Rows, out: u64, out_w: usize, m: usize) !void {
         const l = l8 orelse return f.mmAt(part, x, x_stride, rb, out, false, m);
+        if (try f.mxWide(l8, m)) |wr| {
+            try f.mmAt(null, x, x_stride, wr, f.sc.p8, false, m);
+            try f.th.slotCopy(f.sc.p8, l.n * 2, out, out_w * 2, l.n * 2, m);
+            try f.mmAt(null, x, x_stride, rb, f.sc.pb, false, m);
+            try f.th.slotCopy(f.sc.pb, rb.n * 2, out + l.n * 2, out_w * 2, rb.n * 2, m);
+            if (l.n + rb.n != out_w) return error.ProjectionWidth;
+            return f.mark(part);
+        }
         // the block-FP8 columns stored straight into `out`'s rows (fn_qmmf_ld; TF_FLASHNEXT_FP8_LD=0: through the
         // scratch and a copy, the same bytes)
         if (f.fp8_ld) {

@@ -450,6 +450,18 @@ pub const Engine = struct {
         if (mx8Of(&e.c)) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.f.k8 = &e.k8.?;
+            // prompt chunks' MXFP8 faces widened to bf16 rows: the widest face's bytes
+            var widest: usize = 0;
+            for (e.w.layers) |l| {
+                if (l.gdn) |g| for ([_]?fp8.Linear{ g.proj8, g.out8 }) |x| if (x) |q| {
+                    widest = @max(widest, @as(usize, q.n) * q.k * 2);
+                };
+                if (l.attn) |at| for ([_]?fp8.Linear{ at.proj8, at.o8 }) |x| if (x) |q| {
+                    widest = @max(widest, @as(usize, q.n) * q.k * 2);
+                };
+            }
+            if (envGet("TF_FLASHNEXT_MX_PROMPT_ROWS")) |v| e.f.mx_prompt_rows = std.fmt.parseInt(usize, v, 10) catch 256;
+            if (widest > 0 and e.f.mx_prompt_rows > 0) e.f.mx_wide = try cuda.DeviceBuffer.alloc(d, widest);
         } else if (e.c.int4ar()) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.k4 = try int4.Kernels.load(ctx);
