@@ -11,6 +11,7 @@ const cuda = @import("cuda");
 const W = @import("cuda_weights.zig");
 const kern = @import("cuda_kernels.zig");
 const lay = @import("cuda_layouts.zig");
+const fp8 = @import("cuda_fp8.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +20,8 @@ pub const max_entries = 12;
 pub const Table = struct {
     keys: [max_entries]u64 = @splat(0),
     qs: [max_entries]kern.Q4 = undefined,
+    /// TF_FLASHNEXT_MTP_MX8: the entry as MXFP8 (fp8.Linear mx) instead of 4-bit
+    mx: [max_entries]?fp8.Linear = @splat(null),
     bufs: [max_entries]cuda.DeviceBuffer = undefined,
     n: usize = 0,
     bytes_bf16: usize = 0,
@@ -31,13 +34,24 @@ pub const Table = struct {
 
     /// The 4-bit copy of the bf16 matrix at `weight`, if it is one of the head's.
     pub fn find(t: *const Table, weight: u64) ?kern.Q4 {
-        for (t.keys[0..t.n], t.qs[0..t.n]) |k, q| if (k == weight) return q;
+        for (t.keys[0..t.n], t.qs[0..t.n], t.mx[0..t.n]) |k, q, m| if (k == weight and m == null) return q;
+        return null;
+    }
+
+    /// The MXFP8 copy of the bf16 matrix at `weight`.
+    pub fn findMx(t: *const Table, weight: u64) ?fp8.Linear {
+        for (t.keys[0..t.n], t.mx[0..t.n]) |k, m| if (k == weight) return m;
         return null;
     }
 
     /// Quantizes every MTP bf16 matrix of `w` (downloaded from the device) on `threads` host threads.
     /// `parts`: "1" or "all", else a comma list of fc, attn, hc, mixer.
     pub fn build(gpa: Allocator, d: *const cuda.Driver, w: *const W.Weights, parts: []const u8, mse: bool) !Table {
+        return buildAs(gpa, d, w, parts, mse, false);
+    }
+
+    /// `build` with `mx8`: MXFP8 (e4m3, a UE8M0 power of two per 32 inputs) instead of 4-bit.
+    pub fn buildAs(gpa: Allocator, d: *const cuda.Driver, w: *const W.Weights, parts: []const u8, mse: bool, mx8: bool) !Table {
         var t: Table = .{};
         errdefer t.deinit();
         const m = w.mtp orelse return error.NoMtpHead;
@@ -55,7 +69,7 @@ pub const Table = struct {
             if (!every and !listed(parts, g.name)) continue;
             for (g.rows) |r| {
                 if (r.weight == 0 or t.find(r.weight) != null) continue;
-                try t.add(gpa, d, r, mse);
+                if (mx8) try t.addMx(gpa, d, r) else try t.add(gpa, d, r, mse);
             }
         }
         return t;
@@ -65,6 +79,39 @@ pub const Table = struct {
         var it = std.mem.tokenizeScalar(u8, parts, ',');
         while (it.next()) |p| if (std.mem.eql(u8, p, name)) return true;
         return false;
+    }
+
+    fn addMx(t: *Table, gpa: Allocator, d: *const cuda.Driver, r: W.Rows) !void {
+        if (t.n == max_entries) return error.TooMany;
+        const n: usize = r.n;
+        const k: usize = r.k;
+        if (k % 64 != 0) return error.UnsupportedShape;
+        const rows = try gpa.alloc(u16, n * k);
+        defer gpa.free(rows);
+        const src: cuda.DeviceBuffer = .{ .d = d, .ptr = r.weight, .len = n * k * 2 };
+        try src.download(0, std.mem.sliceAsBytes(rows));
+        const codes = try gpa.alloc(u8, n * k);
+        defer gpa.free(codes);
+        const sc = try gpa.alloc(u8, n * (k / 32));
+        defer gpa.free(sc);
+        quantizeMx(rows, n, k, codes, sc);
+        const npad = fp8.npadOf(n);
+        const frag = try gpa.alloc(u8, npad * k);
+        defer gpa.free(frag);
+        try fp8.fragmentOrder(codes, n, k, npad, frag);
+        const tiled = try gpa.alloc(u8, npad * (k / 64) * 2);
+        defer gpa.free(tiled);
+        try fp8.tileMxScales(sc, n, k, npad, tiled);
+        var buf = try cuda.DeviceBuffer.alloc(d, frag.len + tiled.len);
+        errdefer buf.free();
+        try buf.upload(0, frag);
+        try buf.upload(frag.len, tiled);
+        t.bufs[t.n] = buf;
+        t.keys[t.n] = r.weight;
+        t.mx[t.n] = .{ .w8 = buf.ptr, .bs = buf.ptr + frag.len, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad), .mx = true };
+        t.n += 1;
+        t.bytes_bf16 += n * k * 2;
+        t.bytes_q4 += frag.len + tiled.len;
     }
 
     fn add(t: *Table, gpa: Allocator, d: *const cuda.Driver, r: W.Rows, mse: bool) !void {
@@ -108,6 +155,39 @@ pub const Table = struct {
         t.bytes_q4 += wb + 2 * sb;
     }
 };
+
+/// bf16 rows -> MXFP8: each 32 inputs' power of two 2^e, e the least with amax / 2^e <= 448 (UE8M0 byte e + 127),
+/// the codes e4m3 RNE of x / 2^e.
+pub fn quantizeMx(rows: []const u16, n: usize, k: usize, codes: []u8, scales: []u8) void {
+    for (0..n) |r| for (0..k / 32) |g| {
+        const v = rows[r * k + g * 32 ..][0..32];
+        var amax: f32 = 0;
+        for (v) |b| amax = @max(amax, @abs(lay.bf16ToF32(b)));
+        var e: i32 = -127;
+        if (amax > 0) {
+            e = @intFromFloat(@ceil(std.math.log2(amax / 448.0)));
+            while (std.math.ldexp(@as(f32, 448.0), e) < amax) e += 1;
+        }
+        e = std.math.clamp(e, -126, 127);
+        scales[r * (k / 32) + g] = @intCast(e + 127);
+        const inv = std.math.ldexp(@as(f32, 1.0), -e);
+        for (v, 0..) |b, i| codes[r * k + g * 32 + i] = lay.f32ToE4m3(lay.bf16ToF32(b) * inv);
+    };
+}
+
+test "MXFP8 quantization stays in range and round-trips powers of two" {
+    var rows: [64]u16 = undefined;
+    for (&rows, 0..) |*b, i| b.* = lay.bf16Rne(@as(f32, @floatFromInt(i)) - 20.0);
+    var codes: [64]u8 = undefined;
+    var sc: [2]u8 = undefined;
+    quantizeMx(&rows, 1, 64, &codes, &sc);
+    for (codes, 0..) |c, i| {
+        const s = std.math.ldexp(@as(f32, 1.0), @as(i32, sc[i / 32]) - 127);
+        const back = lay.e4m3ToF32(c) * s;
+        const want = lay.bf16ToF32(rows[i]);
+        try std.testing.expect(@abs(back - want) <= @abs(want) / 16.0 + 1e-6);
+    }
+}
 
 /// cuda_layouts.quantize4's format (scale and bias bf16, codes 0..15), each group's range chosen among the min/max range
 /// shrunk toward its centre by 0..30% (the bias and scale as stored, rounded to bf16) by the least squared error.
