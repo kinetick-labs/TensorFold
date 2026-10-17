@@ -2046,13 +2046,14 @@ const Loader = struct {
         }
         t.rows = t.starts.items[t.starts.items.len - 1];
         t.fp8 = kind.? == .f8_e4m3;
-        // TF_FLASHNEXT_NGRAM_RANDOM=1: MADV_RANDOM on the mapped rows (a lookup's fault reads its own pages, not a
-        // read-ahead window around them; the same bytes)
-        if (std.c.getenv("TF_FLASHNEXT_NGRAM_RANDOM")) |v| if (v[0] == '1') {
+        // TF_FLASHNEXT_NGRAM_RANDOM (default on; 0 off): MADV_RANDOM on the mapped rows (a lookup's fault reads its own
+        // pages, not a read-ahead window around them; the same bytes): ~20x less page cache a cold prompt (0.25 vs 4.7 GB
+        // over four), cold prose c1 +2%
+        if (if (std.c.getenv("TF_FLASHNEXT_NGRAM_RANDOM")) |v| v[0] != '0' else true) {
             for (t.shards.items) |b| adviseRandom(b);
             if (t.nvfp4) |n| for (n.scales.items) |b| adviseRandom(b);
             std.log.info("n-gram table: MADV_RANDOM on {d} shards ({d} rows)", .{ t.shards.items.len, t.rows });
-        };
+        }
         var b: [256]u8 = undefined;
         const sname = try std.fmt.bufPrint(&b, "{s}ngram_embedding.weight_scale{s}", .{ base, if (t.nvfp4 != null) "_2" else "" });
         const sfull = try L.nameOf("{s}{s}", .{ L.prefix, sname });
