@@ -7,6 +7,7 @@ pub const native = @import("cuda_native.zig");
 pub const ngram = @import("cuda_ngram.zig");
 pub const rope = @import("cuda_rope.zig");
 pub const sampler = @import("cuda_sampler.zig");
+pub const spec = @import("cuda_spec.zig");
 pub const link = @import("cuda_link.zig");
 pub const comm = @import("cuda_comm.zig");
 pub const kernels = @import("cuda_kernels.zig");
@@ -39,6 +40,7 @@ test {
     _ = ngram;
     _ = rope;
     _ = sampler;
+    _ = spec;
     _ = link;
     _ = comm;
     _ = kernels;
