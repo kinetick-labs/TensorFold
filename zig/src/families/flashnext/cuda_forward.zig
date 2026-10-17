@@ -25,6 +25,7 @@ const profs = @import("cuda_prof.zig");
 const prompt = @import("cuda_mia_prompt.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const fp8 = @import("cuda_fp8.zig");
+const hs_mod = @import("cuda_head_screen.zig");
 const int4 = @import("cuda_int4.zig");
 const exl3 = @import("cuda_exl3.zig");
 
@@ -102,6 +103,8 @@ pub const Seq = struct {
     held_par: u1 = 0,
     /// the prompt's images and video frames (null: text)
     media: ?SeqMedia = null,
+    /// its stream's last draw was greedy (TF_FLASHNEXT_HEAD_SCREEN screens its next verify rounds)
+    greedy: bool = false,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
@@ -651,6 +654,10 @@ pub const Forward = struct {
     count_experts: bool = false,
     /// set while cuda_mtp runs the MTP head (the expert count's split)
     in_mtp: bool = false,
+    /// TF_FLASHNEXT_HEAD_SCREEN: the exact two-stage greedy head, and whether this verify forward takes it (the engine
+    /// sets it per round; part of the graph keys)
+    screen: ?*const hs_mod.HeadScreen = null,
+    screen_on: bool = false,
     /// the shared expert's stream (initSide): it runs beside the routed experts, joined before their sum
     side: ?Side = null,
     /// `_fp4mm` SK 1 launches of 9 to fp4SerialRows(n) rows on fn_ops' K-serial kernel (fp4Serial)
@@ -2382,7 +2389,9 @@ pub const Forward = struct {
         try f.put("final_mixed", b.mixed, n * g.hidden * 2);
         if (!logits) return null;
         const head = f.w.head;
-        try f.headMm(b.mixed, g.hidden, b.logits, n);
+        if (f.screen_on and !b.prefill and f.comm == null and n <= hs_mod.max_rows and f.screen != null and f.k8 != null) {
+            try f.screen.?.run(f.k8.?, f.s, b.mixed, g.hidden, b.logits, n);
+        } else try f.headMm(b.mixed, g.hidden, b.logits, n);
         try f.mark(.head);
         if (f.comm) |cm| {
             try f.candidates(x, b.logits, n, head.n, null, f.vocab_offset, cm);
