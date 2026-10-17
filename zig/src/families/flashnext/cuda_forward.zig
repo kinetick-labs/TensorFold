@@ -1635,11 +1635,17 @@ pub const Forward = struct {
         try f.readoutAt(hc, x, h, x.b.pss, R, if (hc.inject) inject_out else null, x.b.mixed, x.b.xs_mixed, fuse);
     }
 
+    /// Whether `hc`'s read-out must keep its 32-group sums (xs_normed, xs_mixed): an MTP head hyper-connection with
+    /// the 4-bit MTP table on (its matrices read them); the main model's never feed a table matrix.
+    fn q4Hc(f: *const Forward, hc: *const W.Hc) bool {
+        const t = f.mtp_q4 orelse return false;
+        return t.ownsHc(hc.down.weight) or t.find(hc.down.weight) != null or t.find(hc.up.weight) != null;
+    }
+
     /// Whether this write-back also makes the read-out's normed rows (`_hc_wb_norm`): prompt chunks, no 4-bit MTP
-    /// matrices (the only readers of normed's 32-group sums), and a branch the kernel set has an entry for.
+    /// matrices on this hyper-connection (the only readers of normed's 32-group sums, q4Hc), and a branch the kernel set has an entry for.
     fn fusesNorm(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, pending: ?Pending) bool {
-        _ = hc;
-        if (!f.wb_norm or !b.prefill or f.mtp_q4 != null) return false;
+        if (!f.wb_norm or !b.prefill or f.q4Hc(hc)) return false;
         if (pending) |p| switch (p.branch) {
             .slices => return false,
             else => {},
@@ -1676,7 +1682,7 @@ pub const Forward = struct {
         try f.mark(.hc_act);
         // prompt chunks: the up projection and the mix in one pass (cuda_mia_prompt.zig upMix, the same mixed bytes; no
         // 32-group sums of mixed, which only the 4-bit MTP draft matrices read)
-        if (f.up_mix and b.prefill and R >= 16 and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0) {
+        if (f.up_mix and b.prefill and R >= 16 and hc.up8 == null and !f.q4Hc(hc) and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0) {
             try prompt.upMix(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, 64);
             try f.mark(.hc_mix);
             return;
