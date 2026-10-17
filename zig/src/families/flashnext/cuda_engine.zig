@@ -360,6 +360,10 @@ pub const Engine = struct {
     solo_fault: CaptureFault = .{},
     multi_fault: CaptureFault = .{},
     instantiated: u64 = 0,
+    /// TF_FLASHNEXT_SEQ_POOL (reuseSeq): parked sequences, their most, and reuses so far
+    seq_pool: std.ArrayList(*Seq) = .empty,
+    seq_pool_max: usize = 0,
+    pool_reused: u64 = 0,
     /// TF_FLASHNEXT_GRAPH_LOG: wall seconds of solo windows that captured (eager run + capture + instantiate)
     cap_s: f64 = 0,
     graph_log: bool = false,
@@ -472,6 +476,7 @@ pub const Engine = struct {
         // fp4-check; TF_FLASHNEXT_FP4_SERIAL=0 off)
         e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL");
         e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
+        e.seq_pool_max = if (envGet("TF_FLASHNEXT_SEQ_POOL")) |v| std.fmt.parseInt(usize, v, 10) catch 0 else 0;
         if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
         // shared rounds past the captured widths run their attention in one launch a kernel (attn_multi.py's
@@ -652,6 +657,8 @@ pub const Engine = struct {
         e.multi = .empty;
         e.seen.deinit(e.gpa);
         e.seen = .empty;
+        for (e.seq_pool.items) |q| e.destroySeq(q);
+        e.seq_pool.deinit(e.gpa);
         e.freeSeq(e.own);
         e.gpa.free(e.draft_host);
         e.gpa.free(e.round_segs);
@@ -688,7 +695,10 @@ pub const Engine = struct {
 
     /// A new empty sequence whose caches grow up to `limit_rows` (at most the engine's max_len).
     pub fn newSeq(e: *Engine, limit_rows: usize) !*Seq {
-        const limit = @min(limit_rows, e.max_len);
+        if (e.seq_pool_max > 0) if (try e.reuseSeq(@min(limit_rows, e.max_len))) |q| return q;
+        // pooled: a window rounded up (a reservation's address space only), so a later request finds it big enough
+        const limit = if (e.seq_pool_max > 0) @min(e.max_len, @max(8192, std.math.ceilPowerOfTwo(usize, limit_rows) catch limit_rows)) else @min(limit_rows, e.max_len);
+        while (e.seq_pool_max > 0 and !e.fits(@min(limit, state.grow_step)) and e.seq_pool.items.len > 0) e.destroySeq(e.seq_pool.pop().?);
         const s = try e.gpa.create(Seq);
         errdefer e.gpa.destroy(s);
         // caches start at one growth step and grow with the stream (State.ensure), up to `limit`
@@ -744,7 +754,40 @@ pub const Engine = struct {
         try e.f.grow(s, first);
     }
 
+    /// TF_FLASHNEXT_SEQ_POOL=n: up to n freed text sequences parked with their buffers and graphs (keyed by the
+    /// sequence's address and buffer version, both unchanged), so the next request's windows replay instead of
+    /// capturing again. A parked sequence is reset exactly as a new one (Forward.reset, the indexer rings zeroed,
+    /// its window emptied) when reused; it keeps its caches' bytes charged until reused or dropped (a new sequence
+    /// that does not fit drops parked ones first).
+    fn reuseSeq(e: *Engine, limit: usize) !?*Seq {
+        const i = for (e.seq_pool.items, 0..) |q, j| {
+            if (q.st.limit >= limit) break j;
+        } else return null;
+        const s = e.seq_pool.swapRemove(i);
+        errdefer e.destroySeq(s);
+        try e.f.register(s);
+        s.window.clearRetainingCapacity();
+        try e.f.reset(s);
+        if (s.ring_rows > 0) {
+            const ring = s.ring_rows * e.g.index_dim * 2;
+            const layers = e.g.attention_layers + @intFromBool(e.g.mtp);
+            for (0..layers) |l| try e.f.th.zero(s.regions.items[4 * l + 2].base, ring);
+        }
+        e.pool_reused += 1;
+        return s;
+    }
+
     pub fn freeSeq(e: *Engine, s: *Seq) void {
+        if (s != e.own and e.seq_pool_max > 0 and s.media == null and s.regions.items.len > 0 and e.seq_pool.items.len < e.seq_pool_max) {
+            if (e.bound == s) e.bound = e.own;
+            e.f.unregister(s);
+            if (e.seq_pool.append(e.gpa, s)) |_| return else |_| {}
+            e.f.register(s) catch {};
+        }
+        e.destroySeq(s);
+    }
+
+    fn destroySeq(e: *Engine, s: *Seq) void {
         if (e.bound == s and s != e.own) e.bound = e.own;
         e.budget.used -|= s.charged;
         e.f.unregister(s);
@@ -2008,7 +2051,7 @@ pub const Engine = struct {
     fn capLog(e: *Engine, comptime class: []const u8) void {
         if (!e.graph_log or e.captures % 10 != 0) return;
         const free: usize = if (e.ctx.memInfo()) |m| m.free else |_| 0;
-        std.log.info("graphs after {d} captures ({s}): {d} solo, {d} shared live; {d} instantiated; {d} MiB device memory free; solo capture windows {d:.1} ms total", .{ e.captures, class, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20, e.cap_s * 1000.0 });
+        std.log.info("graphs after {d} captures ({s}): {d} solo, {d} shared live; {d} instantiated; {d} MiB device memory free; solo capture windows {d:.1} ms total; {d} pooled sequences reused", .{ e.captures, class, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20, e.cap_s * 1000.0, e.pool_reused });
     }
 
     /// Graphs.warm: every decode window (1 .. depth + 1 rows) at both DeltaNet parities and every MTP step size
