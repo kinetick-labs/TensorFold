@@ -1967,6 +1967,7 @@ pub const Engine = struct {
             _ = e.capNote(f, class, "instantiate", error.CudaFailed);
             return null;
         }
+        if (e.graph_log) if (g.nodeCount()) |n| std.log.info("graph log: {s} capture of {d} nodes", .{ class, n }) else |_| {};
         if (e.graph_log) { // an earlier asynchronous error anywhere in the context would surface in the next graph call
             const d = e.ctx.d;
             const r = d.api.cuCtxSynchronize();
