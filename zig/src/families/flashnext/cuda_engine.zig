@@ -360,6 +360,8 @@ pub const Engine = struct {
     solo_fault: CaptureFault = .{},
     multi_fault: CaptureFault = .{},
     instantiated: u64 = 0,
+    /// TF_FLASHNEXT_GRAPH_LOG: wall seconds of solo windows that captured (eager run + capture + instantiate)
+    cap_s: f64 = 0,
     graph_log: bool = false,
     inject_every: u64 = 0,
     /// shared rounds' and shared MTP steps' graphs by composition (multiKey), and compositions seen once
@@ -1927,6 +1929,10 @@ pub const Engine = struct {
         defer e.f.context = null;
         if (e.graphs.get(key)) |g| return g.launchOn(e.stream);
         e.dropGraphsOf(key.seq, key.version, key.media);
+        const t_cap = std.Io.Clock.awake.now(e.io);
+        defer {
+            if (e.graph_log) e.cap_s += seconds(e.io, t_cap);
+        }
         try e.body(head, rows);
         // the eager run above is this call's result; a capture that fails from here on only costs the graph
         if (e.solo_fault.pause > 0) {
@@ -1940,6 +1946,7 @@ pub const Engine = struct {
         errdefer exec.deinit();
         try e.graphs.put(e.gpa, key, exec);
         e.captures += 1;
+        if (e.graph_log) e.stream.synchronize() catch {};
         e.capLog("solo");
     }
 
@@ -1998,9 +2005,9 @@ pub const Engine = struct {
     }
 
     fn capLog(e: *Engine, comptime class: []const u8) void {
-        if (!e.graph_log or e.captures % 50 != 0) return;
+        if (!e.graph_log or e.captures % 10 != 0) return;
         const free: usize = if (e.ctx.memInfo()) |m| m.free else |_| 0;
-        std.log.info("graphs after {d} captures ({s}): {d} solo, {d} shared live; {d} instantiated; {d} MiB device memory free", .{ e.captures, class, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20 });
+        std.log.info("graphs after {d} captures ({s}): {d} solo, {d} shared live; {d} instantiated; {d} MiB device memory free; solo capture windows {d:.1} ms total", .{ e.captures, class, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20, e.cap_s * 1000.0 });
     }
 
     /// Graphs.warm: every decode window (1 .. depth + 1 rows) at both DeltaNet parities and every MTP step size
