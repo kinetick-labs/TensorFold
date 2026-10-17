@@ -391,6 +391,9 @@ pub const Engine = struct {
     spec_kept: u64 = 0,
     spec_taken: u64 = 0,
     spec_plain: u64 = 0,
+    /// TF_FLASHNEXT_DRAFT_LOG=1: draftMany's timeline per step (timing events on the stream): MTP forward, the
+    /// draw (sample kernels + read back), the host gap before the next step; summed and reported every 200 calls
+    dlog: ?*DraftLog = null,
     gprof_rows: u32 = 0,
     gprof_n: usize = 0,
     gprof_rounds: u64 = 0,
@@ -475,6 +478,12 @@ pub const Engine = struct {
         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
         try e.f.initRound(rows, @max(1, o.streams));
         e.ngram_prefetch = !std.mem.eql(u8, envGet("TF_FLASHNEXT_NGRAM_PREFETCH") orelse "1", "0"); // default on: cold prose c1 +7%
+        if (envGet("TF_FLASHNEXT_DRAFT_LOG")) |v| if (v[0] == '1') {
+            const dl = try gpa.create(DraftLog);
+            dl.* = .{};
+            for (&dl.ev) |*x| x.* = try cuda.Event.init(d, true);
+            e.dlog = dl;
+        };
         e.spec_on = std.mem.eql(u8, envGet("TF_FLASHNEXT_SPEC_SAMPLE") orelse "0", "1") and e.world == 1;
         if (e.spec_on) std.log.warn("TF_FLASHNEXT_SPEC_SAMPLE=1: sampled streams keep drafts by speculative sampling (same distribution, other draws)", .{});
         if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 32;
@@ -1743,8 +1752,12 @@ pub const Engine = struct {
             pn[i] = 1;
             e.f.prefetchNgram(r.seq, pwin[i][0..1], 0);
         };
+        const dl_t0 = std.Io.Clock.awake.now(e.io);
+        if (e.dlog) |dl| dl.n = 0;
         _ = try mtp.stageMany(&e.f, inputs[0..reqs.len], mb, &segs);
+        if (e.dlog) |dl| try dl.mark(e.stream);
         try e.runMulti(true, segs[0..reqs.len], mb);
+        if (e.dlog) |dl| try dl.mark(e.stream);
         const logits = mb.b.logits;
         var n_active: usize = 0;
         for (reqs, 0..) |*r, i| {
@@ -1807,6 +1820,7 @@ pub const Engine = struct {
                 t_level = tel.now(e.io);
             }
             try e.f.mark(.draft_sample);
+            if (e.dlog) |dl| try dl.mark(e.stream);
             if (n_next == 0) break;
             if (e.f.prof) |p| p.level = @intCast(@min(j + 1, 255));
             var toks: [64][1]u32 = undefined;
@@ -1815,7 +1829,9 @@ pub const Engine = struct {
                 inputs[k] = .{ .seq = reqs[nx.req].seq, .next = &toks[k], .streams = mb.b.streams + nx.row * Wd * 2 };
             }
             _ = try mtp.stageMany(&e.f, inputs[0..n_next], mb, &segs);
+            if (e.dlog) |dl| try dl.mark(e.stream);
             try e.runMulti(true, segs[0..n_next], mb);
+            if (e.dlog) |dl| try dl.mark(e.stream);
             lg = mb.b.logits;
             rows = n_next;
             for (next[0..n_next], 0..) |nx, k| {
@@ -1827,6 +1843,24 @@ pub const Engine = struct {
             }
             n_active = n_next;
         }
+        if (e.dlog) |dl| if (dl.n >= 3) {
+            // marks: [fwd start, fwd end, draw end] per step
+            try dl.ev[dl.n - 1].synchronize();
+            var k: usize = 0;
+            while (k + 2 < dl.n) : (k += 3) {
+                const f = try cuda.Event.elapsedMs(dl.ev[k], dl.ev[k + 1]);
+                if (k == 0) dl.first_ms += f else dl.mtp_ms += f;
+                dl.draw_ms += try cuda.Event.elapsedMs(dl.ev[k + 1], dl.ev[k + 2]);
+                if (k + 3 < dl.n) dl.gap_ms += try cuda.Event.elapsedMs(dl.ev[k + 2], dl.ev[k + 3]);
+                dl.steps += 1;
+            }
+            dl.calls += 1;
+            dl.wall_ms += seconds(e.io, dl_t0) * 1000.0;
+            if (dl.calls % 200 == 0) {
+                const c: f64 = @floatFromInt(dl.calls);
+                std.log.warn("draft log: {d} calls, {d:.2} steps/call; ms/call wall {d:.3} = absorb fwd {d:.3} + later fwds {d:.3} + draws {d:.3} + host gaps {d:.3} (+ staging/rest)", .{ dl.calls, @as(f64, @floatFromInt(dl.steps)) / c, dl.wall_ms / c, dl.first_ms / c, dl.mtp_ms / c, dl.draw_ms / c, dl.gap_ms / c });
+            }
+        };
         if (tel_on) {
             tel.park(tel.now(e.io));
             var held: [64]usize = undefined;
@@ -1852,6 +1886,23 @@ pub const Engine = struct {
         tokens: std.ArrayList(u32) = .empty,
         rounds: usize = 0,
         accepted: usize = 0,
+    };
+
+    pub const DraftLog = struct {
+        ev: [64]cuda.Event = undefined,
+        n: usize = 0,
+        calls: u64 = 0,
+        steps: u64 = 0,
+        first_ms: f64 = 0, // the absorb step's MTP forward
+        mtp_ms: f64 = 0, // the later steps' MTP forwards
+        draw_ms: f64 = 0, // each step's draw: sample kernels, read back, host draw
+        gap_ms: f64 = 0, // host time between a draw and the next step's forward
+        wall_ms: f64 = 0,
+        fn mark(dl: *DraftLog, s: cuda.Stream) !void {
+            if (dl.n >= dl.ev.len) return;
+            try dl.ev[dl.n].record(s);
+            dl.n += 1;
+        }
     };
 
     /// Seconds generateMany spent in each part of its last run (the stream synchronized at each boundary).
