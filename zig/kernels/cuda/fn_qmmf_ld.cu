@@ -61,7 +61,7 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
         int group, int ldo) {
     using T = Tile<MODE, BM, BN, WM, WN, STAGES>;
-    static_assert(BN == 64, "a block reads one 64-column tile of words and scales");
+    static_assert(BN % 64 == 0, "a block reads whole 64-column tiles of words and scales (adjacent in shared memory)");
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
@@ -86,8 +86,11 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         }
         if constexpr (T::S > 0) {                          // block scales [npad/64][K/64][64][4|2]: one tile's
             unsigned char* ps = pw + T::W;
-            for (int c = tid; c < T::S / 16; c += T::THREADS)
-                cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64) * KG + g) * T::S + c * 16);
+            constexpr int ST = T::S / (BN / 64);          // one 64-column tile's scale bytes a group
+            for (int c = tid; c < T::S / 16; c += T::THREADS) {
+                const int t = c * 16 / ST, off = c * 16 % ST;
+                cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + t) * KG + g) * ST + off);
+            }
         }
     };
 
@@ -317,3 +320,11 @@ TF_QMMF_LD_MX(16, true, false)
 TF_QMMF_LD_MX(32, true, false)
 TF_QMMF_LD_MX(64, true, false)
 TF_QMMF_LD_MX(64, false, true)
+
+// MXFP8 prompt rows on the wide tile (TF_FLASHNEXT_MX_WIDE): 128 rows x 64 columns, one warp a 128 x 16 strip, 2
+// stages; one K slice or the slices summed in order (FUSE). A value's instructions are the 64-row tile's.
+#define TF_QMMF_LD_WIDE(FUSE) template __global__ void tf_fn_qmmf_ld::qmmf_kernel<2, 128, 64, 1, 4, 2, false, false, \
+    FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, int, int, \
+    int, int, int);
+TF_QMMF_LD_WIDE(false)
+TF_QMMF_LD_WIDE(true)
