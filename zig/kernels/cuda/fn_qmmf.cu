@@ -329,26 +329,3 @@ TF_QMMF_MX(32, true, true, false)
 TF_QMMF_MX(64, true, true, false)
 TF_QMMF_MX(64, false, false, true)
 TF_QMMF_MX(64, true, false, true)
-
-// MXFP8 weights in the lane matmul's fragment order back to bf16 rows [n, k] (exact: the loader refused any
-// e4m3 x 2^(s-127) bf16 cannot hold): prompt chunks' projections then run on the bf16 prompt matmul.
-extern "C" __global__ void tf_fn_mx_widen(const uint8_t* __restrict__ w8, const uint8_t* __restrict__ bs,
-                                          __nv_bfloat16* __restrict__ out, int n, int k, int npad) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long long)npad * k) return;
-    const int byte = (int)(i & 7);
-    const int h = (int)((i >> 3) & 1);
-    const int lane = (int)((i >> 4) & 31);
-    const int c = (int)((i >> 9) & 7);
-    const long long rest = i >> 12;  // a * (k / 64) + b
-    const int kg = k / 64;
-    const int b = (int)(rest % kg);
-    const int a = (int)(rest / kg);
-    const int row = a * 64 + c * 8 + lane / 4;
-    if (row >= n) return;
-    const int kin = 16 * (byte / 4) + 2 * (lane % 4) + (byte % 2) + 8 * ((byte % 4) / 2);
-    const int col = b * 64 + h * 32 + kin;
-    const uint8_t s = bs[(((long long)a * kg + b) * 64 + row % 64) * 2 + h];
-    const float v = tf_fn_qmmf::e4m3f(w8[i]) * __int_as_float(static_cast<int>(s) << 23);
-    out[(long long)row * k + col] = __float2bfloat16_rn(v);
-}
