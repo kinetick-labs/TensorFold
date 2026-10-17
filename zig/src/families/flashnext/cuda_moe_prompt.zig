@@ -34,6 +34,9 @@ pub const Prompt4 = struct {
     gate2: Fn = undefined,
     up2: Fn = undefined,
     gate_buf: ?cuda.DeviceBuffer = null,
+    /// TF_FLASHNEXT_EXPERTS_COOP=1: the cooperative kernels (CTA-shared inputs through shared memory; the same
+    /// bytes): gate/up T=2 4 warps, down fp32 / bf16 T=2 8 warps
+    coop: ?[3]Coop = null,
     /// SMs a grid may cover (each function's grid caps at its own resident CTAs an SM times this;
     /// TF_FLASHNEXT_EXPERT_SMS_FREE lowers it, the grids loop over units: same bits)
     sms: usize = 0,
@@ -73,11 +76,41 @@ pub const Prompt4 = struct {
             if (it.next()) |x| p.down_rows = std.fmt.parseInt(usize, x, 10) catch 2048;
         }
         if (p.tile < 16 or p.tile > 1024 or p.tile % 16 != 0) return error.BadPromptTile;
+        if (std.c.getenv("TF_FLASHNEXT_EXPERTS_COOP")) |v| if (v[0] == '1') {
+            p.coop = .{ try p.coopOf("fn_coop_gu_t2_w4", 4), try p.coopOf("fn_coop_f32_t2_w8", 8), try p.coopOf("fn_coop_b16_t2_w8", 8) };
+        };
         return p;
     }
 
     /// A kernel and its resident CTAs an SM (at least 1).
     pub const Fn = struct { f: cuda.Function, per_sm: usize };
+    /// A cooperative kernel: its warps a CTA, its dynamic shared bytes (4 stages x 32 rows x 80 bytes), its CTAs an SM.
+    pub const Coop = struct { f: cuda.Function, warps: usize, smem: usize, per_sm: usize };
+
+    fn coopOf(p: *const Prompt4, name: [:0]const u8, warps: usize) !Coop {
+        const f = try p.mod.function(name);
+        const smem: usize = 4 * 32 * 80;
+        return .{ .f = f, .warps = warps, .smem = smem, .per_sm = @max(1, @as(usize, @intCast(try f.occupancy(32 * warps, smem)))) };
+    }
+
+    fn runCoop(p: *const Prompt4, s: cuda.Stream, c: Coop, x: u64, x_stride: usize, slots: usize, w: u64, scale: u64, kg: usize, nb: usize, pl: kern.Plan, out: u64, n: usize, limit: f32, skip: c_int, max_items: usize) !void {
+        const units = max_items * ((nb + c.warps - 1) / c.warps);
+        const grid = @min(units, c.per_sm * p.sms);
+        if (grid < 1) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(int(x_stride));
+        a.add(int(slots));
+        a.add(w);
+        a.add(scale);
+        a.add(int(kg));
+        a.add(int(nb));
+        for ([_]u64{ pl.items, pl.counts, pl.members, out }) |v| a.add(v);
+        a.add(int(n));
+        a.add(limit);
+        a.add(skip);
+        try cuda.launch.launch(c.f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = @intCast(32 * c.warps) }, .shared = @intCast(c.smem) }, s, &a);
+    }
 
     fn fnOf(p: *const Prompt4, name: [:0]const u8) !Fn {
         const f = try p.mod.function(name);
@@ -136,6 +169,7 @@ pub const Prompt4 = struct {
             try p.runG(s, p.up2, x, x_stride, plan_slots, ex.up, ex.up_scale, ex.dims / 32, ex.width / 32, pl, out, ex.width, ex.limit, skip, mi, gb);
             return;
         }
+        if (p.coop) |c| if (x_stride % 8 == 0 and x % 16 == 0) return p.runCoop(s, c[0], x, x_stride, plan_slots, ex.up, ex.up_scale, ex.dims / 32, ex.width / 32, pl, out, ex.width, ex.limit, skip, kern.maxItems(rows * plan_slots, plan_experts, p.tile));
         const f = switch (p.t_gu) {
             2 => if (p.use_occ) p.occ[0] else p.gu[0],
             3 => p.gu[1],
@@ -147,6 +181,7 @@ pub const Prompt4 = struct {
 
     /// nvfp4/experts.down on this plan: act [R * slots, NI] -> out [R * slots, D], fp32 (`f32_out`) or bf16.
     pub fn down(p: *const Prompt4, s: cuda.Stream, act: u64, act_stride: usize, ex: kern.Experts4, pl: kern.Plan, plan_slots: usize, plan_experts: usize, out: u64, f32_out: bool, rows: usize, skip: c_int) !void {
+        if (p.coop) |c| if (act_stride % 8 == 0 and act % 16 == 0) return p.runCoop(s, if (f32_out) c[1] else c[2], act, act_stride, 0, ex.down, ex.down_scale, ex.width / 32, ex.dims / 32, pl, out, ex.dims, 0, skip, kern.maxItems(rows * plan_slots, plan_experts, p.tile));
         const fs = if (f32_out) p.f32 else p.b16;
         const f = switch (p.t_down) {
             2 => if (p.use_occ or p.occ_down) (if (f32_out) p.occ[1] else p.occ[2]) else fs[0],
