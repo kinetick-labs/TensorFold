@@ -460,7 +460,7 @@ pub const Engine = struct {
         e.f.comm = o.comm;
         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
         try e.f.initRound(rows, @max(1, o.streams));
-        if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 2048;
+        if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 16;
         if (mx8Of(&e.c)) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.f.k8 = &e.k8.?;
@@ -571,13 +571,14 @@ pub const Engine = struct {
             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
         };
         errdefer if (e.mtpq) |*t| t.deinit();
-        if (envGet("TF_FLASHNEXT_HEAD_SCREEN")) |v| if (std.mem.eql(u8, v, "1")) {
+        // TF_FLASHNEXT_HEAD_SCREEN (default on; 0 off): ~0.75 GB for the MXFP8 copy and its bounds
+        if (!std.mem.eql(u8, envGet("TF_FLASHNEXT_HEAD_SCREEN") orelse "1", "0")) {
             if (o.world == 1 and e.w.head4 == null and e.w.head3 == null and e.k8 != null) {
                 e.screen = try hs.HeadScreen.build(gpa, d, e.w.head);
                 e.f.screen = &e.screen.?;
                 std.log.info("head screen: MXFP8 copy of the {d} x {d} head for greedy verify rounds (exact draws)", .{ e.w.head.n, e.w.head.k });
             } else std.log.warn("head screen: needs one GPU, a bf16 head and the FP8 kernels; off", .{});
-        };
+        }
         errdefer if (e.screen) |*x| x.deinit();
         // EXL3: a 4-bit draft head from the trellis lm_head (drafts only); TF_FLASHNEXT_X3_DRAFT_HEAD=0: the whole head
         if (e.w.mtp != null and e.w.head3 != null and e.w.draft_head == null and !envOff("TF_FLASHNEXT_X3_DRAFT_HEAD")) {
