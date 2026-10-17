@@ -26,6 +26,7 @@ const prompt = @import("cuda_mia_prompt.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const fp8 = @import("cuda_fp8.zig");
 const hs_mod = @import("cuda_head_screen.zig");
+const spec = @import("cuda_spec.zig");
 const int4 = @import("cuda_int4.zig");
 const exl3 = @import("cuda_exl3.zig");
 
@@ -105,6 +106,9 @@ pub const Seq = struct {
     media: ?SeqMedia = null,
     /// its stream's last draw was greedy (TF_FLASHNEXT_HEAD_SCREEN screens its next verify rounds)
     greedy: bool = false,
+    /// TF_FLASHNEXT_SPEC_SAMPLE: the head's last chain's draft distributions (draft d at spec_q[d]), spec_n of them
+    spec_q: [state.max_rows]spec.Dist = undefined,
+    spec_n: usize = 0,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {

@@ -25,6 +25,7 @@ const decode = @import("cuda_decode.zig");
 const fwd = @import("cuda_forward.zig");
 const fp8 = @import("cuda_fp8.zig");
 const hs = @import("cuda_head_screen.zig");
+const spec = @import("cuda_spec.zig");
 const int4 = @import("cuda_int4.zig");
 const exl3 = @import("cuda_exl3.zig");
 const mtp = @import("cuda_mia_mtp.zig");
@@ -384,6 +385,12 @@ pub const Engine = struct {
     /// replay synchronized and its parts summed, reported every 200 (graph-mode part times; the same bits)
     gprof: ?*profs.Prof = null,
     ngram_prefetch: bool = false,
+    /// TF_FLASHNEXT_SPEC_SAMPLE=1 (one rank): sampled streams keep head drafts by speculative sampling (cuda_spec)
+    spec_on: bool = false,
+    spec_toks: [64][state.max_rows]u32 = undefined,
+    spec_kept: u64 = 0,
+    spec_taken: u64 = 0,
+    spec_plain: u64 = 0,
     gprof_rows: u32 = 0,
     gprof_n: usize = 0,
     gprof_rounds: u64 = 0,
@@ -468,6 +475,8 @@ pub const Engine = struct {
         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
         try e.f.initRound(rows, @max(1, o.streams));
         e.ngram_prefetch = !std.mem.eql(u8, envGet("TF_FLASHNEXT_NGRAM_PREFETCH") orelse "1", "0"); // default on: cold prose c1 +7%
+        e.spec_on = std.mem.eql(u8, envGet("TF_FLASHNEXT_SPEC_SAMPLE") orelse "0", "1") and e.world == 1;
+        if (e.spec_on) std.log.warn("TF_FLASHNEXT_SPEC_SAMPLE=1: sampled streams keep drafts by speculative sampling (same distribution, other draws)", .{});
         if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 32;
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 16;
         if (mx8Of(&e.c)) {
@@ -1478,6 +1487,10 @@ pub const Engine = struct {
         }
         e.f.screen_on = e.round_screened;
         defer e.f.screen_on = false;
+        if (e.spec_on) for (windows, 0..) |w, i| {
+            if (i >= e.spec_toks.len or w.tokens.len > state.max_rows) break;
+            @memcpy(e.spec_toks[i][0..w.tokens.len], w.tokens);
+        };
         try e.f.mark(.gap_verify);
         e.cand_round +%= 1;
         if (windows.len > e.round_segs.len) return error.TooManyStreams;
@@ -1509,6 +1522,8 @@ pub const Engine = struct {
             e.round_screened = false;
             e.full_redone += 1;
         }
+        if (e.spec_on and e.world == 1 and spec.fits(smp) and i < e.spec_toks.len and envGet("TF_FLASHNEXT_FORCE") == null)
+            return e.specRows(sg, e.spec_toks[i][0 .. sg.a1 - sg.a0], smp.?, out);
         if (e.world > 1 and e.draw_once and sampler.gatheredFits(smp)) {
             // the round's candidates read once (one wait), every window's draws from the host copy
             if (e.cand_have != e.cand_round) {
@@ -1519,6 +1534,61 @@ pub const Engine = struct {
             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
         }
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
+    }
+
+    /// TF_FLASHNEXT_SPEC_SAMPLE: window `sg`'s rows (tokens `toks`) drawn by speculative sampling: row r's draw is
+    /// the draft toks[r + 1] when kept (its head distribution held at seq.spec_q[r]), the residual's draw at the
+    /// first refusal, the plain keyed draw on a row without a head draft. Every emitted token follows the target's
+    /// sampler distribution (cuda_spec); rows past the first difference are drawn plainly and dropped by the caller.
+    fn specRows(e: *Engine, sg: fwd.Seg, toks: []const u32, s: lanes.Sampling, out: []u32) !void {
+        const V = e.g.head_n;
+        const rows = sg.a1 - sg.a0;
+        if (rows > state.max_rows) return error.WindowPastRows;
+        const first_position = sg.seq.st.pos + 1;
+        const ms = e.main_sample;
+        const k = mtp.topK(V, s);
+        if (k > max_k) return error.TopKPastScratch;
+        try e.f.th.sampleTopk(e.buf.b.logits + sg.a0 * V * 2, rows, V, k, ms);
+        const vals = try e.gpa.alloc(f32, rows * k);
+        defer e.gpa.free(vals);
+        const cols = try e.gpa.alloc(i64, rows * k);
+        defer e.gpa.free(cols);
+        try e.read(ms.vals, std.mem.sliceAsBytes(vals));
+        try e.read(ms.idx, std.mem.sliceAsBytes(cols));
+        const ids = try e.gpa.alloc(u64, k);
+        defer e.gpa.free(ids);
+        var done = false;
+        for (0..rows) |r| {
+            for (ids, cols[r * k ..][0..k]) |*t, c| t.* = @intCast(c);
+            const position = first_position + r;
+            const row = vals[r * k ..][0..k];
+            const q = &sg.seq.spec_q[r];
+            if (!done and r + 1 < rows and r < sg.seq.spec_n and q.position == position and q.token == toks[r + 1]) {
+                var p: spec.Dist = .{};
+                if (try spec.dist(e.gpa, row, ids, s, &p)) {
+                    switch (spec.decide(&p, q, toks[r + 1], s.seed, position)) {
+                        .keep => {
+                            out[r] = toks[r + 1];
+                            e.spec_kept += 1;
+                        },
+                        .take => |t| {
+                            out[r] = @intCast(t);
+                            e.spec_taken += 1;
+                            done = true;
+                        },
+                    }
+                    continue;
+                }
+            }
+            out[r] = @intCast((try sampler.drawRow(e.gpa, row, ids, position, s, null)).token);
+            if (!done) {
+                e.spec_plain += 1;
+                if (r + 1 < rows and out[r] != toks[r + 1]) done = true;
+            }
+            if (r + 1 >= rows) done = true;
+        }
+        const n = e.spec_kept + e.spec_taken + e.spec_plain;
+        if (n / 2000 != (n - @min(n, rows)) / 2000) std.log.info("spec sample: {d} drafts kept, {d} refused (residual draws), {d} plain rows", .{ e.spec_kept, e.spec_taken, e.spec_plain });
     }
 
     /// TF_FLASHNEXT_FORCE=path (diagnostics): "pos token" lines, read again each window; a row at a listed position
@@ -1650,6 +1720,7 @@ pub const Engine = struct {
         if (reqs.len > inputs.len) return error.TooManyStreams;
         for (reqs, 0..) |*r, i| {
             r.drafted = 0;
+            r.seq.spec_n = 0;
             const st = &r.seq.st;
             if (st.mtp_drafted != 0) {
                 try e.f.setMtpLen(st, st.mtp_len - st.mtp_drafted);
@@ -1706,7 +1777,12 @@ pub const Engine = struct {
             for (active[0..n_active], 0..) |a, k| {
                 const r = &reqs[a.req];
                 const smp: ?lanes.Sampling = if (r.sampling) |x| (if (x.temperature > 0) x else null) else null;
-                const got = if (cands != null and sampler.gatheredFits(smp))
+                // TF_FLASHNEXT_SPEC_SAMPLE: the draft on its own keys, its distribution held for the verify
+                const with_q: ?sampler.Draw = if (e.spec_on and cands == null and smp != null and r.drafted < state.max_rows)
+                    try d.sampleDraftRowDist(&e.f, mb, lg, row_of[k], rows, r.seq.st.pos + 1 + j, smp.?, &r.seq.spec_q[r.drafted])
+                else
+                    null;
+                const got = if (with_q) |g| g else if (cands != null and sampler.gatheredFits(smp))
                     try d.gatheredFrom(cands.?, row_of[k], rows, r.seq.st.pos + 1 + j, smp)
                 else
                     try d.sampleDraftRow(&e.f, mb, lg, row_of[k], rows, r.seq.st.pos + 1 + j, smp);
@@ -1715,6 +1791,7 @@ pub const Engine = struct {
                 if (!t.propose) continue;
                 r.out[r.drafted] = @intCast(got.token);
                 r.drafted += 1;
+                if (with_q != null and r.seq.spec_n + 1 == r.drafted) r.seq.spec_n = r.drafted;
                 if (e.ngram_prefetch and pn[a.req] > 0 and pn[a.req] < 64) {
                     pwin[a.req][pn[a.req]] = @intCast(got.token);
                     pn[a.req] += 1;
