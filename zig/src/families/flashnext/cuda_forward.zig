@@ -649,6 +649,8 @@ pub const Forward = struct {
     /// TF_FLASHNEXT_COUNT_EXPERTS=1 (with the profile): every decode MoE layer's distinct routed experts and rows
     /// counted on the host (a wait a layer); the main model's and the MTP head's, since the last report
     count_experts: bool = false,
+    /// set while cuda_mtp runs the MTP head (the expert count's split)
+    in_mtp: bool = false,
     /// the shared expert's stream (initSide): it runs beside the routed experts, joined before their sum
     side: ?Side = null,
     /// `_fp4mm` SK 1 launches of 9 to fp4SerialRows(n) rows on fn_ops' K-serial kernel (fp4Serial)
@@ -2067,7 +2069,7 @@ pub const Forward = struct {
         try f.t.router(b.mixed, D, m.router, b.moe_logits, R, D, E + 1);
         try f.mark(.router);
         try f.t.topkRows(b.moe_logits, b.moe_pick, b.moe_wts, R, E, top);
-        if (f.count_experts and f.prof != null and !b.prefill) try f.countExperts(b.moe_pick, R, slots, E);
+        if (f.count_experts and !b.prefill) try f.countExperts(b.moe_pick, R, slots, E);
         if (f.splitOf(x, R)) |q| if (f.cs != null and f.overlap & 2 != 0) {
             // the peer's rows first: their experts and partial, sent while this rank's own rows run
             const yrow = slots * D * es;
@@ -2115,13 +2117,14 @@ pub const Forward = struct {
         var seen = try std.DynamicBitSet.initEmpty(f.gpa, E + 1);
         defer seen.deinit();
         for (host) |x| if (x >= 0 and x < E) seen.set(@intCast(x));
-        const c = &f.experts_seen[@intFromBool(f.prof.?.mtp)];
+        const mtp_head = f.in_mtp;
+        const c = &f.experts_seen[@intFromBool(mtp_head)];
         c.layers += 1;
         c.distinct += seen.count();
         c.rows += R;
         // the lane core never prints the rounds summary: report every 2400 layers (50 rounds of 48) here
         if (c.layers >= 2400) {
-            std.debug.print("count experts ({s}): {d:.1} distinct routed experts a MoE layer over {d:.2} rows ({d} layers)\n", .{ if (f.prof.?.mtp) "MTP head" else "main", @as(f64, @floatFromInt(c.distinct)) / @as(f64, @floatFromInt(c.layers)), @as(f64, @floatFromInt(c.rows)) / @as(f64, @floatFromInt(c.layers)), c.layers });
+            std.debug.print("count experts ({s}): {d:.1} distinct routed experts a MoE layer over {d:.2} rows ({d} layers)\n", .{ if (mtp_head) "MTP head" else "main", @as(f64, @floatFromInt(c.distinct)) / @as(f64, @floatFromInt(c.layers)), @as(f64, @floatFromInt(c.rows)) / @as(f64, @floatFromInt(c.layers)), c.layers });
             c.* = .{};
         }
     }
