@@ -380,6 +380,12 @@ pub const Engine = struct {
     seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// TF_FLASHNEXT_PROFILE: each prompt chunk's GPU time by part (cuda_prof.zig)
     prof: ?*profs.Prof = null,
+    /// TF_FLASHNEXT_GPROF=rows: verify graphs of `rows` rows captured with their profile marks (event nodes); each
+    /// replay synchronized and its parts summed, reported every 200 (graph-mode part times; the same bits)
+    gprof: ?*profs.Prof = null,
+    gprof_rows: u32 = 0,
+    gprof_n: usize = 0,
+    gprof_rounds: u64 = 0,
     /// TF_FLASHNEXT_PROMPT_EXPERTS (default on): prompt chunks' experts read weights once a call
     px: ?moep.Prompt4 = null,
     /// TF_FLASHNEXT_PREFILL_DIGEST: each prompt chunk's final streams (every row) and last logits hashed and printed
@@ -560,6 +566,11 @@ pub const Engine = struct {
             e.prof = try profs.Prof.init(gpa, d, 16384);
         }
         errdefer if (e.prof) |p| p.deinit(gpa);
+        if (envGet("TF_FLASHNEXT_GPROF")) |v| {
+            e.gprof_rows = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (e.gprof_rows > 0) e.gprof = try profs.Prof.init(gpa, d, 4096);
+        }
+        errdefer if (e.gprof) |p| p.deinit(gpa);
         if (o.rank == 0) std.debug.print("prompt path: {d}-row chunks (the last up to {d} more), glue {s}{s}, matmul K slices {s}, experts {s}{s}\n", .{ e.prefill_rows, e.prefill_tail, if (e.f.glue_split) "split by rows" else "on every row", if (e.f.cs != null) " (exchanges overlapped)" else "", if (e.f.prompt_mm) "in one program (_b16mm_ks/_fp4mm_ks)" else "split with _reduce", if (e.px != null) "on 128-pair items (fn_experts_prompt)" else "on 16-pair items", if (e.prof != null) ", profiled" else "" });
         // FP4-Local (MXFP8 checkpoints) defaults to the 4-bit MTP head: the same outputs, faster prose (TF_FLASHNEXT_MTP_Q4=0: off)
         const q4_default: ?[]const u8 = if (e.c.hasMxfp8()) "1" else null;
@@ -681,6 +692,7 @@ pub const Engine = struct {
         e.gpa.free(e.round_segs);
         e.extra.buf.free();
         if (e.prof) |p| p.deinit(e.gpa);
+        if (e.gprof) |p| p.deinit(e.gpa);
         e.cand_host.deinit(e.gpa);
         e.memo.deinit();
         if (e.px) |*q| q.deinit();
@@ -2033,7 +2045,19 @@ pub const Engine = struct {
         const key: GraphKey = .{ .seq = @intFromPtr(seq), .version = seq.st.version, .mtp = head, .rows = @intCast(rows), .parity = par, .ctx = ctx, .media = mediaKey(seq), .screen = !head and e.f.screen_on };
         e.f.context = ctx;
         defer e.f.context = null;
-        if (e.graphs.get(key)) |g| return g.launchOn(e.stream);
+        const gp: ?*profs.Prof = if (!head and rows == e.gprof_rows) e.gprof else null;
+        if (e.graphs.get(key)) |g| {
+            try g.launchOn(e.stream);
+            if (gp) |p| if (e.gprof_n > 1) {
+                try p.replayed(e.gprof_n);
+                e.gprof_rounds += 1;
+                if (e.gprof_rounds % 200 == 0) {
+                    p.n = 0;
+                    try p.rounds(e.rank, "graph verify", 200, 0);
+                }
+            };
+            return;
+        }
         e.dropGraphsOf(key.seq, key.version, key.media);
         const t_cap = std.Io.Clock.awake.now(e.io);
         defer {
@@ -2047,7 +2071,17 @@ pub const Engine = struct {
         }
         try e.stream.synchronize();
         if (!e.capBegin(&e.solo_fault, "solo")) return;
+        if (gp) |p| {
+            p.n = 0;
+            p.mtp = false;
+            e.f.prof = p;
+        }
         const ok = if (e.body(head, rows)) |_| true else |err| e.capNote(&e.solo_fault, "solo", "capture", err);
+        if (gp) |p| {
+            e.f.prof = null;
+            if (e.gprof_n != 0 and e.gprof_n != p.n) std.log.warn("graph profile: {d} marks, earlier capture {d}", .{ p.n, e.gprof_n });
+            e.gprof_n = p.n;
+        }
         var exec = e.capEnd(&e.solo_fault, "solo", ok) orelse return;
         errdefer exec.deinit();
         try e.graphs.put(e.gpa, key, exec);
