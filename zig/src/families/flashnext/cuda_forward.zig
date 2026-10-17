@@ -1479,6 +1479,20 @@ pub const Forward = struct {
         return R;
     }
 
+    /// TF_FLASHNEXT_NGRAM_PREFETCH: the n-gram rows of `window`'s rows from `from` on (as the next verify of `seq`
+    /// will gather them) read ahead on a host-mapped table; a hint only, nothing computed changes.
+    pub fn prefetchNgram(f: *Forward, seq: *const Seq, window: []const i64, from: usize) void {
+        const table = &(f.w.table orelse return);
+        if (table.gpu != null or table.exl3 != null or window.len > 64 or from >= window.len) return;
+        for (f.w.layers) |l| if (l.ple) |p| {
+            const heads = p.ngram.heads;
+            var nid: [64 * 32]i64 = undefined;
+            if (window.len * heads > nid.len) return;
+            p.ngram.ids(seq.st.history[0 .. p.ngram.n - 1], window, nid[0 .. window.len * heads]) catch return;
+            table.willNeed(nid[from * heads .. window.len * heads]);
+        };
+    }
+
     var stage_acc: [4]u64 = @splat(0);
     var stage_n: u64 = 0;
     fn stageNs() u64 {
