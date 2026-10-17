@@ -447,6 +447,7 @@ pub const Engine = struct {
         e.f.comm = o.comm;
         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
         try e.f.initRound(rows, @max(1, o.streams));
+        if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 2048;
         if (mx8Of(&e.c)) {
             e.k8 = try fp8.Kernels.load(ctx);
             e.f.k8 = &e.k8.?;
