@@ -547,7 +547,9 @@ pub const Engine = struct {
         if (o.rank == 0) std.debug.print("prompt path: {d}-row chunks (the last up to {d} more), glue {s}{s}, matmul K slices {s}, experts {s}{s}\n", .{ e.prefill_rows, e.prefill_tail, if (e.f.glue_split) "split by rows" else "on every row", if (e.f.cs != null) " (exchanges overlapped)" else "", if (e.f.prompt_mm) "in one program (_b16mm_ks/_fp4mm_ks)" else "split with _reduce", if (e.px != null) "on 128-pair items (fn_experts_prompt)" else "on 16-pair items", if (e.prof != null) ", profiled" else "" });
         if (e.w.mtp != null) if (std.c.getenv("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
             const mse = if (std.c.getenv("TF_FLASHNEXT_MTP_Q4_MSE")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;
-            e.mtpq = try @import("cuda_mtp_q4.zig").Table.build(gpa, d, &e.w, std.mem.span(v), mse);
+            const mx = if (std.c.getenv("TF_FLASHNEXT_MTP_MX8")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;
+            if (mx and e.k8 == null) return error.NoFp8Kernels;
+            e.mtpq = try @import("cuda_mtp_q4.zig").Table.buildAs(gpa, d, &e.w, std.mem.span(v), mse, mx);
             e.f.mtp_q4 = &e.mtpq.?;
             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
         };
