@@ -649,6 +649,8 @@ pub const Forward = struct {
     /// TF_FLASHNEXT_COUNT_EXPERTS=1 (with the profile): every decode MoE layer's distinct routed experts and rows
     /// counted on the host (a wait a layer); the main model's and the MTP head's, since the last report
     count_experts: bool = false,
+    /// the lane matmul (cuda.qmmf) for the hyper-connections' decode rows (W.Hc down_l / up_l)
+    lane: ?*const cuda.qmmf.Lane = null,
     /// the shared expert's stream (initSide): it runs beside the routed experts, joined before their sum
     side: ?Side = null,
     /// `_fp4mm` SK 1 launches of 9 to fp4SerialRows(n) rows on fn_ops' K-serial kernel (fp4Serial)
@@ -1637,6 +1639,10 @@ pub const Forward = struct {
                 try f.th.slotCopy(f.sc.pb, hc.down.n * 4, f.sc.dn + d8.n * 4, dn_n * 4, hc.down.n * 4, R);
             }
             try f.mark(.hc_down);
+        } else if (f.lane != null and hc.down_l != null and !b.prefill) {
+            // FP4-Local decode rows: the lane matmul's BF16 mode (fp32 out), the same weights
+            try f.lane.?.matmulF32(f.s, b.normed, Wd, R, hc.down_l.?, f.sc.dn, 0);
+            try f.mark(.hc_down);
         } else try f.mmxAt(.hc_down, b.normed, Wd, b.xs_normed, hc.down, f.sc.dn, true, R);
         try f.t.hcAct(f.sc.dn, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low);
         try f.mark(.hc_act);
@@ -1647,7 +1653,10 @@ pub const Forward = struct {
             try f.mark(.hc_mix);
             return;
         }
-        try f.denseAt(.hc_up, b.act, g.low, b.xs_act, hc.up, hc.up8, b.up, false, R);
+        if (f.lane != null and hc.up_l != null and !b.prefill) {
+            try f.lane.?.matmul(f.s, b.act, g.low, R, hc.up_l.?, b.up, 0);
+            try f.mark(.hc_up);
+        } else try f.denseAt(.hc_up, b.act, g.low, b.xs_act, hc.up, hc.up8, b.up, false, R);
         try f.t.hcMix(b.up, b.normed, mixed, xs, R, g.hidden, g.streams);
         try f.mark(.hc_mix);
     }
