@@ -101,7 +101,24 @@ pub const sym = struct {
         break :blk out;
     };
     pub const ld_fused_mx = ldNameM(2, 64, false, true);
+    /// TF_FLASHNEXT_MX_WIDE: the MXFP8 prompt tile <2, 128, 64, 1, 4, 2> ([F32][fuse]; ld: [fuse])
+    pub const wide_mx = [2][2][:0]const u8{
+        .{ wideName(false, false), wideName(false, true) },
+        .{ wideName(true, false), wideName(true, true) },
+    };
+    pub const ld_wide_mx = [2][:0]const u8{ ldWideName(false), ldWideName(true) };
+    fn wideName(comptime f32_out: bool, comptime fuse: bool) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN10tf_fn_qmmf11qmmf_kernelILi2ELi128ELi64ELi1ELi4ELi2ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(f32_out), @intFromBool(fuse) });
+    }
+    fn ldWideName(comptime fuse: bool) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN13tf_fn_qmmf_ld11qmmf_kernelILi2ELi128ELi64ELi1ELi4ELi2ELb0ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", .{@intFromBool(fuse)});
+    }
 };
+
+/// The wide MXFP8 prompt tile's rows and dynamic shared bytes (Tile<MXFP8, 128, 64, 1, 4, 2>::SMEM: 2 stages of
+/// 128 x 128 input bytes, 64 x 64 codes and 64 x 2 scales).
+pub const wide_rows: usize = 128;
+pub const wide_smem: u32 = 2 * 20608;
 
 pub const Kernels = struct {
     module: cuda.Module,
@@ -116,6 +133,10 @@ pub const Kernels = struct {
     fused_mx: [2]cuda.Function,
     ld_tiled_mx: [2][3]cuda.Function,
     ld_fused_mx: cuda.Function,
+    /// TF_FLASHNEXT_MX_WIDE=1: MXFP8 prompt rows (m >= fused_rows) on the 128-row tile, [bf16, f32][one slice, fused]
+    /// and ld [one slice, fused] (the same bytes); null when off
+    wide: ?[2][2]cuda.Function = null,
+    ld_wide: ?[2]cuda.Function = null,
     /// TF_FLASHNEXT_MX_GEMV=1: MXFP8 rows up to 8 on tf_fn_mxgemv ([bf16, f32][2, 4, 8 rows]); null when off
     gemv: ?[2][3]cuda.Function = null,
     major: c_int,
@@ -167,6 +188,22 @@ pub const Kernels = struct {
         };
         k.ld_fused_mx = try k.ld_module.function(sym.ld_fused_mx);
         try k.ld_fused_mx.allowDynamicShared(smem(64));
+        k.wide = null;
+        k.ld_wide = null;
+        if (std.c.getenv("TF_FLASHNEXT_MX_WIDE")) |v| if (v[0] == '1') {
+            var w: [2][2]cuda.Function = undefined;
+            var lw: [2]cuda.Function = undefined;
+            for (0..2) |f| for (0..2) |u| {
+                w[f][u] = try k.module.function(sym.wide_mx[f][u]);
+                try w[f][u].allowDynamicShared(wide_smem);
+            };
+            for (0..2) |u| {
+                lw[u] = try k.ld_module.function(sym.ld_wide_mx[u]);
+                try lw[u].allowDynamicShared(wide_smem);
+            }
+            k.wide = w;
+            k.ld_wide = lw;
+        };
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
     }
@@ -216,6 +253,22 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
         return cuda.launch.launch(g[@intFromBool(f32_out)][b], .{ .grid = .{ .x = @intCast((n + 7) / 8), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = 0, .cluster = null }, s, &a);
     };
     const sk = splitK(n, kk);
+    if (l.mx and m >= fused_rows) if (k.wide) |w| {
+        // the 128-row tile: one slice, or the slices summed in order in the program (fused), as the 64-row forms
+        const fuse = sk > 1;
+        const rt = (m + wide_rows - 1) / wide_rows;
+        const wf = if (ldo != null) k.ld_wide.?[@intFromBool(fuse)] else w[@intFromBool(f32_out)][@intFromBool(fuse)];
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(l.w8);
+        a.add(l.bs);
+        a.add(@as(f32, 1.0));
+        a.add(out);
+        a.add(@as(u64, 0));
+        for ([_]usize{ m, n, kk, sk, l.npad, if (m == 1) kk else x_stride, l2Group(rt, wide_rows, kk) }) |v| a.add(@as(c_int, @intCast(v)));
+        if (ldo) |ld| a.add(@as(c_int, @intCast(ld)));
+        return cuda.launch.launch(wf, .{ .grid = .{ .x = @intCast(rt * ((n + 63) / 64)), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = wide_smem, .cluster = null }, s, &a);
+    };
     const bm: usize = if (sk > 1 and m >= fused_rows) 0 else bucket(m);
     const fused = bm == 0;
     const cluster = !fused and sk > 1 and sk <= 8 and k.major >= 9;
