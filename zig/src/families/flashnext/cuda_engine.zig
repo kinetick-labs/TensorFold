@@ -154,8 +154,8 @@ fn yarnConfig(y: rope.Yarn) cfgs.Yarn {
 fn mtpTopK(top_k: u32) usize {
     const v = envGet("TF_FLASHNEXT_MTP_TOPK") orelse return 0;
     const n = std.fmt.parseInt(usize, v, 10) catch return 0;
-    // the kernel set routes the checkpoints' own values (10, INT4-AutoRound's 5); 10 is the only other one accepted
-    if (n != 10 or n == top_k) {
+    // the kernel set routes the checkpoints' own values (10, INT4-AutoRound's 5); either is accepted (drafts only)
+    if ((n != 10 and n != 5) or n == top_k) {
         if (n != top_k) std.log.warn("TF_FLASHNEXT_MTP_TOPK={d} ignored: the kernel set has top-5 and top-10 routing", .{n});
         return 0;
     }
