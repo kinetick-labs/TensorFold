@@ -143,6 +143,31 @@ pub fn decide(p: *const Dist, q: *const Dist, draft: u64, seed: u64, position: u
     return .{ .take = arg };
 }
 
+/// A tree node's siblings (multi-draft, SpecInfer / Miao et al. 2024 recursive rejection): `drafts` drawn
+/// i.i.d. from `q` at one position. Sibling i is kept with probability min(1, p_i(x)/q(x)), p_0 = p; after its
+/// refusal p_{i+1} = norm(max(p_i - q, 0)); past every sibling the draw is from the last p. Returns the kept
+/// sibling's index, or the residual's token. The engine's windows are chains (cuda_lanes refuses parents:
+/// TreesNotBuilt), so only `decide` runs today; this is the rule a tree verify must use.
+pub const Multi = union(enum) { keep: usize, take: u64 };
+pub fn decideMulti(p: *const Dist, q: *const Dist, drafts: []const u64, seed: u64, position: u64) Multi {
+    var cur = p.*;
+    const rs = S.mix(seed ^ salt_rest);
+    for (drafts, 0..) |x, i| {
+        const px = cur.prob(x);
+        const qx = q.prob(x);
+        const u = S.uniform(S.mix(seed ^ salt_coin), position, i);
+        if (qx > 0.0 and u * qx <= px) return .{ .keep = i };
+        var sum: f64 = 0;
+        for (cur.ids[0..cur.n], cur.probs[0..cur.n]) |id, *pp| {
+            pp.* = @max(pp.* - q.prob(id), 0.0);
+            sum += pp.*;
+        }
+        if (!(sum > 0.0)) break;
+        for (cur.probs[0..cur.n]) |*pp| pp.* /= sum;
+    }
+    return .{ .take = drawFrom(&cur, rs, position) };
+}
+
 /// The keyed Gumbel draw from `d` with `seed` at `position` (the draft's draw over its distribution).
 fn drawFrom(d: *const Dist, seed: u64, position: u64) u64 {
     var arg: u64 = d.ids[0];
@@ -231,4 +256,77 @@ test "dist follows choose's cut: its draws are choose's kept set" {
         try std.testing.expect(d.prob(t) > 0);
     }
     try std.testing.expect(!(try dist(gpa, &values, &ids, .{ .seed = 1, .temperature = 0.7, .top_k = 0 }, &d)));
+}
+
+test "recursive rejection over three i.i.d. siblings emits the target's distribution (chi-square)" {
+    const p = mk(&.{ 3, 7, 11, 13, 17, 19 }, &.{ 0.40, 0.25, 0.15, 0.10, 0.06, 0.04 });
+    const q = mk(&.{ 7, 3, 11, 23, 13 }, &.{ 0.45, 0.20, 0.20, 0.10, 0.05 });
+    const seed: u64 = 777;
+    const n: usize = 400_000;
+    var counts: [6]usize = @splat(0);
+    var kept: usize = 0;
+    for (0..n) |pos| {
+        // three siblings from q, each on its own key stream
+        var xs: [3]u64 = undefined;
+        for (&xs, 0..) |*x, i| x.* = drawFrom(&q, S.mix(seed ^ salt_draft ^ (@as(u64, i) << 32)), pos);
+        const tok = switch (decideMulti(&p, &q, &xs, seed, pos)) {
+            .keep => |i| blk: {
+                kept += 1;
+                break :blk xs[i];
+            },
+            .take => |t| t,
+        };
+        var hit = false;
+        for (p.ids[0..p.n], 0..) |id, j| if (id == tok) {
+            counts[j] += 1;
+            hit = true;
+        };
+        try std.testing.expect(hit);
+    }
+    var chi: f64 = 0;
+    for (counts, p.probs[0..6]) |c, pr| {
+        const e = pr * @as(f64, @floatFromInt(n));
+        const d = @as(f64, @floatFromInt(c)) - e;
+        chi += d * d / e;
+    }
+    try std.testing.expect(chi < 25.0);
+    const rate = @as(f64, @floatFromInt(kept)) / @as(f64, @floatFromInt(n));
+    // three siblings keep more than one (0.65)
+    try std.testing.expect(rate > 0.70);
+    if (std.c.getenv("SPEC_PROBE") != null) {
+        std.debug.print("multi chi2 {d:.2} (df 5) keep {d:.4}\n", .{ chi, rate });
+        return error.Probe;
+    }
+}
+
+test "the chi-square check has power: siblings each judged against the unchanged p miss the target" {
+    const p = mk(&.{ 3, 7, 11, 13, 17, 19 }, &.{ 0.40, 0.25, 0.15, 0.10, 0.06, 0.04 });
+    const q = mk(&.{ 7, 3, 11, 23, 13 }, &.{ 0.45, 0.20, 0.20, 0.10, 0.05 });
+    const seed: u64 = 777;
+    const n: usize = 400_000;
+    var counts: [6]usize = @splat(0);
+    for (0..n) |pos| {
+        var tok: ?u64 = null;
+        for (0..3) |i| {
+            const x = drawFrom(&q, S.mix(seed ^ salt_draft ^ (@as(u64, i) << 32)), pos);
+            if (decide(&p, &q, x, seed ^ (@as(u64, i) << 40), pos) == .keep) {
+                tok = x;
+                break;
+            }
+        }
+        const t = tok orelse switch (decide(&p, &q, 23, seed, pos)) {
+            .keep => unreachable,
+            .take => |r| r,
+        };
+        for (p.ids[0..p.n], 0..) |id, j| if (id == t) {
+            counts[j] += 1;
+        };
+    }
+    var chi: f64 = 0;
+    for (counts, p.probs[0..6]) |c, pr| {
+        const e = pr * @as(f64, @floatFromInt(n));
+        const d = @as(f64, @floatFromInt(c)) - e;
+        chi += d * d / e;
+    }
+    try std.testing.expect(chi > 100.0);
 }
