@@ -68,6 +68,7 @@ const kernels = [_]Kernel{
     .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // ours (decode D5): qmm_kernel's K-slice cluster forms for the MTP head in 4-bit
     .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce_mia.zig)
     .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // ours: attention._scores' bits from row tiles (the prompt indexer)
+    .{ .name = "fn_head_screen", .flags = &.{ "-O3", "--fmad=true" } }, // ours: the exact two-stage greedy lm_head (TF_FLASHNEXT_HEAD_SCREEN)
     // EXL3 (ExLlamaV3 packs): the vendored tile decoder and the linear/expert GEMMs (upstream/python-0.6 cuda/exl3)
     .{ .name = "fn_exl3", .flags = &.{"-O3"} },
 };
