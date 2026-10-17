@@ -254,6 +254,25 @@ pub const NgramTable = struct {
         }
     }
 
+    /// MADV_WILLNEED on rows `ids`' pages (codes and NVFP4 scales): the kernel reads them ahead, nothing changes
+    /// (TF_FLASHNEXT_NGRAM_PREFETCH: the next verify's rows while the head drafts).
+    pub fn willNeed(t: *const NgramTable, ids: []const i64) void {
+        const page = std.heap.pageSize();
+        for (ids) |id| {
+            if (id < 0 or id >= t.rows) continue;
+            const r = t.row(@intCast(id));
+            adviseNeed(r, page);
+            if (t.nvfp4 != null) adviseNeed(t.rowScales(@intCast(id)), page);
+        }
+    }
+
+    fn adviseNeed(b: []const u8, page: usize) void {
+        const lo = std.mem.alignBackward(usize, @intFromPtr(b.ptr), page);
+        const hi = std.mem.alignForward(usize, @intFromPtr(b.ptr) + b.len, page);
+        const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(lo);
+        std.posix.madvise(p, hi - lo, std.posix.MADV.WILLNEED) catch {};
+    }
+
     /// EXL3's rows `ids` as stored: `words` int16 a row (word 0 its fp16 scale), `out[ids.len * exl3.words]`.
     pub fn gatherExl3(t: *const NgramTable, ids: []const i64, out: []align(1) u16) !void {
         const e = t.exl3 orelse return error.NotExl3Table;
