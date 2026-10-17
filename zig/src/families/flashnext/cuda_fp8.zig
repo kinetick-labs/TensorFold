@@ -24,11 +24,16 @@ pub fn npadOf(n: usize) usize {
 }
 
 /// qmm.split_k(n, k, gs=64, target=192): K slices fixed by the weight's shape, never by the row count.
+/// TF_FP8_SPLIT=target,min_groups (default 192,8; Kernels.load reads it): the split's block target and the fewest
+/// 64-input groups a slice keeps. A shape's slices stay fixed for every row count either way.
+pub var split_target: usize = 192;
+pub var split_min: usize = 8;
+
 pub fn splitK(n: usize, k: usize) usize {
     const tiles = (n + 63) / 64;
     const groups = k / 64;
     var sk: usize = 1;
-    while (sk < 8 and tiles * sk < 192 and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
+    while (sk < 8 and tiles * sk < split_target and groups % (sk * 2) == 0 and groups / (sk * 2) >= split_min) sk *= 2;
     return sk;
 }
 
@@ -115,6 +120,11 @@ pub const Kernels = struct {
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        if (std.c.getenv("TF_FP8_SPLIT")) |v| {
+            var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+            split_target = std.fmt.parseInt(usize, it.next() orelse "192", 10) catch 192;
+            split_min = std.fmt.parseInt(usize, it.next() orelse "8", 10) catch 8;
+        }
         var k: Kernels = undefined;
         k.module = try cuda.Module.load(ctx.d, cuda.kernels.fn_qmmf);
         errdefer k.module.unload();
