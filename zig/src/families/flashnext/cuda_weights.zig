@@ -49,8 +49,6 @@ pub const Options = struct {
     ngram_on_gpu: ?bool = null,
     /// MXFP8 attention and DeltaNet projections on the lane matmul's MXFP8 mode (false: widened to bf16 rows)
     mxfp8: bool = false,
-    /// the hyper-connections' down and up also packed for the lane matmul's BF16 mode (decode rows; +1.26 GB)
-    hc_lane: bool = false,
     mode: Mode = .device,
     /// the CUDA driver (its context current) for `.device`
     driver: ?*const cuda.Driver = null,
@@ -99,9 +97,6 @@ pub const Hc = struct {
     inject: bool = false,
     down8: ?fp8.Linear = null,
     up8: ?fp8.Linear = null,
-    /// FP4-Local decode rows: down and up again in the lane matmul's BF16 order (cuda.qmmf), the same values
-    down_l: ?cuda.qmmf.Weight = null,
-    up_l: ?cuda.qmmf.Weight = null,
 
     /// The down projection's outputs: the low-rank rows, then the inject rows.
     pub fn downN(h: Hc) u32 {
@@ -574,8 +569,6 @@ const Loader = struct {
     around_one: bool = true,
     /// Options.mxfp8 on a checkpoint with MXFP8 linears
     mx8: bool = false,
-    /// Options.hc_lane: hyper-connections also in the lane's BF16 order (decode rows)
-    hc_lane: bool = false,
     /// the shard paths in the checkpoint's file order (Checkpoint.openModel opens shardFiles' list)
     paths: []const [:0]u8 = &.{},
     /// the rope (YaRN folds its attention factor into the rotated norms' gammas: yarn.py apply)
@@ -1027,31 +1020,6 @@ const Loader = struct {
         return .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k) };
     }
 
-    /// bf16 parts' rows stacked, in the lane matmul's BF16 order (cuda.qmmf.packBf16).
-    fn laneBf16(L: *Loader, path: []const u8, parts: []const Part) !cuda.qmmf.Weight {
-        const k = parts[0].t.dim(1);
-        var n: usize = 0;
-        for (parts) |p| {
-            if (p.t.dtype != .bf16 or p.t.dim(1) != k or p.rows.len != 0 or p.cols != null) return error.UnexpectedTensor;
-            n += p.t.dim(0);
-        }
-        if (k % 64 != 0) return error.UnexpectedTensor;
-        const grid = try L.gpa.alloc(u16, n * k);
-        defer L.gpa.free(grid);
-        var at: usize = 0;
-        for (parts) |p| {
-            const src = p.t.bytes[0 .. p.t.dim(0) * k * 2];
-            for (grid[at * k ..][0 .. p.t.dim(0) * k], 0..) |*g, i| g.* = std.mem.readInt(u16, src[2 * i ..][0..2], .little);
-            at += p.t.dim(0);
-        }
-        const npad = (n + 127) / 128 * 128;
-        const out = std.mem.bytesAsSlice(u16, try L.staging(npad * k * 2));
-        cuda.qmmf.packBf16(@alignCast(out), grid, n, k);
-        const ptr = try L.out.whole(path, "uint16", &.{npad * k}, L.host.items);
-        L.out.ours();
-        return .{ .mode = .bf16, .codes = ptr, .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
-    }
-
     fn b16(L: *Loader, path: []const u8, name: []const u8, n: usize, k: usize) !Rows {
         return L.face(path, &.{.{ .t = try L.linear(name, n, k) }});
     }
@@ -1099,10 +1067,6 @@ const Loader = struct {
         var pb: [192]u8 = undefined;
         h.down = try L.face(try std.fmt.bufPrint(&pb, "{s}.down.b.weight", .{path}), parts[0 .. @as(usize, 1) + @intFromBool(inject)]);
         h.up = try L.b16(try std.fmt.bufPrint(&pb, "{s}.up.b.weight", .{path}), try L.nameOf("{s}.input_mix_weight_up", .{name}), sd, c.low);
-        if (L.hc_lane) {
-            h.down_l = try L.laneBf16(try std.fmt.bufPrint(&pb, "{s}.down.l.weight", .{path}), parts[0 .. @as(usize, 1) + @intFromBool(inject)]);
-            h.up_l = try L.laneBf16(try std.fmt.bufPrint(&pb, "{s}.up.l.weight", .{path}), &.{.{ .t = try L.linear(try L.nameOf("{s}.input_mix_weight_up", .{name}), sd, c.low) }});
-        }
         h.scale = try L.cscale(try std.fmt.bufPrint(&pb, "{s}.scale", .{path}), try L.nameOf("{s}.hc_norm.weight", .{name}), sd);
         return h;
     }
@@ -2302,7 +2266,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     const paths = try core.checkpoint.shardFiles(gpa, io, dir);
     defer core.checkpoint.freeShardFiles(gpa, paths);
     if (paths.len != ck.files.items.len) return error.CheckpointChanged;
-    var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c), .mx8 = o.mxfp8 and c.hasMxfp8(), .hc_lane = o.hc_lane };
+    var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c), .mx8 = o.mxfp8 and c.hasMxfp8() };
     defer L.deinit();
     L.prefix = if (L.has("language_model.model.embed_tokens.weight")) "language_model." else "";
     try L.openExtra(dir);
