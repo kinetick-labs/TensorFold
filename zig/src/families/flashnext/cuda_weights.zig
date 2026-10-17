@@ -1965,6 +1965,14 @@ const Loader = struct {
 
     /// open_table: the shards (".shard_i" or ".shards.i") mapped from their files again, FP8 with its table scale
     /// (bf16_rne(e4m3 x scale) through a 256-entry LUT) or bf16 as stored.
+    fn adviseRandom(b: []const u8) void {
+        const page = std.heap.pageSize();
+        const lo = std.mem.alignBackward(usize, @intFromPtr(b.ptr), page);
+        const hi = std.mem.alignForward(usize, @intFromPtr(b.ptr) + b.len, page);
+        const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(lo);
+        std.posix.madvise(p, hi - lo, std.posix.MADV.RANDOM) catch {};
+    }
+
     fn openTable(L: *Loader, base: []const u8, g: ngram.NGram) !NgramTable {
         var t: NgramTable = .{ .gpa = L.gpa, .io = L.io };
         errdefer t.deinit();
@@ -2031,6 +2039,13 @@ const Loader = struct {
         }
         t.rows = t.starts.items[t.starts.items.len - 1];
         t.fp8 = kind.? == .f8_e4m3;
+        // TF_FLASHNEXT_NGRAM_RANDOM=1: MADV_RANDOM on the mapped rows (a lookup's fault reads its own pages, not a
+        // read-ahead window around them; the same bytes)
+        if (std.c.getenv("TF_FLASHNEXT_NGRAM_RANDOM")) |v| if (v[0] == '1') {
+            for (t.shards.items) |b| adviseRandom(b);
+            if (t.nvfp4) |n| for (n.scales.items) |b| adviseRandom(b);
+            std.log.info("n-gram table: MADV_RANDOM on {d} shards ({d} rows)", .{ t.shards.items.len, t.rows });
+        };
         var b: [256]u8 = undefined;
         const sname = try std.fmt.bufPrint(&b, "{s}ngram_embedding.weight_scale{s}", .{ base, if (t.nvfp4 != null) "_2" else "" });
         const sfull = try L.nameOf("{s}{s}", .{ L.prefix, sname });
