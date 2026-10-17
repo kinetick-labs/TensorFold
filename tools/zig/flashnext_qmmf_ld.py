@@ -29,6 +29,26 @@ TF_QMMF_LD(16, true, false)
 TF_QMMF_LD(32, true, false)
 TF_QMMF_LD(64, true, false)
 TF_QMMF_LD(64, false, true)
+
+// MXFP8 (FP4-Local's dense linears), the same tiles.
+#define TF_QMMF_LD_MX(BM, CLUSTER, FUSE) template __global__ void tf_fn_qmmf_ld::qmmf_kernel<2, BM, 64, 1, 4, 4, false, \\
+    CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, \\
+    int, int, int, int, int);
+TF_QMMF_LD_MX(16, false, false)
+TF_QMMF_LD_MX(32, false, false)
+TF_QMMF_LD_MX(64, false, false)
+TF_QMMF_LD_MX(16, true, false)
+TF_QMMF_LD_MX(32, true, false)
+TF_QMMF_LD_MX(64, true, false)
+TF_QMMF_LD_MX(64, false, true)
+
+// MXFP8 prompt rows on the wide tile (TF_FLASHNEXT_MX_WIDE): 128 rows x 64 columns, one warp a 128 x 16 strip, 2
+// stages; one K slice or the slices summed in order (FUSE). A value's instructions are the 64-row tile's.
+#define TF_QMMF_LD_WIDE(FUSE) template __global__ void tf_fn_qmmf_ld::qmmf_kernel<2, 128, 64, 1, 4, 2, false, false, \\
+    FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, int, int, \\
+    int, int, int);
+TF_QMMF_LD_WIDE(false)
+TF_QMMF_LD_WIDE(true)
 """
 
 
