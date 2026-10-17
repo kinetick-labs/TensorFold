@@ -197,8 +197,9 @@ pub const NgramTable = struct {
     /// overlap: +8.7% prose c1 on fresh prompts, same bytes)
     pub var gather_min: usize = 16;
 
-    /// TF_FLASHNEXT_GATHER_POOL=n (default 0): n persistent threads take the split gathers (no spawn a round)
-    pub var pool_threads: u32 = 0;
+    /// TF_FLASHNEXT_GATHER_POOL=n (default 32; 0 spawns): n persistent threads take the split gathers (no spawn a
+    /// round): cold prose c1 +5.5%, warm +2-3%, the same bytes
+    pub var pool_threads: u32 = 32;
 
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
