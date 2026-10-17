@@ -15,6 +15,7 @@ const tri = @import("cuda_triton.zig");
 const tops = @import("cuda_torch_ops.zig");
 const state = @import("cuda_state.zig");
 const sampler = @import("cuda_sampler.zig");
+const spec = @import("cuda_spec.zig");
 const fwd = @import("cuda_forward.zig");
 const nucleus = @import("cuda_nucleus.zig");
 
@@ -247,6 +248,30 @@ pub const Draws = struct {
         defer d.gpa.free(ids);
         for (ids, got[k + 1 ..]) |*t, c| t.* = d.id(@intFromFloat(c));
         return sampler.drawRow(d.gpa, got[0..k], ids, position, s, got[k]);
+    }
+
+    /// TF_FLASHNEXT_SPEC_SAMPLE, one rank, a top_k sampler: sampleDraftRow's sampled branch on the draft's own keys
+    /// (spec.draftSampling), with the distribution the token is drawn from in `q` (null: no such distribution, the
+    /// draw is sampleDraftRow's).
+    pub fn sampleDraftRowDist(d: *const Draws, f: *Forward, x: *const Bufs, logits_base: u64, row: usize, rows: usize, position: u64, s: lanes.Sampling, q: *spec.Dist) !?sampler.Draw {
+        _ = .{ x, rows };
+        if (d.world > 1 or !spec.fits(s)) return null;
+        const logits = logits_base + row * d.columns * 2;
+        const k = topK(d.columns, s);
+        if (k > d.max_k) return error.TopKPastScratch;
+        try f.th.draftTopk(logits, d.columns, k, d.s, d.out);
+        const got = try d.gpa.alloc(f32, 2 * k + 1);
+        defer d.gpa.free(got);
+        try d.read(f, d.out, std.mem.sliceAsBytes(got));
+        const ids = try d.gpa.alloc(u64, k);
+        defer d.gpa.free(ids);
+        for (ids, got[k + 1 ..]) |*t, c| t.* = d.id(@intFromFloat(c));
+        const ds = spec.draftSampling(s);
+        if (!try spec.dist(d.gpa, got[0..k], ids, ds, q)) return null;
+        const draw = try sampler.drawRow(d.gpa, got[0..k], ids, position, ds, got[k]);
+        q.position = position;
+        q.token = draw.token;
+        return draw;
     }
 
     /// decode.sample_mapped (a chain without the confidence rule): the keyed draw over the head's row.
