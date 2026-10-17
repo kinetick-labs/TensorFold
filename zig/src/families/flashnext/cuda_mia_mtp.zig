@@ -136,6 +136,8 @@ pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
     const m = &(f.w.mtp orelse return error.NoMtpHead);
     const n = segs[segs.len - 1].a1;
     const k = segs.len;
+    f.in_mtp = true;
+    defer f.in_mtp = false;
     const was = if (f.dump) |d| d.mtp else false;
     if (f.dump) |d| d.mtp = true;
     defer if (f.dump) |d| {

@@ -485,6 +485,7 @@ pub const Engine = struct {
         }
         if (envGet("TF_FLASHNEXT_MEDIA_GRAPHS")) |v| e.media_graphs = !std.mem.eql(u8, v, "0");
         e.f.count_experts = if (envGet("TF_FLASHNEXT_COUNT_EXPERTS")) |v| std.mem.eql(u8, v, "1") else false;
+        if (e.f.count_experts) e.graphs_on = false; // the count reads the picks back each layer: eager rounds
         if (!envOff(moep.env)) {
             e.px = try moep.Prompt4.init(ctx);
             if (e.px.?.gu2) try e.px.?.reserveGate(d, (e.prefill_rows + e.prefill_tail) * e.g.slots(), e.g.moe_width);
