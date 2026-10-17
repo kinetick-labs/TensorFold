@@ -90,7 +90,7 @@ pub const Prompt4 = struct {
     fn coopOf(p: *const Prompt4, name: [:0]const u8, warps: usize) !Coop {
         const f = try p.mod.function(name);
         const smem: usize = 4 * 32 * 80;
-        return .{ .f = f, .warps = warps, .smem = smem, .per_sm = @max(1, @as(usize, @intCast(try f.occupancy(32 * warps, smem)))) };
+        return .{ .f = f, .warps = warps, .smem = smem, .per_sm = @max(1, @as(usize, @intCast(try f.occupancy(@intCast(32 * warps), smem)))) };
     }
 
     fn runCoop(p: *const Prompt4, s: cuda.Stream, c: Coop, x: u64, x_stride: usize, slots: usize, w: u64, scale: u64, kg: usize, nb: usize, pl: kern.Plan, out: u64, n: usize, limit: f32, skip: c_int, max_items: usize) !void {
