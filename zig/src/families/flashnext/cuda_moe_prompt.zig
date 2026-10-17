@@ -34,7 +34,7 @@ pub const Prompt4 = struct {
     gate2: Fn = undefined,
     up2: Fn = undefined,
     gate_buf: ?cuda.DeviceBuffer = null,
-    /// TF_FLASHNEXT_EXPERTS_COOP=1: the cooperative kernels (CTA-shared inputs through shared memory; the same
+    /// TF_FLASHNEXT_EXPERTS_COOP (default on at tile 32; =0 turns off): the cooperative kernels (CTA-shared inputs through shared memory; the same
     /// bytes): gate/up T=2 4 warps, down fp32 / bf16 T=2 8 warps
     coop: ?[3]Coop = null,
     /// SMs a grid may cover (each function's grid caps at its own resident CTAs an SM times this;
@@ -76,9 +76,10 @@ pub const Prompt4 = struct {
             if (it.next()) |x| p.down_rows = std.fmt.parseInt(usize, x, 10) catch 2048;
         }
         if (p.tile < 16 or p.tile > 1024 or p.tile % 16 != 0) return error.BadPromptTile;
-        if (std.c.getenv("TF_FLASHNEXT_EXPERTS_COOP")) |v| if (v[0] == '1') {
+        const coop_on = if (std.c.getenv("TF_FLASHNEXT_EXPERTS_COOP")) |v| v[0] != '0' else true;
+        if (coop_on and p.tile == 32) {
             p.coop = .{ try p.coopOf("fn_coop_gu_t2_w4", 4), try p.coopOf("fn_coop_f32_t2_w8", 8), try p.coopOf("fn_coop_b16_t2_w8", 8) };
-        };
+        }
         return p;
     }
 
