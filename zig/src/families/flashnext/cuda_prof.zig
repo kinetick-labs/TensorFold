@@ -71,6 +71,8 @@ pub const Prof = struct {
     in_mtp: []bool,
     levels: []u8,
     n: usize = 0,
+    /// marks recorded as graph event nodes (TF_FLASHNEXT_GPROF captures)
+    external: bool = false,
     /// marks from here on count under the MTP head
     mtp: bool = false,
     /// and under this draft level (0: the absorb)
@@ -103,7 +105,7 @@ pub const Prof = struct {
     /// The interval since the previous mark is `part`'s (the first mark of a chunk opens it: `.start`).
     pub fn mark(p: *Prof, s: cuda.Stream, part: Part) !void {
         if (p.n == p.events.len) try p.drain();
-        try p.events[p.n].record(s);
+        if (p.external) try p.events[p.n].recordExternal(s) else try p.events[p.n].record(s);
         p.labels[p.n] = part;
         p.in_mtp[p.n] = p.mtp;
         p.levels[p.n] = p.level;
