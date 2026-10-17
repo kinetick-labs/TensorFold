@@ -116,6 +116,8 @@ pub const Kernels = struct {
     fused_mx: [2]cuda.Function,
     ld_tiled_mx: [2][3]cuda.Function,
     ld_fused_mx: cuda.Function,
+    /// TF_FLASHNEXT_MX_GEMV=1: MXFP8 rows up to 8 on tf_fn_mxgemv ([bf16, f32][2, 4, 8 rows]); null when off
+    gemv: ?[2][3]cuda.Function = null,
     major: c_int,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -142,6 +144,15 @@ pub const Kernels = struct {
             k.fused_mx[f] = try k.module.function(sym.fused_mx[f]);
             try k.fused_mx[f].allowDynamicShared(smem(64));
         }
+        k.gemv = null;
+        if (std.c.getenv("TF_FLASHNEXT_MX_GEMV")) |v| if (v[0] == '1') {
+            var g: [2][3]cuda.Function = undefined;
+            const names = [2][3][:0]const u8{ .{ "tf_fn_mxgemv_r2_b16", "tf_fn_mxgemv_r4_b16", "tf_fn_mxgemv_r8_b16" }, .{ "tf_fn_mxgemv_r2_f32", "tf_fn_mxgemv_r4_f32", "tf_fn_mxgemv_r8_f32" } };
+            for (0..2) |f| for (0..3) |b| {
+                g[f][b] = try k.module.function(names[f][b]);
+            };
+            k.gemv = g;
+        };
         k.ld_module = try cuda.Module.load(ctx.d, cuda.kernels.fn_qmmf_ld);
         errdefer k.ld_module.unload();
         for (0..2) |c| for (0..3) |b| {
@@ -193,6 +204,16 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     const n: usize = l.n;
     const kk: usize = l.k;
     if (kk % 64 != 0 or l.npad < n) return error.Invalid;
+    if (l.mx and m <= 8) if (k.gemv) |g| {
+        const b: usize = if (m <= 2) 0 else if (m <= 4) 1 else 2;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(l.w8);
+        a.add(l.bs);
+        a.add(out);
+        for ([_]usize{ m, n, kk, if (m == 1) kk else x_stride, ldo orelse n }) |v| a.add(@as(c_int, @intCast(v)));
+        return cuda.launch.launch(g[@intFromBool(f32_out)][b], .{ .grid = .{ .x = @intCast((n + 7) / 8), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = 0, .cluster = null }, s, &a);
+    };
     const sk = splitK(n, kk);
     const bm: usize = if (sk > 1 and m >= fused_rows) 0 else bucket(m);
     const fused = bm == 0;
