@@ -111,8 +111,6 @@ pub const Kernels = struct {
     fused_mx: [2]cuda.Function,
     ld_tiled_mx: [2][3]cuda.Function,
     ld_fused_mx: cuda.Function,
-    /// tf_fn_mx_widen: an MXFP8 Linear back to bf16 rows [n, k] (prompt chunks)
-    widen_mx: cuda.Function,
     major: c_int,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -132,7 +130,6 @@ pub const Kernels = struct {
                 try k.tiled_mx[f][c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
             };
             k.fused_mx[f] = try k.module.function(sym.fused_mx[f]);
-            k.widen_mx = try k.module.function("tf_fn_mx_widen");
             try k.fused_mx[f].allowDynamicShared(smem(64));
         }
         k.ld_module = try cuda.Module.load(ctx.d, cuda.kernels.fn_qmmf_ld);
@@ -158,18 +155,6 @@ pub const Kernels = struct {
         k.module.unload();
     }
 };
-
-/// An MXFP8 Linear's values as bf16 rows [n, k] at `out` (exact; the same numbers its MXFP8 matmul reads).
-pub fn widen(k: *const Kernels, s: cuda.Stream, l: Linear, out: u64) !void {
-    if (!l.mx) return error.Invalid;
-    const total: usize = @as(usize, l.npad) * l.k;
-    var a: cuda.Args = .{};
-    a.add(l.w8);
-    a.add(l.bs);
-    a.add(out);
-    for ([_]usize{ l.n, l.k, l.npad }) |v| a.add(@as(c_int, @intCast(v)));
-    try cuda.launch.launch(k.widen_mx, .{ .grid = .{ .x = @intCast((total + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
-}
 
 fn bucketIndex(bm: usize) usize {
     return switch (bm) {
