@@ -193,9 +193,12 @@ pub const NgramTable = struct {
 
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
     /// NVFP4 prompt chunks: the rows split over threads (a mapped table's page reads overlap; the same bits).
+    /// TF_FLASHNEXT_GATHER_MIN (default 2048): the fewest ids split over threads (decode rounds' page reads overlap)
+    pub var gather_min: usize = 2048;
+
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
-        if (t.nvfp4 != null and ids.len >= 2048) {
+        if (t.nvfp4 != null and ids.len >= gather_min) {
             const n_threads = 16;
             var threads: [n_threads]std.Thread = undefined;
             var errs: [n_threads]?anyerror = @splat(null);
