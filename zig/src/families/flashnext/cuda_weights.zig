@@ -197,8 +197,14 @@ pub const NgramTable = struct {
     /// overlap: +8.7% prose c1 on fresh prompts, same bytes)
     pub var gather_min: usize = 16;
 
+    /// TF_FLASHNEXT_GATHER_POOL=n (default 0): n persistent threads take the split gathers (no spawn a round)
+    pub var pool_threads: u32 = 0;
+
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
+        if (t.nvfp4 != null and ids.len >= gather_min and pool_threads > 0) {
+            if (gather_pool.run(t, ids, out)) |done| return done else |_| {}
+        }
         if (t.nvfp4 != null and ids.len >= gather_min) {
             const n_threads = 16;
             var threads: [n_threads]std.Thread = undefined;
@@ -228,7 +234,7 @@ pub const NgramTable = struct {
         return t.gatherSerial(ids, out);
     }
 
-    fn gatherSerial(t: *const NgramTable, ids: []const i64, out: []u16) !void {
+    pub fn gatherSerial(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         for (ids, 0..) |id, i| {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
             const src = t.row(@intCast(id));
@@ -2526,3 +2532,64 @@ test "a plain weight: bf16 source passes through, fp16 source rounds through fp3
     copyBf16(bt, 0, 4, out);
     try std.testing.expectEqualSlices(u8, &bsrc, out);
 }
+
+/// NgramTable.gather's persistent threads (TF_FLASHNEXT_GATHER_POOL): rows dealt `chunk` ids at a time, each the
+/// same gatherSerial (the same bits). One gather at a time: a concurrent one returns error.PoolBusy (spawns instead).
+const GatherPool = struct {
+    const chunk = 2;
+    gen: std.atomic.Value(u32) = .init(0),
+    busy: std.atomic.Value(bool) = .init(false),
+    next: std.atomic.Value(u32) = .init(0),
+    left: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    started: bool = false,
+    t: *const NgramTable = undefined,
+    ids: []const i64 = &.{},
+    out: []u16 = &.{},
+    chunks: u32 = 0,
+
+    fn work(p: *GatherPool) void {
+        while (true) {
+            const c = p.next.fetchAdd(1, .acq_rel);
+            if (c >= p.chunks) return;
+            const lo = @min(@as(usize, c) * chunk, p.ids.len);
+            const hi = @min(lo + chunk, p.ids.len);
+            p.t.gatherSerial(p.ids[lo..hi], p.out[lo * p.t.width .. hi * p.t.width]) catch p.failed.store(true, .release);
+            _ = p.left.fetchSub(1, .acq_rel);
+        }
+    }
+
+    fn worker(p: *GatherPool) void {
+        var seen = p.gen.load(.acquire);
+        while (true) {
+            while (p.gen.load(.acquire) == seen) _ = std.os.linux.futex_4arg(&p.gen.raw, .{ .cmd = .WAIT, .private = true }, seen, null);
+            seen = p.gen.load(.acquire);
+            p.work();
+        }
+    }
+
+    fn run(p: *GatherPool, t: *const NgramTable, ids: []const i64, out: []u16) !void {
+        if (p.busy.swap(true, .acq_rel)) return error.PoolBusy;
+        defer p.busy.store(false, .release);
+        if (!p.started) {
+            for (0..NgramTable.pool_threads) |_| {
+                const th = std.Thread.spawn(.{}, worker, .{p}) catch return error.PoolBusy;
+                th.detach();
+            }
+            p.started = true;
+        }
+        p.t = t;
+        p.ids = ids;
+        p.out = out;
+        p.chunks = @intCast((ids.len + chunk - 1) / chunk);
+        p.failed.store(false, .release);
+        p.left.store(p.chunks, .release);
+        p.next.store(0, .release);
+        _ = p.gen.fetchAdd(1, .acq_rel);
+        _ = std.os.linux.futex_3arg(&p.gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        p.work();
+        while (p.left.load(.acquire) != 0) std.atomic.spinLoopHint();
+        if (p.failed.load(.acquire)) return error.NgramIdOutOfRange;
+    }
+};
+var gather_pool: GatherPool = .{};
