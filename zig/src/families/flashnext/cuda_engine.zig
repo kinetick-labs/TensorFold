@@ -401,6 +401,7 @@ pub const Engine = struct {
     /// TF_FLASHNEXT_GPROF=rows: verify graphs of `rows` rows captured with their profile marks (event nodes); each
     /// replay synchronized and its parts summed, reported every 200 (graph-mode part times; the same bits)
     gprof: ?*profs.Prof = null,
+    ngram_prefetch: bool = false,
     gprof_rows: u32 = 0,
     gprof_n: usize = 0,
     gprof_rounds: u64 = 0,
@@ -493,6 +494,7 @@ pub const Engine = struct {
         }
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 2048;
         if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 0;
+        e.ngram_prefetch = std.mem.eql(u8, envGet("TF_FLASHNEXT_NGRAM_PREFETCH") orelse "0", "1");
         if (envGet("TF_FLASHNEXT_GATHER_POOL")) |v| weights.NgramTable.pool_threads = std.fmt.parseInt(u32, v, 10) catch 32;
         if (envGet("TF_FLASHNEXT_GATHER_MIN")) |v| weights.NgramTable.gather_min = std.fmt.parseInt(usize, v, 10) catch 16;
         if (mx8Of(&e.c)) {
@@ -1815,6 +1817,14 @@ pub const Engine = struct {
             };
             inputs[i] = .{ .seq = r.seq, .next = r.next, .streams = streams };
         }
+        // TF_FLASHNEXT_NGRAM_PREFETCH: each stream's next verify window (its pending token, then its drafts as drawn)
+        var pwin: [64][64]i64 = undefined;
+        var pn: [64]usize = @splat(0);
+        if (e.ngram_prefetch) for (reqs, 0..) |r, i| if (r.next.len > 0) {
+            pwin[i][0] = r.next[r.next.len - 1];
+            pn[i] = 1;
+            e.f.prefetchNgram(r.seq, pwin[i][0..1], 0);
+        };
         _ = try mtp.stageMany(&e.f, inputs[0..reqs.len], mb, &segs);
         try e.runMulti(true, segs[0..reqs.len], mb);
         const logits = mb.b.logits;
@@ -1858,6 +1868,11 @@ pub const Engine = struct {
                 if (!t.propose) continue;
                 r.out[r.drafted] = @intCast(got.token);
                 r.drafted += 1;
+                if (e.ngram_prefetch and pn[a.req] > 0 and pn[a.req] < 64) {
+                    pwin[a.req][pn[a.req]] = @intCast(got.token);
+                    pn[a.req] += 1;
+                    e.f.prefetchNgram(r.seq, pwin[a.req][0..pn[a.req]], pn[a.req] - 1);
+                }
                 if (t.more and j + 1 < @min(r.count, r.out.len)) {
                     next[n_next] = .{ .req = a.req, .row = a.row, .tok = @intCast(got.token) };
                     n_next += 1;
