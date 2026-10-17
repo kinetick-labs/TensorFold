@@ -133,7 +133,7 @@ pub const Kernels = struct {
     fused_mx: [2]cuda.Function,
     ld_tiled_mx: [2][3]cuda.Function,
     ld_fused_mx: cuda.Function,
-    /// TF_FLASHNEXT_MX_WIDE=1: MXFP8 prompt rows (m >= fused_rows) on the 128-row tile, [bf16, f32][one slice, fused]
+    /// TF_FLASHNEXT_MX_WIDE (on unless =0): MXFP8 prompt rows (m >= fused_rows) on the 128-row tile, [bf16, f32][one slice, fused]
     /// and ld [one slice, fused] (the same bytes); null when off
     wide: ?[2][2]cuda.Function = null,
     ld_wide: ?[2]cuda.Function = null,
@@ -190,7 +190,8 @@ pub const Kernels = struct {
         try k.ld_fused_mx.allowDynamicShared(smem(64));
         k.wide = null;
         k.ld_wide = null;
-        if (std.c.getenv("TF_FLASHNEXT_MX_WIDE")) |v| if (v[0] == '1') {
+        const wide_on = if (std.c.getenv("TF_FLASHNEXT_MX_WIDE")) |v| v[0] != '0' else true;
+        if (wide_on) {
             var w: [2][2]cuda.Function = undefined;
             var lw: [2]cuda.Function = undefined;
             for (0..2) |f| for (0..2) |u| {
@@ -203,7 +204,7 @@ pub const Kernels = struct {
             }
             k.wide = w;
             k.ld_wide = lw;
-        };
+        }
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
     }
