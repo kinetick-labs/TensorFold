@@ -992,7 +992,7 @@ pub const Forward = struct {
     pub fn mmAt(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, r: W.Rows, out: u64, fp32: bool, m: usize) !void {
         if (prompt.b16Takes(f.prompt_mm, m, r.n, r.k)) {
             try prompt.b16(f.t, x, x_stride, r.weight, out, fp32, m, r.n, r.k);
-        } else if (f.prof != null and part != null and tri.b16SplitK(r.n, r.k) > 1 and f.t.rec == null) {
+        } else if (f.prof != null and !f.prof.?.external and part != null and tri.b16SplitK(r.n, r.k) > 1 and f.t.rec == null) {
             try prompt.b16Slices(f.t, x, x_stride, r.weight, f.sc.part, fp32, m, r.n, r.k);
             try f.mark(part.?);
             try prompt.reduce(f.t, f.sc.part, out, fp32, m * r.n, tri.b16SplitK(r.n, r.k));
@@ -1986,7 +1986,7 @@ pub const Forward = struct {
         const irow = d.index_heads * d.index_dim * 2;
         const split = may_split and f.comm != null and f.qsa_split_keys > 0 and ends >= f.qsa_split_keys and m >= 32;
         if (!split) {
-            if (f.prof == null and f.qsa_rt == 0 and f.qsa_fast == null and ag.blocks(ends) < f.qsa_tiles_from) return f.t.qsaRows(iq, pooled, pos0, sc, m, ag, ends, d);
+            if ((f.prof == null or f.prof.?.external) and f.qsa_rt == 0 and f.qsa_fast == null and ag.blocks(ends) < f.qsa_tiles_from) return f.t.qsaRows(iq, pooled, pos0, sc, m, ag, ends, d);
             try f.qsaScoresSelect(iq, pooled, pos0, sc, m, ag, ends);
             return;
         }
