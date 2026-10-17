@@ -568,7 +568,10 @@ pub const Engine = struct {
         errdefer if (e.prof) |p| p.deinit(gpa);
         if (envGet("TF_FLASHNEXT_GPROF")) |v| {
             e.gprof_rows = std.fmt.parseInt(u32, v, 10) catch 0;
-            if (e.gprof_rows > 0) e.gprof = try profs.Prof.init(gpa, d, 4096);
+            if (e.gprof_rows > 0) {
+                e.gprof = try profs.Prof.init(gpa, d, 4096);
+                e.gprof.?.external = true;
+            }
         }
         errdefer if (e.gprof) |p| p.deinit(gpa);
         if (o.rank == 0) std.debug.print("prompt path: {d}-row chunks (the last up to {d} more), glue {s}{s}, matmul K slices {s}, experts {s}{s}\n", .{ e.prefill_rows, e.prefill_tail, if (e.f.glue_split) "split by rows" else "on every row", if (e.f.cs != null) " (exchanges overlapped)" else "", if (e.f.prompt_mm) "in one program (_b16mm_ks/_fp4mm_ks)" else "split with _reduce", if (e.px != null) "on 128-pair items (fn_experts_prompt)" else "on 16-pair items", if (e.prof != null) ", profiled" else "" });
