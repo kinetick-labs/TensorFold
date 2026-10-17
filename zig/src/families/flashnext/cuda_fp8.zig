@@ -204,7 +204,8 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     const n: usize = l.n;
     const kk: usize = l.k;
     if (kk % 64 != 0 or l.npad < n) return error.Invalid;
-    if (l.mx and m <= 8) if (k.gemv) |g| {
+    // microbench (fp4-logs/mb): the GEMV wins at 1-2 rows (and 4 on 8-slice shapes); qmmf from 4 rows on
+    if (l.mx and (m <= 2 or (m <= 4 and splitK(n, kk) == 8))) if (k.gemv) |g| {
         const b: usize = if (m <= 2) 0 else if (m <= 4) 1 else 2;
         var a: cuda.Args = .{};
         a.add(x);
