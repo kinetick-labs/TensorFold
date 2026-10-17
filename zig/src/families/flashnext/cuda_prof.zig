@@ -140,6 +140,17 @@ pub const Prof = struct {
         p.n = 1;
     }
 
+    /// A graph replay's baked marks (events [0, n), recorded in its capture): their intervals into `sums`, the
+    /// events kept in place (a replay records the same events again). Waits for the last.
+    pub fn replayed(p: *Prof, n: usize) !void {
+        if (n < 2) return;
+        try p.events[n - 1].synchronize();
+        for (1..n) |i| {
+            const ms = try cuda.Event.elapsedMs(p.events[i - 1], p.events[i]);
+            p.sums[@intFromBool(p.in_mtp[i])][@backingInt(p.labels[i])] += ms;
+        }
+    }
+
     /// Decode rounds since the last report: ms a round by part (main model, then the MTP head and its levels), the
     /// whole of it against the rounds' wall time; then cleared.
     pub fn rounds(p: *Prof, rank: u32, label: []const u8, n_rounds: usize, wall_ms: f64) !void {
