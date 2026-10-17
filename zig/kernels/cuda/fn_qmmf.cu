@@ -329,3 +329,94 @@ TF_QMMF_MX(32, true, true, false)
 TF_QMMF_MX(64, true, true, false)
 TF_QMMF_MX(64, false, false, true)
 TF_QMMF_MX(64, true, false, true)
+
+// MXFP8 decode GEMV (TF_FLASHNEXT_MX_GEMV): up to MR rows of x against the fragment-ordered e4m3 codes. A block is
+// one 8-row chunk of outputs; its WARPS warps split the 64-input groups and add in warp order (deterministic,
+// no atomics). Each lane loads its 16 code bytes with one 128-bit load, the 4 lanes of an output row add by shuffle.
+namespace tf_fn_mxgemv {
+template <int MR, int WARPS, bool F32>
+__device__ __forceinline__ void mx_gemv(const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w8,
+    const uint8_t* __restrict__ bs, void* __restrict__ out, int m, int n, int k, int ldx, int ldo) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int chunk = blockIdx.x;            // 8 output rows
+    const int tile = chunk >> 3, c = chunk & 7;
+    const int kg = k >> 6;
+    const int r_in = c * 8 + (lane >> 2);   // row within the 64-row tile
+    const int q = lane & 3;
+    float acc[MR];
+#pragma unroll
+    for (int i = 0; i < MR; ++i) acc[i] = 0.f;
+    for (int g = warp; g < kg; g += WARPS) {
+        const size_t blk = (size_t)tile * kg + g;
+        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(w8 + blk * 4096 + c * 512) + lane);
+        const uint16_t sv = __ldg(reinterpret_cast<const uint16_t*>(bs + (blk * 64 + r_in) * 2));
+        const float s0 = __uint_as_float((uint32_t)(sv & 0xFF) << 23), s1 = __uint_as_float((uint32_t)(sv >> 8) << 23);
+        float wf[16];
+        const uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                __nv_fp8x2_storage_t b2 = (__nv_fp8x2_storage_t)((wu[j] >> (16 * p)) & 0xFFFF);
+                __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(b2, __NV_E4M3);
+                float2 f = __half22float2(*reinterpret_cast<__half2*>(&hr));
+                wf[j * 4 + p * 2] = f.x;
+                wf[j * 4 + p * 2 + 1] = f.y;
+            }
+        }
+        // byte b of this lane (h = b / 8, bb = b % 8): input 64 g + 32 h + 16 (bb / 4) + 2 q + (bb % 2) + 8 ((bb % 4) / 2)
+        const int base = g * 64 + 2 * q;
+#pragma unroll
+        for (int i = 0; i < MR; ++i) {
+            if (i < m) {
+                const __nv_bfloat16* xr = x + (size_t)i * ldx + base;
+                float sh[2];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {   // bb pairs: (0,1) (2,3) (4,5) (6,7)
+                        const int off = 32 * h + 16 * (t / 2) + 8 * (t % 2);
+                        const float2 xv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr + off));
+                        s = fmaf(xv.x, wf[h * 8 + t * 2], s);
+                        s = fmaf(xv.y, wf[h * 8 + t * 2 + 1], s);
+                    }
+                    sh[h] = s;
+                }
+                acc[i] = fmaf(sh[0], s0, fmaf(sh[1], s1, acc[i]));
+            }
+        }
+    }
+    __shared__ float red[WARPS][MR][32];
+#pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        float v = acc[i];
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        v += __shfl_xor_sync(0xffffffffu, v, 2);
+        red[warp][i][lane] = v;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int row = tile * 64 + r_in;
+#pragma unroll
+        for (int i = 0; i < MR; ++i) {
+            float v = 0.f;
+#pragma unroll
+            for (int ww = 0; ww < WARPS; ++ww) v += red[ww][i][lane];
+            if (q == 0 && i < m && row < n) {
+                if constexpr (F32) reinterpret_cast<float*>(out)[(size_t)i * ldo + row] = v;
+                else reinterpret_cast<__nv_bfloat16*>(out)[(size_t)i * ldo + row] = __float2bfloat16_rn(v);
+            }
+        }
+    }
+}
+}   // namespace tf_fn_mxgemv
+#define TF_MXGEMV(MR, F32, NAME) extern "C" __global__ void __launch_bounds__(128) NAME(const __nv_bfloat16* x, \
+    const unsigned char* w8, const uint8_t* bs, void* out, int m, int n, int k, int ldx, int ldo) { \
+    tf_fn_mxgemv::mx_gemv<MR, 4, F32>(x, w8, bs, out, m, n, k, ldx, ldo); }
+TF_MXGEMV(2, false, tf_fn_mxgemv_r2_b16)
+TF_MXGEMV(4, false, tf_fn_mxgemv_r4_b16)
+TF_MXGEMV(8, false, tf_fn_mxgemv_r8_b16)
+TF_MXGEMV(2, true, tf_fn_mxgemv_r2_f32)
+TF_MXGEMV(4, true, tf_fn_mxgemv_r4_f32)
+TF_MXGEMV(8, true, tf_fn_mxgemv_r8_f32)
