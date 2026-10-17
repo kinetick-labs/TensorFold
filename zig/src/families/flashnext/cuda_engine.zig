@@ -24,6 +24,7 @@ const sampler = @import("cuda_sampler.zig");
 const decode = @import("cuda_decode.zig");
 const fwd = @import("cuda_forward.zig");
 const fp8 = @import("cuda_fp8.zig");
+const hs = @import("cuda_head_screen.zig");
 const int4 = @import("cuda_int4.zig");
 const exl3 = @import("cuda_exl3.zig");
 const mtp = @import("cuda_mia_mtp.zig");
@@ -105,7 +106,7 @@ pub const Seq = fwd.Seq;
 /// and the attention context bucket (Python Graphs.main / Graphs.mtp keys).
 /// `media`: the sequence's image/video attachment (SeqMedia.epoch; 0: text): an image sequence's launches bake in its
 /// rotary table and prompt length, so its graphs are its own.
-const GraphKey = struct { seq: usize, version: u32, mtp: bool, rows: u32, parity: u32, ctx: usize, media: u64 = 0 };
+const GraphKey = struct { seq: usize, version: u32, mtp: bool, rows: u32, parity: u32, ctx: usize, media: u64 = 0, screen: bool = false };
 
 /// A shared round's (or shared MTP step's) graph and the sequences whose buffers it bakes in.
 const MultiGraph = struct { exec: cuda.graph.Exec, seqs: []usize };
@@ -360,6 +361,12 @@ pub const Engine = struct {
     solo_fault: CaptureFault = .{},
     multi_fault: CaptureFault = .{},
     instantiated: u64 = 0,
+    /// TF_FLASHNEXT_HEAD_SCREEN (cuda_head_screen.zig): the exact two-stage greedy head, and whether the last verify
+    /// round took it (a draw that is not greedy then recomputes the full head first)
+    screen: ?hs.HeadScreen = null,
+    round_screened: bool = false,
+    screened_rounds: u64 = 0,
+    full_redone: u64 = 0,
     /// TF_FLASHNEXT_SEQ_POOL (reuseSeq): parked sequences, their most, and reuses so far
     seq_pool: std.ArrayList(*Seq) = .empty,
     seq_pool_max: usize = 0,
@@ -564,6 +571,14 @@ pub const Engine = struct {
             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
         };
         errdefer if (e.mtpq) |*t| t.deinit();
+        if (envGet("TF_FLASHNEXT_HEAD_SCREEN")) |v| if (std.mem.eql(u8, v, "1")) {
+            if (o.world == 1 and e.w.head4 == null and e.w.head3 == null and e.k8 != null) {
+                e.screen = try hs.HeadScreen.build(gpa, d, e.w.head);
+                e.f.screen = &e.screen.?;
+                std.log.info("head screen: MXFP8 copy of the {d} x {d} head for greedy verify rounds (exact draws)", .{ e.w.head.n, e.w.head.k });
+            } else std.log.warn("head screen: needs one GPU, a bf16 head and the FP8 kernels; off", .{});
+        };
+        errdefer if (e.screen) |*x| x.deinit();
         // EXL3: a 4-bit draft head from the trellis lm_head (drafts only); TF_FLASHNEXT_X3_DRAFT_HEAD=0: the whole head
         if (e.w.mtp != null and e.w.head3 != null and e.w.draft_head == null and !envOff("TF_FLASHNEXT_X3_DRAFT_HEAD")) {
             try @import("cuda_draft3.zig").build(gpa, d, &e.f, &e.w, e.stream, e.c.vocab, o.rank, o.world);
@@ -671,6 +686,10 @@ pub const Engine = struct {
         if (e.k4) |*q| q.deinit();
         if (e.k3) |*q| q.deinit();
         if (e.mtpq) |*t| t.deinit();
+        if (e.screen) |*x| {
+            std.log.info("head screen: {d} verify rounds screened, {d} redone in full for a sampled draw", .{ e.screened_rounds, e.full_redone });
+            x.deinit();
+        }
         if (e.qsa_fast) |*q| q.deinit();
         if (e.f.cs) |*cs| {
             cs.synchronize() catch {};
@@ -1431,6 +1450,15 @@ pub const Engine = struct {
     /// as `forward` does (graphs).
     pub fn verifyMany(e: *Engine, windows: []const Window) !void {
         if (windows.len == 0) return error.EmptyRound;
+        e.round_screened = e.screen != null and envGet("TF_FLASHNEXT_LOGIT_DUMP") == null and for (windows) |w| {
+            if (!w.seq.greedy) break false;
+        } else true;
+        if (e.round_screened) {
+            e.screened_rounds += 1;
+            if (e.screened_rounds % 1000 == 0) std.log.info("head screen: {d} verify rounds screened, {d} redone in full", .{ e.screened_rounds, e.full_redone });
+        }
+        e.f.screen_on = e.round_screened;
+        defer e.f.screen_on = false;
         try e.f.mark(.gap_verify);
         e.cand_round +%= 1;
         if (windows.len > e.round_segs.len) return error.TooManyStreams;
@@ -1455,6 +1483,13 @@ pub const Engine = struct {
         const sg = e.round_segs[i];
         const smp: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
         const total = e.round_segs[e.round_n - 1].a1;
+        sg.seq.greedy = smp == null;
+        if (e.round_screened and smp != null) {
+            // a screened round's logits are exact only where a greedy draw can land: the full head first
+            try e.f.headMm(e.buf.b.mixed, e.g.hidden, e.buf.b.logits, total);
+            e.round_screened = false;
+            e.full_redone += 1;
+        }
         if (e.world > 1 and e.draw_once and sampler.gatheredFits(smp)) {
             // the round's candidates read once (one wait), every window's draws from the host copy
             if (e.cand_have != e.cand_round) {
@@ -1993,7 +2028,7 @@ pub const Engine = struct {
     /// then the capture of the same launches (Graphs.forward / mtp_forward).
     fn graphed(e: *Engine, comptime head: bool, rows: usize, ctx: usize, par: u32) !void {
         const seq = e.bound;
-        const key: GraphKey = .{ .seq = @intFromPtr(seq), .version = seq.st.version, .mtp = head, .rows = @intCast(rows), .parity = par, .ctx = ctx, .media = mediaKey(seq) };
+        const key: GraphKey = .{ .seq = @intFromPtr(seq), .version = seq.st.version, .mtp = head, .rows = @intCast(rows), .parity = par, .ctx = ctx, .media = mediaKey(seq), .screen = !head and e.f.screen_on };
         e.f.context = ctx;
         defer e.f.context = null;
         if (e.graphs.get(key)) |g| return g.launchOn(e.stream);
@@ -2117,7 +2152,7 @@ pub const Engine = struct {
     /// A shared step's composition: every segment's sequence, buffer version, rows, DeltaNet parity and context
     /// bucket (written to `ctxs`), and which buffers; null when a sequence's DeltaNet layers are out of step.
     fn multiKey(e: *Engine, comptime head: bool, segs: []const fwd.Seg, ctxs: []usize) ?u64 {
-        var h = std.hash.Wyhash.init(if (head) 0x6d7470 else 0x6d61696e);
+        var h = std.hash.Wyhash.init(if (head) 0x6d7470 else if (e.f.screen_on) 0x73637265656e else 0x6d61696e);
         for (segs, ctxs) |sg, *c| {
             const st = &sg.seq.st;
             var par: u32 = 0;
