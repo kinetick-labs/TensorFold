@@ -154,7 +154,7 @@ pub const NgramTable = struct {
     exl3: ?struct { words: u32, bits: u32 } = null,
     /// NVFP4 (FP4-Local): each shard's e4m3 scales [rows, width / 16] beside its e2m1 codes [rows, width / 2], and the
     /// table's fp32 weight_scale_2; a value is bf16_rne(e2m1 x e4m3 x global)
-    nvfp4: ?struct { scales: std.ArrayList([]const u8) = .empty, global: f32 = 1 } = null,
+    nvfp4: ?struct { scales: std.ArrayList([]const u8) = .empty, global: f32 = 1, lut: [256 * 16]u16 = @splat(0) } = null,
     /// EXL3: the decode's head bias fp16 [heads, DH], mapped from the table's own file
     head_bias: []const u8 = &.{},
     /// on the GPU: rows [base, base + count) as stored, the LUT ([256] bf16 bits), heads [head0, head0 + heads)
@@ -192,14 +192,49 @@ pub const NgramTable = struct {
     }
 
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
+    /// NVFP4 prompt chunks: the rows split over threads (a mapped table's page reads overlap; the same bits).
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
+        if (t.nvfp4 != null and ids.len >= 2048) {
+            const n_threads = 16;
+            var threads: [n_threads]std.Thread = undefined;
+            var errs: [n_threads]?anyerror = @splat(null);
+            const per = (ids.len + n_threads - 1) / n_threads;
+            const Run = struct {
+                fn go(tt: *const NgramTable, a: []const i64, o: []u16, e: *?anyerror) void {
+                    tt.gatherSerial(a, o) catch |x| {
+                        e.* = x;
+                    };
+                }
+            };
+            var spawned: usize = 0;
+            for (0..n_threads) |i| {
+                const lo = @min(i * per, ids.len);
+                const hi = @min(lo + per, ids.len);
+                threads[i] = std.Thread.spawn(.{}, Run.go, .{ t, ids[lo..hi], out[lo * t.width .. hi * t.width], &errs[i] }) catch {
+                    for (threads[0..spawned]) |th| th.join();
+                    return t.gatherSerial(ids, out);
+                };
+                spawned += 1;
+            }
+            for (threads[0..spawned]) |th| th.join();
+            for (errs) |e| if (e) |x| return x;
+            return;
+        }
+        return t.gatherSerial(ids, out);
+    }
+
+    fn gatherSerial(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         for (ids, 0..) |id, i| {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
             const src = t.row(@intCast(id));
             const dst = out[i * t.width ..][0..t.width];
             if (t.nvfp4) |n| {
-                decodeNvfp4Row(src, t.rowScales(@intCast(id)), n.global, dst);
+                const sc = t.rowScales(@intCast(id));
+                for (dst, 0..) |*d, j| {
+                    const nib: u8 = if (j % 2 == 0) src[j / 2] & 15 else src[j / 2] >> 4;
+                    d.* = n.lut[@as(usize, sc[j / 16]) * 16 + nib];
+                }
             } else if (t.fp8) {
                 for (dst, src) |*d, c| d.* = t.lut[c];
             } else {
@@ -226,6 +261,35 @@ pub fn decodeNvfp4Row(codes: []const u8, scales: []const u8, global: f32, dst: [
     for (dst, 0..) |*d, j| {
         const nib: u8 = if (j % 2 == 0) codes[j / 2] & 15 else codes[j / 2] >> 4;
         d.* = lay.bf16Rne(@as(f32, @floatCast(core.quant.nvfp4.e2m1(nib))) * lay.e4m3ToF32(scales[j / 16]) * global);
+    }
+}
+
+/// decodeNvfp4Row's value for every (e4m3 scale byte, nibble): lut[scale * 16 + nibble].
+pub fn nvfp4Lut(global: f32) [256 * 16]u16 {
+    var lut: [256 * 16]u16 = undefined;
+    for (0..256) |s| for (0..16) |nib| {
+        const codes = [1]u8{@intCast(nib)};
+        const scales = [1]u8{@intCast(s)};
+        var one: [1]u16 = undefined;
+        decodeNvfp4Row(&codes, &scales, global, &one);
+        lut[s * 16 + nib] = one[0];
+    };
+    return lut;
+}
+
+test "the NVFP4 LUT is decodeNvfp4Row's values" {
+    const lut = nvfp4Lut(0.37);
+    var codes: [8]u8 = undefined;
+    var scales: [1]u8 = undefined;
+    for (0..256) |s| {
+        scales[0] = @intCast(s);
+        for (&codes, 0..) |*c, i| c.* = @intCast((i * 37 + s) & 255);
+        var out: [16]u16 = undefined;
+        decodeNvfp4Row(&codes, &scales, 0.37, &out);
+        for (out, 0..) |v, j| {
+            const nib: u8 = if (j % 2 == 0) codes[j / 2] & 15 else codes[j / 2] >> 4;
+            try std.testing.expectEqual(v, lut[s * 16 + nib]);
+        }
     }
 }
 
@@ -1979,6 +2043,7 @@ const Loader = struct {
         }
         if (t.nvfp4) |*n| {
             n.global = t.scale;
+            n.lut = nvfp4Lut(n.global);
         } else if (t.fp8) t.lut = lay.ngramLut(t.scale) else if (t.scale != 1) return error.UnsupportedQuantization;
         if (t.width != g.dims) {
             std.log.err("the n-gram rows hold {d} values, expected {d}", .{ t.width, g.dims });
