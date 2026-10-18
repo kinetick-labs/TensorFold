@@ -25,7 +25,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
             job.key[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(f, std.mem.asBytes(&job.key[0])) & 0x7fff_ffff));
         }
     };
-    if (h.cache) |store| if (!r.promptOnly() and r.prompt_logprobs == null and !r.untaught) if (@import("lane_cache_queue.zig").lookup(h, job)) |l| {
+    if (r.media == null and !(h.info_.media and r.images.len > 0)) if (h.cache) |store| if (!r.promptOnly() and r.prompt_logprobs == null and !r.untaught) if (@import("lane_cache_queue.zig").lookup(h, job)) |l| { // our engine's media rows: neither resumed nor kept
         job.entry = l.entry;
         job.kept0 = store.counts.kept;
         job.marks = l.marks;
