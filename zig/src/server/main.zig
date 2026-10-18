@@ -14,6 +14,7 @@ const api = @import("engine_api");
 const recall_open = @import("recall_open.zig");
 const benchmark = @import("benchmark.zig");
 const checkpoint_cli = @import("checkpoint_cli");
+const vision_helper = @import("vision_helper.zig");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE]" ++
     " [--alias ALIAS] [--allowed-host NAME] [--allowed-origin ORIGIN] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard]" ++
@@ -125,6 +126,11 @@ pub fn main(init: std.process.Init) !u8 {
         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
         return 0;
     }
+    // --vision-helper (rank 0): the helper loads and warms the tower on this GPU before the engine reads its memory
+    // budget, so the tower and the helper's context stay outside the caches' share
+    var helper: ?*vision_helper.Helper = null;
+    defer if (helper) |h| h.stop(io);
+    if (args.vision_helper) helper = vision_helper.Helper.start(gpa, io, dir, vision_helper.Settings.of(args, init.environ_map), init.environ_map, &problem) catch return fail(problem);
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
@@ -156,6 +162,7 @@ pub fn main(init: std.process.Init) !u8 {
         .sampling = try sampling(a, io, dir, args),
         .environ = init.environ_map,
         .started = started,
+        .vision_helper = helper,
         .identity = engines.identity(a, args),
         .forget_fail = if (comptime @import("build_options").slide_test_hooks) forgetFail(init.environ_map) else 0,
     });

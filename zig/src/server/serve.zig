@@ -80,6 +80,8 @@ fn raiseOpenFileLimit() ?[2]u64 {
 /// What a server needs besides its flags.
 pub const Setup = struct {
     engine: api.Engine,
+    /// --vision-helper: the started helper (image and video prompts of our Flash Next engine)
+    vision_helper: ?*@import("vision_helper.zig").Helper = null,
     text: model_text.Text,
     served: []const u8,
     /// The checkpoint's folder (structured output reads its tokenizer.json and config.json, /slide shows its shards).
@@ -204,6 +206,15 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .out_of_memory => log.line("out of memory: idle unload stays off", .{}),
     }
     defer idle_unload.stopServer(srv);
+    if (s.vision_helper) |h| {
+        if (!srv.info.media) {
+            std.debug.print("tensorfold: --vision-helper: this engine takes no image or video rows (TENSORFOLD_FLASHNEXT_ENGINE=mia serves them)\n", .{});
+            return 2;
+        }
+        srv.vision_helper = h;
+        srv.media_limits = .{ .max_images = h.settings.max_images, .max_videos = h.settings.max_videos, .allow_urls = h.settings.allow_urls };
+        @import("http_body.zig").limit = 96 * 1024 * 1024; // base64 data URLs are a third larger than the files
+    }
     if (args.loop_guard and !srv.info.loop_guard) {
         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
         return 2;

@@ -139,6 +139,9 @@ pub const Server = struct {
     snapshot_checked: bool = false,
     /// Cortheon's web reader and what replies hid from their clients; null without --cortheon.
     cortheon: ?*cortheon.State = null,
+    /// --vision-helper: the helper that prepares image and video prompts (null: none)
+    vision_helper: ?*@import("vision_helper.zig").Helper = null,
+    media_limits: @import("vision_helper_prompt.zig").MediaLimits = .{},
     /// Recall's record (--recall), which GET and DELETE /v1/recall read and empty; main opens and closes it.
     recall: ?*api.recall_store.Store = null,
 

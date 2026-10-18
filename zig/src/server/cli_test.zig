@@ -212,6 +212,10 @@ test "parse and capabilities share the table" {
     try std.testing.expect(urls.vision and urls.vision_urls);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--vision-urls" }, &u));
     try std.testing.expectEqualStrings("--vision-urls needs --vision", u.message);
+    const helper = try parse(a, &.{ "m", "--vision-helper", "--vision-urls", "--vision-max-images", "8" }, &u);
+    try std.testing.expect(helper.vision_helper and helper.vision_urls and !helper.vision and helper.vision_counts_set);
+    try std.testing.expect(!(try parse(a, &.{ "m", "--vision-helper" }, &u)).vision_counts_set);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--vision", "--vision-helper" }, &u));
 }
 
 test "learned disk floor parses once with a finite byte-safe default and is a native capability" {

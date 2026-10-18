@@ -461,6 +461,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .structures = served.backend.vtable.first_masked != null,
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
+        .media = @hasDecl(F, "takes_media") and F.takes_media and o.vision_helper, // our engine's --vision-helper rows
         .admit = admit,
         .slide_conversations = conversations,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
