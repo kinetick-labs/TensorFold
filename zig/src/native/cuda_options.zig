@@ -34,6 +34,10 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
     if (comptime @hasField(F.Options, "drafter")) opts.drafter = o.drafter;
     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
+    // our Flash Next engine (cuda_mia.zig) sizes its streams and prompt cache at load, and takes helper-prepared media
+    if (@hasField(F.Options, "parallel")) opts.parallel = @intCast(o.lanes);
+    if (@hasField(F.Options, "prompt_cache_gib")) opts.prompt_cache_gib = o.prompt_cache_gib;
+    if (@hasField(F.Options, "vision_helper")) opts.vision_helper = o.vision_helper;
     return true;
 }
 
