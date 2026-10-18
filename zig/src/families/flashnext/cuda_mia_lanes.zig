@@ -1028,7 +1028,7 @@ pub fn Lanes(comptime E: type) type {
                 for (&times) |*x| x.* = try c.chain(io, levels);
                 out.* = median(times[1..]);
             }
-            const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)));
+            const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)), verify.len); // one regime: every width pools
             self.cost_count = 0;
             for (1..k.rows + 1) |w| {
                 self.costs[self.cost_count] = .{ .width = @intCast(w), .ms = k.verify[w] };
