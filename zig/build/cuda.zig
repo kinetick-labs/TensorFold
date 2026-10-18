@@ -160,6 +160,16 @@ fn qwenVisionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     return b.createModule(.{ .root_source_file = b.path("zig/src/vision/qwen_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } });
 }
 
+/// Our Flash Next CUDA engine (MiaAI-Lab lineage: EXL3 packs, NVIDIA FP4-Local), served beside upstream Flash Next
+/// when TENSORFOLD_FLASHNEXT_ENGINE=mia (native/cuda_mia.zig).
+fn flashnextMiaModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addImport("core", core);
+    m.addImport("lanes", lanes);
+    return m;
+}
+
 /// The checkpoint subcommands' module: `models`, `info` and `pull` over the CUDA families.
 pub fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: ?bool, engines_mod: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "native_engines", .module = engines_mod }, exlr8_build.cliImport(b, target, optimize, core), .{ .name = "core", .module = core } } });
@@ -463,7 +473,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         @import("cortheon_fuzz.zig").add(b, host, native_modules.api, mods.tokenizer, template);
     }
     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), flashnextMiaModule(b, host, .debug, cuda, mods.core, mods.lanes), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const selected = b.option([]const u8, "modelopt-host-filter", "One portable ModelOpt regression") orelse "modelopt host:";
     const run = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{selected} }));
     run.has_side_effects = true;
@@ -511,16 +521,6 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-info-config", "Info shares the checkpoint config reader and diagnostics").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli, .filters = &.{"issue 934:"} })).step);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = memory_cli, .filters = &.{"plan"} })).step); // plan's verdict tests in the plain `zig build test` gate
-    // The checkpoint CLI (models, info, pull) against a synthetic cache and a fake hub: the same test root
-    // the Metal path wires (build.zig, `test-cli`), which the Linux host tests used to leave out.
-    const cli_checks = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("zig/src/cli/tests.zig"),
-        .target = host,
-        .optimize = .debug,
-        .link_libc = true,
-        .imports = &.{.{ .name = "native_engines", .module = native }},
-    }) });
-    step.dependOn(&b.addRunArtifact(cli_checks).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.

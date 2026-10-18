@@ -16,5 +16,9 @@ pub fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     cuda.addOptions("kernel_options", options);
     cuda.addImport("stagger", stagger(b, target, optimize));
     if (with) for (@import("cuda_kernels.zig").kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
+    // our engine's one-shot RoCE all-gather proxy (cuda/roce_mia.zig): plain C over libibverbs' header, the library
+    // opened at run time (roce_proxy_stub.c, which refuses every open, where /usr/include has no infiniband/verbs.h)
+    const verbs = if (std.Io.Dir.accessAbsolute(b.graph.io, "/usr/include/infiniband/verbs.h", .{})) |_| true else |_| false;
+    cuda.addCSourceFile(.{ .file = b.path(if (verbs) "zig/src/cuda/roce_proxy.c" else "zig/src/cuda/roce_proxy_stub.c"), .flags = &.{ "-std=gnu11", "-O2", "-idirafter", "/usr/include" } });
     return cuda;
 }
