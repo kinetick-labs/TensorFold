@@ -1,5 +1,6 @@
-//! ``--vision``: image and video input through Python TensorFold's own frontend and tower, run by a helper process
-//! (``python3 -m tensorfold.vision.native_helper``, work/research/V1-vision.md). The server renders the chat template
+//! ``--vision-helper`` (our Flash Next engine, TENSORFOLD_FLASHNEXT_ENGINE=mia): image and video input through Python
+//! TensorFold's own frontend and tower, run by a helper process (``python3 -m tensorfold.vision.native_helper``,
+//! work/research/V1-vision.md); upstream's ``--vision`` runs its own tower instead. The server renders the template
 //! with image and video parts and sends the rendered prompt with the request's media (data URLs, or https URLs with
 //! ``--vision-urls``); the helper decodes them (Pillow, PyAV), runs the processor (resize, normalize, the expanded
 //! placeholders, the HF tokenizer, the rotary positions) and the 27-layer tower on this GPU, and answers with the
@@ -11,7 +12,7 @@
 //! i32 [n, 3], features bf16 [k, width]). One request at a time.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const Value = json.Value;
@@ -42,7 +43,24 @@ pub const Settings = struct {
     max_images: u32 = 50,
     max_videos: u32 = 4,
     image_tokens: u32 = 16384,
+
+    /// The serve flags' (--vision-urls, --vision-max-images / -videos, --vision-image-tokens) where given, else
+    /// TENSORFOLD_MAX_IMAGES, TENSORFOLD_MAX_VIDEOS and TENSORFOLD_IMAGE_TOKENS, else the single-Spark recipe's.
+    pub fn of(args: anytype, environ: *const std.process.Environ.Map) Settings {
+        const d: Settings = .{};
+        return .{
+            .allow_urls = args.vision_urls,
+            .max_images = if (args.vision_counts_set) args.vision_max_images else envInt(environ, "TENSORFOLD_MAX_IMAGES", d.max_images),
+            .max_videos = if (args.vision_counts_set) args.vision_max_videos else envInt(environ, "TENSORFOLD_MAX_VIDEOS", d.max_videos),
+            .image_tokens = if (args.vision_image_tokens_set) args.vision_image_tokens else envInt(environ, "TENSORFOLD_IMAGE_TOKENS", d.image_tokens),
+        };
+    }
 };
+
+fn envInt(m: *const std.process.Environ.Map, name: []const u8, default: u32) u32 {
+    const t = m.get(name) orelse return default;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch default;
+}
 
 extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
@@ -113,7 +131,7 @@ pub const Helper = struct {
             try env_copy.?.put("PYTHONPATH", joined);
         };
         const child = std.process.spawn(io, .{ .argv = argv.items, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit, .environ_map = if (env_copy) |*m| m else environ }) catch |e| {
-            problem.* = try std.fmt.allocPrint(a, "--vision: cannot start {s} -m tensorfold.vision.native_helper ({s})", .{ python, @errorName(e) });
+            problem.* = try std.fmt.allocPrint(a, "--vision-helper: cannot start {s} -m tensorfold.vision.native_helper ({s})", .{ python, @errorName(e) });
             return error.VisionHelper;
         };
         const h = try gpa.create(Helper);
@@ -124,20 +142,20 @@ pub const Helper = struct {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const frame = h.readFrame(arena.allocator()) catch |e| {
-            problem.* = try std.fmt.allocPrint(a, "--vision: the helper stopped before it was ready ({s}); see its lines above", .{@errorName(e)});
+            problem.* = try std.fmt.allocPrint(a, "--vision-helper: the helper stopped before it was ready ({s}); see its lines above", .{@errorName(e)});
             h.stop(io);
             return error.VisionHelper;
         };
         const head = frame.header;
         if (head.get("ready") == null or head.get("ready").? != .bool or !head.get("ready").?.bool) {
-            problem.* = try std.fmt.allocPrint(a, "--vision: the helper could not load the vision tower: {s}", .{head.strField("error") orelse "unknown"});
+            problem.* = try std.fmt.allocPrint(a, "--vision-helper: the helper could not load the vision tower: {s}", .{head.strField("error") orelse "unknown"});
             h.stop(io);
             return error.VisionHelper;
         }
         h.timeout_s = 600;
         h.selftest = try gpa.dupe(u8, head.strField("selftest_sha256") orelse "");
         if (environ) |m| if (m.get("TENSORFOLD_VISION_SELFTEST")) |want| if (want.len > 0 and !std.mem.eql(u8, want, h.selftest)) {
-            problem.* = try std.fmt.allocPrint(a, "--vision: the helper's self-test features sha {s} is not TENSORFOLD_VISION_SELFTEST {s}: another Python, torch, transformers, Pillow or PyAV stack than the reference's", .{ h.selftest, want });
+            problem.* = try std.fmt.allocPrint(a, "--vision-helper: the helper's self-test features sha {s} is not TENSORFOLD_VISION_SELFTEST {s}: another Python, torch, transformers, Pillow or PyAV stack than the reference's", .{ h.selftest, want });
             h.stop(io);
             return error.VisionHelper;
         };

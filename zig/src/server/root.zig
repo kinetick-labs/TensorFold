@@ -72,6 +72,7 @@ test {
     _ = @import("messages.zig");
     _ = @import("images.zig");
     _ = @import("images_video_marker_test.zig");
+    _ = @import("vision_helper_prompt.zig");
     _ = @import("image_key.zig");
     _ = @import("image_pieces.zig");
     _ = @import("image_reuse_test.zig");
