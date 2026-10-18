@@ -108,18 +108,14 @@ pub const Image = struct {
     hash: u64 = 0, // core/picture/identity.zig's: the bytes and the grid, as the prompt cache's key names the image
 };
 
-/// A prompt's images and video frames as the vision frontend prepared them (Python's EncodedVision): the prompt
-/// rows the visual features replace (ascending), each prompt row's three rotary positions (t, h, w: [n, 3] row
-/// major, i32), the decode offset (text after the prompt rotates at its position + delta) and the features
-/// (bf16 [rows.len, width]). A prompt with media prefills from its start and keeps no prefix states.
+/// Images and video frames for a prompt: replaced rows, [n, 3] rotary positions, decode delta, bf16 features.
 pub const Media = struct {
     rows: []const u32,
     positions: []const i32,
     delta: i64,
     features: []const u8,
     width: u32,
-    /// a following rank's copy (two ranks): the feature rows' count only; rows, positions and features arrive by
-    /// rank 0's broadcast (they never ride the control link)
+    /// a following rank's copy: the feature rows' count only; the rest arrives by rank 0's broadcast
     follower_rows: u32 = 0,
 
     pub fn rowCount(m: *const Media) usize {

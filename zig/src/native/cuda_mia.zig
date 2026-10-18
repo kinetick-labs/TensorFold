@@ -1,7 +1,4 @@
-//! Our Flash Next CUDA engine (the MiaAI-Lab lineage: ExLlamaV3 packs, NVIDIA's FP4-Local ModelOpt checkpoint)
-//! as a CUDA family beside upstream's (families/flashnext/cuda_lanes.zig, #952). Both read model_type qwen4_exp;
-//! `TENSORFOLD_FLASHNEXT_ENGINE=mia` serves a checkpoint with this one, anything else (or unset) with upstream's.
-//! The namespace speaks native/cuda.zig's family contract and forwards to flashnext_mia.native (cuda_native.zig).
+//! Our Flash Next CUDA engine (MiaAI-Lab lineage) beside upstream's #952; TENSORFOLD_FLASHNEXT_ENGINE=mia selects it.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -32,8 +29,7 @@ pub const snap_lookahead: u32 = N.cache_rules.lookahead;
 /// The engine takes --vision-helper's image and video rows (Request.media).
 pub const takes_media = N.media;
 
-/// The serve options this engine takes: upstream's (context, drafts, segments, slide, the two-rank link, --kv-cache
-/// fp8 as kv8) and ours that family_options.zig forwards by name (parallel, prompt_cache_gib, vision_helper).
+/// Upstream's serve options plus those cuda_options.zig forwards by name (parallel, prompt_cache_gib, vision_helper).
 pub const Options = struct {
     context: usize,
     drafts: bool,
@@ -179,8 +175,7 @@ fn checked(io: std.Io, path: []const u8) ![]const u8 {
     return path;
 }
 
-/// Every top-level `*.safetensors` the loader uploads; a file holding only the n-gram table is memory-mapped and read
-/// a row at a time (cuda_weights.NgramTable), so it is not counted.
+/// Every top-level `*.safetensors` the loader uploads; the n-gram table's file is memory-mapped, so not counted.
 fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
     var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
     defer d.close(io);

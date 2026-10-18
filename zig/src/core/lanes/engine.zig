@@ -59,7 +59,7 @@ pub const Engine = struct {
             .backend = backend,
             .clock = clock,
             .arena = std.heap.ArenaAllocator.init(gpa),
-            // head_stops is not wired: Config.head_stops and head_stops_most are not copied, and nothing sets Rule.live, so stopsNow() stays false. depth() uses acceptance rates; the head's product rule only truncates.
+            // head_stops is not wired here: Rule.live stays unset, so depth() keeps acceptance rates
             .rule = .{
                 .gpa = gpa,
                 .k = cfg.k,

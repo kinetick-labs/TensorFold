@@ -5,12 +5,10 @@ const hub = @import("hub.zig");
 
 pub const GiB: u64 = 1 << 30;
 
-/// Kept back for kernels, activations and buffers that grow with long prompts; the same margin the
-/// server's prompt-cache budget reserves (native/cache_fit.zig's MARGIN).
+/// Kept back for kernels, activations and long-prompt buffers: the prompt cache's margin (native/cache_fit.zig).
 pub const runtime_margin: u64 = 2 * GiB;
 
-/// Prints what a Zig family would serve from `model` (a directory or a cached repo id).
-/// Returns the process exit code.
+/// Prints what a Zig family would serve from `model` (a directory or a cached repo id); returns the exit code.
 pub fn run(a: Allocator, io: std.Io, out: *std.Io.Writer, env: ?*const std.process.Environ.Map, override: ?[]const u8, model: []const u8) !u8 {
     const dir: []const u8 = blk: {
         if (hub.isDir(io, model)) break :blk model;
@@ -90,8 +88,7 @@ test "info prints family, format, context, weights and floor for a cached checkp
     try std.testing.expectEqual(@as(u8, 1), try run(a, io, &refused.writer, null, root, "Org/Draft"));
     try std.testing.expect(has(refused.written(), "no registered Zig family serves model_type gemma3n"));
 
-    // An ExLlamaV3 pack: the format line names the codebook and the two fixed heads off the config alone,
-    // while the per-tensor width stays a load-time read (format.py:bits_of).
+    // an ExLlamaV3 pack: codebook and fixed heads from the config; the per-tensor width is read at load
     try w.createDirPath(io, try std.fs.path.join(a, &.{ root, "models--Org--Exl3/snapshots/rev3" }));
     try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ root, "models--Org--Exl3/snapshots/rev3/config.json" }), .data = "{\"model_type\": \"qwen4_exp\", \"quantization_config\": {\"quant_method\": \"exl3\", \"version\": \"1.4.4\", \"bits\": 4.05, \"head_bits\": 6, \"mtp_bits\": 4, \"codebook\": \"mul1\", \"out_scales\": \"always\"}}" });
     try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ root, "models--Org--Exl3/snapshots/rev3/weights.safetensors" }), .data = &weights });
