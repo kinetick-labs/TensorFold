@@ -42,8 +42,26 @@ pub fn prepare(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking
         },
         .ok => |p| {
             log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), p.features_sha });
+            dump(srv, cx.a, p.media);
             return .{ .ids = p.tokens, .media = p.media };
         },
+    }
+}
+
+var dumped = std.atomic.Value(u32).init(0);
+
+/// TENSORFOLD_VISION_DUMP: `helper-<n>.{features,rows,pos}` raw, as native/cuda_mia_vision.zig writes the bridge's.
+fn dump(srv: *Server, a: std.mem.Allocator, m: *const @import("engine_api").Media) void {
+    const dir = std.mem.span(std.c.getenv("TENSORFOLD_VISION_DUMP") orelse return);
+    const n = dumped.fetchAdd(1, .monotonic) + 1;
+    const parts = [_]struct { []const u8, []const u8 }{
+        .{ "features", m.features },
+        .{ "rows", std.mem.sliceAsBytes(m.rows) },
+        .{ "pos", std.mem.sliceAsBytes(m.positions) },
+    };
+    for (parts) |part| {
+        const path = std.fmt.allocPrint(a, "{s}/helper-{d}.{s}", .{ dir, n, part[0] }) catch return;
+        std.Io.Dir.cwd().writeFile(srv.io, .{ .sub_path = path, .data = part[1] }) catch |e| log.line("vision dump: {s}", .{@errorName(e)});
     }
 }
 
