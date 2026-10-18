@@ -22,13 +22,13 @@ pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
     const source = @import("copy_source.zig");
     try source.captureBegin(stream, mode);
     errdefer source.captureEnd(stream);
-    try soft(stream.d, stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
+    try stream.d.check(stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
 }
 
 /// Ends the capture; an invalidated capture returns an error and no graph.
 pub fn endCapture(stream: Stream) Error!Graph {
     var g: abi.Graph = null;
-    try soft(stream.d, stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+    try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
     @import("copy_source.zig").captureEnd(stream);
     return .{ .d = stream.d, .handle = g };
 }
