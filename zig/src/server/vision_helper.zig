@@ -1,15 +1,4 @@
-//! ``--vision-helper`` (our Flash Next engine, TENSORFOLD_FLASHNEXT_ENGINE=mia): image and video input through Python
-//! TensorFold's own frontend and tower, run by a helper process (``python3 -m tensorfold.vision.native_helper``,
-//! work/research/V1-vision.md); upstream's ``--vision`` runs its own tower instead. The server renders the template
-//! with image and video parts and sends the rendered prompt with the request's media (data URLs, or https URLs with
-//! ``--vision-urls``); the helper decodes them (Pillow, PyAV), runs the processor (resize, normalize, the expanded
-//! placeholders, the HF tokenizer, the rotary positions) and the 27-layer tower on this GPU, and answers with the
-//! prompt's token ids, the feature rows, each row's three rotary positions and the bf16 features: Python's bits. The
-//! engine moves the features into the prompt rows (``api.Media``).
-//!
-//! Frames on the helper's stdin / stdout (little endian): a request is a u32 length and its JSON; a reply is a u32
-//! header length, the header JSON, a u64 payload length and the payload (token ids u32 [n], rows u32 [k], positions
-//! i32 [n, 3], features bf16 [k, width]). One request at a time.
+//! --vision-helper: our engine's images and videos through python3 -m tensorfold.vision.native_helper (V1-vision.md).
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
@@ -44,8 +33,7 @@ pub const Settings = struct {
     max_videos: u32 = 4,
     image_tokens: u32 = 16384,
 
-    /// The serve flags' (--vision-urls, --vision-max-images / -videos, --vision-image-tokens) where given, else
-    /// TENSORFOLD_MAX_IMAGES, TENSORFOLD_MAX_VIDEOS and TENSORFOLD_IMAGE_TOKENS, else the single-Spark recipe's.
+    /// The serve flags where given, else TENSORFOLD_MAX_IMAGES / _MAX_VIDEOS / _IMAGE_TOKENS, else the recipe's.
     pub fn of(args: anytype, environ: *const std.process.Environ.Map) Settings {
         const d: Settings = .{};
         return .{
@@ -85,6 +73,7 @@ fn memAvailable() ?u64 {
     return null;
 }
 
+/// One request at a time; frames LE: u32 + request JSON; u32 + header JSON, u64 + payload (ids, rows, positions, bf16).
 pub const Helper = struct {
     gpa: Allocator,
     child: std.process.Child,
@@ -97,16 +86,13 @@ pub const Helper = struct {
     videos: bool = false,
     width: u32 = 0,
     tower_bytes: u64 = 0,
-    /// seconds a request may take (writing it, decoding, the tower, reading the answer); past it the helper is
-    /// taken as stuck: killed, and media requests refused from then on
+    /// seconds a request may take; past it the helper is taken as stuck: killed, and media requests refused
     timeout_s: u32 = 600,
-    /// requests waiting for the helper (each holds its body in host memory): past `max_waiting` a request is refused
-    /// at once with 503, and none waits past `wait_s` (Python's bounded image slots and 60 s wait)
+    /// requests waiting for the helper: past `max_waiting` refused with 503, none waits past `wait_s` (Python's)
     waiting: std.atomic.Value(u32) = .init(0),
     max_waiting: u32 = 8,
     wait_s: u32 = 60,
-    /// the features sha of the helper's start-up self-test image (a fixed picture through the whole frontend and
-    /// tower): equal on every box running the same stack; TENSORFOLD_VISION_SELFTEST=<sha> refuses another
+    /// the helper's self-test features sha (same on every box with the stack); TENSORFOLD_VISION_SELFTEST pins it
     selftest: []const u8 = "",
     /// the transaction's deadline (monotonic ns) for readAll / writeAll
     deadline: i128 = 0,
