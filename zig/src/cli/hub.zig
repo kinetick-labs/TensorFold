@@ -206,17 +206,14 @@ pub fn quantization(a: Allocator, io: std.Io, dir: []const u8) ?struct { bits: u
     return .{ .bits = @intCast(bits), .group = @intCast(group) };
 }
 
-/// The quantization format a config.json declares, as the Zig families read it: MLX's affine
-/// `quantization` block, or an ExLlamaV3 `quantization_config` (quant_method "exl3").
+/// config.json's quantization as the Zig families read it: MLX's `quantization`, or EXL3's `quantization_config`.
 pub const Format = union(enum) {
     affine: struct { bits: u64, group: u64 },
-    /// An EXL3 pack's *mean* width and two fixed heads; the real width is per tensor and comes off
-    /// each trellis shape at load (format.py:bits_of), so it is not a config field.
+    /// An EXL3 pack's mean width and two fixed heads; the real width is per tensor, read at load (format.py:bits_of).
     exl3: struct { codebook: []const u8, bits: ?f64, head_bits: ?i64, mtp_bits: ?i64 },
 };
 
-/// config.json's quantization, or null for an unquantized checkpoint. An `exl3` codebook string
-/// points into `text`, which the caller's allocator owns for as long as the `Format` is read.
+/// config.json's quantization, or null when unquantized; an `exl3` codebook string points into the caller's `text`.
 pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
     const text = @import("checkpoint_config").optional(a, io, dir) orelse return null;
     var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return null;

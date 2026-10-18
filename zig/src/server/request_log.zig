@@ -1,4 +1,4 @@
-//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images and videos redacted, for replays.
+//! TENSORFOLD_REQUEST_LOG: each chat and completion body as one JSON line, images and videos redacted, for replays.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("sys");

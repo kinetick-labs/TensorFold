@@ -126,8 +126,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
         return 0;
     }
-    // --vision-helper (rank 0): the helper loads and warms the tower on this GPU before the engine reads its memory
-    // budget, so the tower and the helper's context stay outside the caches' share
+    // --vision-helper: the helper warms its tower before the engine reads its memory budget (outside the caches)
     var helper: ?*vision_helper.Helper = null;
     defer if (helper) |h| h.stop(io);
     if (args.vision_helper) helper = vision_helper.Helper.start(gpa, io, dir, vision_helper.Settings.of(args, init.environ_map), init.environ_map, &problem) catch return fail(problem);

@@ -109,8 +109,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
-    // our Flash Next CUDA engine (MiaAI-Lab lineage, families/flashnext/cuda.zig: EXL3, FP4-Local); every name fn_*
-    // Flash Next (qwen4_exp): copies of its extensions' device code (zig/tests/cuda/copies.py), the same flags
+    // our Flash Next CUDA engine (MiaAI-Lab lineage), fn_*: its extensions' device code (zig/tests/cuda/copies.py)
     .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
     .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
     .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2

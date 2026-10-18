@@ -161,9 +161,7 @@ fn qwenVisionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     return b.createModule(.{ .root_source_file = b.path("zig/src/vision/qwen_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } });
 }
 
-/// Flash Next's CUDA family, sharing the maintained runtime and lane core.
-/// Our Flash Next CUDA engine (MiaAI-Lab lineage: EXL3 packs, NVIDIA's FP4-Local), served beside upstream's
-/// (`flashnextModule`) when TENSORFOLD_FLASHNEXT_ENGINE=mia (native/cuda_mia.zig).
+/// Our Flash Next CUDA engine (EXL3, FP4-Local), served when TENSORFOLD_FLASHNEXT_ENGINE=mia (native/cuda_mia.zig).
 fn flashnextMiaModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
@@ -172,6 +170,7 @@ fn flashnextMiaModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     return m;
 }
 
+/// Flash Next's CUDA family, sharing the maintained runtime and lane core.
 fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, qwen_vision: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_launch.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
