@@ -431,7 +431,7 @@ pub const LaneHost = struct {
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
+        if (h.cache) |store| _ = if (!job.request.untaught and !(h.info_.media and job.request.images.len > 0) and store.rules.lookahead == 0) store.keepBorn(job.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");

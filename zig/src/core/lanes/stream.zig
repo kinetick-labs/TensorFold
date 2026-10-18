@@ -143,6 +143,41 @@ pub const Spec = struct {
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
 };
 
+/// Images and video frames for a prompt: replaced rows, [n, 3] rotary positions, decode delta, bf16 features.
+pub const Media = struct {
+    rows: []const u32,
+    positions: []const i32,
+    delta: i64,
+    features: []const u8,
+    width: u32,
+    /// a following rank's copy: the feature rows' count only; the rest arrives by rank 0's broadcast
+    follower_rows: u32 = 0,
+
+    pub fn rowCount(m: *const Media) usize {
+        return if (m.follower_rows > 0) m.follower_rows else m.rows.len;
+    }
+
+    pub fn featureBytes(m: *const Media) usize {
+        return m.rowCount() * @as(usize, m.width) * 2;
+    }
+
+    pub fn check(m: *const Media, prompt_len: usize) error{BadMedia}!void {
+        if (m.follower_rows > 0) {
+            if (m.rows.len != 0 or m.positions.len != 0 or m.features.len != 0 or m.width == 0 or m.follower_rows > prompt_len) return error.BadMedia;
+            return;
+        }
+        if (m.rows.len == 0 or m.positions.len != 3 * prompt_len or m.width == 0) return error.BadMedia;
+        // a following rank's copy carries no features (they arrive by broadcast)
+        if (m.features.len != 0 and m.features.len != m.featureBytes()) return error.BadMedia;
+        var last: ?u32 = null;
+        for (m.rows) |r| {
+            if (r >= prompt_len or (last != null and r <= last.?)) return error.BadMedia;
+            last = r;
+        }
+        for (m.positions) |p| if (p < 0) return error.BadMedia;
+    }
+};
+
 pub const Stream = struct {
     embedding: ?@import("embedding.zig").Batch = null,
     id: []const u8,

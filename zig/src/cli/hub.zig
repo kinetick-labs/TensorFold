@@ -242,7 +242,8 @@ pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
     if (root.get("quantization")) |q| {
         if (q != .object) return null;
         const bits = if (q.object.get("bits")) |b| (if (b == .integer) b.integer else return null) else return null;
-        const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else 32) else 32;
+        const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else return null) else 32;
+        if (bits <= 0 or group <= 0) return null;
         return .{ .affine = .{ .bits = @intCast(bits), .group = @intCast(group) } };
     }
     return null;

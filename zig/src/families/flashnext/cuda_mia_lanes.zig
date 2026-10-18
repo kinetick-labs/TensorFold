@@ -44,6 +44,13 @@ pub const Gate = struct {
     fatal: *const fn (ptr: *anyopaque, what: []const u8, err: anyerror) void,
 };
 
+/// --vision through upstream's tower (native/cuda_mia_vision.zig): a prompt's images as Media, made before its fill.
+pub const MediaHook = struct {
+    ptr: *anyopaque,
+    make: *const fn (ptr: *anyopaque, ids: []const u32, images: []const lanes.stream.Image) anyerror!*const lanes.stream.Media,
+    free: *const fn (ptr: *anyopaque, m: *const lanes.stream.Media) void,
+};
+
 /// Where rank 0's prompt-cache decisions go (cuda_mirror's Leader: a note call to rank 1).
 pub const Notes = struct { ptr: *anyopaque, send: *const fn (ptr: *anyopaque, bytes: []const u8) void };
 
@@ -163,6 +170,8 @@ pub fn Lanes(comptime E: type) type {
         shared: [shared_points]lanes.config.Cost = undefined,
         shared_count: usize = 0,
         mtp_ms: f64 = 0,
+        media_hook: ?MediaHook = null,
+        bridged: std.AutoHashMapUnmanaged(*const lanes.Stream, *const lanes.stream.Media) = .empty, // the hook's, freed at release
 
         pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
             const late = if (std.c.getenv("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
@@ -171,6 +180,9 @@ pub fn Lanes(comptime E: type) type {
 
         pub fn deinit(self: *Self) void {
             tel.shutdown();
+            var bit = self.bridged.valueIterator();
+            while (bit.next()) |m| self.media_hook.?.free(self.media_hook.?.ptr, m.*);
+            self.bridged.deinit(self.gpa);
             var it = self.lanes.valueIterator();
             while (it.next()) |l| {
                 self.stopFill(l.*);
@@ -695,6 +707,7 @@ pub fn Lanes(comptime E: type) type {
         fn preparePrefill(self: *Self, s: *lanes.Stream) !*Lane {
             const e = self.e;
             const ids = s.prompt();
+            if (s.media == null and s.images.len > 0) try self.bridge(s);
             if (ids.len == 0 or ids.len > self.context or s.max_new > self.context - ids.len) return error.PromptTooLong;
             const limit = ids.len + s.max_new + self.window; // speculative rows are outside the public context
             // an image or video prompt also holds its rotary table and features while it fills (attachMedia)
@@ -951,8 +964,21 @@ pub fn Lanes(comptime E: type) type {
             return .{ .count = @intCast(l.held_n) };
         }
 
+        /// A prompt's images through the media hook, once (a retried admission finds its Media made).
+        fn bridge(self: *Self, s: *lanes.Stream) !void {
+            const h = self.media_hook orelse return error.NoImageTower;
+            const m = try h.make(h.ptr, s.prompt(), s.images);
+            errdefer h.free(h.ptr, m);
+            try self.bridged.put(self.gpa, s, m);
+            s.media = m;
+        }
+
         fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
             const self = of(ptr);
+            if (self.bridged.fetchRemove(s)) |b| {
+                s.media = null;
+                self.media_hook.?.free(self.media_hook.?.ptr, b.value);
+            }
             const kv = self.lanes.fetchRemove(s) orelse return;
             // a late Kept of this lane takes the lane's sequence as its keeper (its first `at` rows are the
             // prompt's): release runs no collective (cuda_mirror batches it), so no keeper is made here

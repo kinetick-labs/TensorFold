@@ -39,7 +39,9 @@ pub const prompt_rows: u32 = kvd.prefill_rows;
 /// `parallel`: streams one shared forward holds (--parallel; the engine's Options.streams, the lanes' max_streams).
 /// `prompt_cache_gib`: the kept prompt states' budget (null: a quarter of the sequences' memory, 16 GiB at most;
 /// 0: no prompt reuse). `kv_dtype`: the attention caches' format (--kv-dtype bf16|fp8; both ranks must agree).
-pub const Options = struct { context: usize, drafts: bool, parallel: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: []const u8 = "", master_port: u16 = 29551, kv_dtype: kvd.KvDtype = .bf16, vision: bool = false };
+pub const Options = struct { context: usize, drafts: bool, parallel: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: []const u8 = "", master_port: u16 = 29551, kv_dtype: kvd.KvDtype = .bf16, vision: bool = false, media_hook: ?MediaHook = null };
+/// --vision's images as Media (native/cuda_mia_vision.zig through native/cuda_mia.zig), made before a prompt's fill.
+pub const MediaHook = lane_backend.MediaHook;
 
 /// The engine takes image and video rows (Request.media: rotary positions MODE 2, features into the prompt rows).
 pub const media = true;
@@ -134,6 +136,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     errdefer own.e.deinit();
     own.lanes = lane_backend.Lanes(M.Engine).init(gpa, own.e, o.drafts, o.context, depth + 1);
     own.lanes.streams = streams;
+    own.lanes.media_hook = o.media_hook;
     own.lanes.confidence = @import("cuda_engine.zig").confidenceSetting();
     own.lanes.product_streams = @import("cuda_engine.zig").productStreams();
     own.lanes.wide_confidence = @import("cuda_engine.zig").wide_confidence;

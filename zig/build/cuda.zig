@@ -199,6 +199,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "core", .module = core },
             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision) },
             .{ .name = "flashnext_mia", .module = flashnextMiaModule(b, target, optimize, cuda, core, lanes) },
+            .{ .name = "qwen_vision", .module = qwen_vision }, // our engine's --vision (native/cuda_mia_vision.zig)
             .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
             .{ .name = "qwen35", .module = qwen35 },
             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
