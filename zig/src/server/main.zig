@@ -20,6 +20,7 @@ const pdf_worker = @import("pdf_worker.zig");
 const web_cli = @import("web_cli.zig");
 const launch_cli = @import("launch_cli.zig");
 const device_cli = @import("device_cli.zig");
+const vision_helper = @import("vision_helper.zig");
 
 const usage_line = "usage: tensorfold serve [-h] [--config FILE.toml] [--host HOST] [--port PORT] [--unix-socket PATH] [--name NAME] [--chat-template FILE]" ++
     " [--alias ALIAS] [--allowed-host NAME] [--allowed-origin ORIGIN] [--cors-origin ORIGIN] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--log-json]" ++
@@ -176,6 +177,11 @@ pub fn main(init: std.process.Init) !u8 {
         error.OutOfMemory => |x| return x,
         error.Refused => return fail(problem),
     };
+    // --vision-helper (rank 0): the helper loads and warms the tower on this GPU before the engine reads its memory
+    // budget, so the tower and the helper's context stay outside the caches' share
+    var helper: ?*vision_helper.Helper = null;
+    defer if (helper) |h| h.stop(io);
+    if (args.vision_helper) helper = vision_helper.Helper.start(gpa, io, dir, vision_helper.Settings.of(args, init.environ_map), init.environ_map, &problem) catch return fail(problem);
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
@@ -212,6 +218,7 @@ pub fn main(init: std.process.Init) !u8 {
         .instruct = instruct,
         .environ = init.environ_map,
         .started = started,
+        .vision_helper = helper,
         .identity = engines.identity(a, args),
         .forget_fail = if (comptime @import("build_options").slide_test_hooks) try forgetFail(init.environ_map) else 0,
         .tool_id_key = if (tool_ids) |*key| key else null,
