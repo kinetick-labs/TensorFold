@@ -7,6 +7,8 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const flashnext = @import("flashnext");
+/// Our Flash Next engine (EXL3, FP4-Local), for qwen4_exp when TENSORFOLD_FLASHNEXT_ENGINE=mia (cuda_mia.zig).
+const flashnext_mia = @import("cuda_mia.zig");
 const family_memory = @import("cuda_family_memory.zig");
 const pool = family_memory.pool;
 const family_options = @import("cuda_options.zig");
@@ -177,6 +179,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
+    if (std.mem.eql(u8, o.model_type, flashnext_mia.model_type) and flashnext_mia.selected()) return openWith(flashnext_mia, a, gpa, io, o, problem);
     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
         if (refusals.lfm2(o)) |why| {
@@ -199,7 +202,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = why;
         return null;
     }
-    const native = modelContext(a, io, o.dir);
+    // a family may serve past config.json's window (our Flash Next engine with YaRN): its modelWindow says how far
+    const native = if (@hasDecl(F, "modelWindow")) F.modelWindow(a, io, o.dir) else modelContext(a, io, o.dir);
     const window = contextWindow(o.context, native, F.default_context) catch |e| {
         problem.* = switch (e) {
             error.Negative => try std.fmt.allocPrint(a, "--context {d}: a token count, or 0 for the model's window", .{o.context.?}),
@@ -474,6 +478,7 @@ test {
     _ = @import("cuda_startup_test.zig");
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
     _ = refusals;
+    _ = flashnext_mia; // the engine variable's test
     _ = lane_backend;
     _ = snaps;
     _ = cuda_device; // the device and variable tests
