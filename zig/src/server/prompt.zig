@@ -12,7 +12,7 @@ const Value = json.Value;
 const Cx = errors.Cx;
 
 /// With image input, `ids` holds each image's tokens, `images` the images and `cache_key` the prompt the cache matches.
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, user_end: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, frames: []const ?api.Size = &.{}, message_starts: []const u32 = &.{} };
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, user_end: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, frames: []const ?api.Size = &.{}, message_starts: []const u32 = &.{}, media: ?*const api.Media = null };
 
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
@@ -167,6 +167,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     cx.template_fields = input.fields;
     var message_starts: []const u32 = &.{};
     const marks = srv.info.prompt_cache or srv.chunks.step > 0; // read only by the prompt cache and prompt cuts
+    if (input.media) |raw| return @import("vision_helper_prompt.zig").prepare(srv, cx, raw, input.tools, thinking, effort);
     const prompt = try renderStarts(srv, cx, input.messages, input.tools, thinking, effort, true, input.explicit_off, if (marks) &message_starts else null);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;

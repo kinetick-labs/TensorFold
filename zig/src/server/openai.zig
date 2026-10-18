@@ -109,7 +109,10 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
     const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
     if (!cx.skip_request_log) if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined, .format = format };
-    if (is_chat) {
+    if (is_chat and srv.vision_helper != null and @import("vision_helper_prompt.zig").hasVisual(body.get("messages"))) {
+        input.media = body.get("messages"); // split, rendered and prepared with the helper (vision_helper_prompt.zig)
+        input.tools = if (srv.text.native_deepseek) try @import("deepseek_request.zig").active(cx, body.get("tools"), body.get("tool_choice")) else try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+    } else if (is_chat) {
         input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.media());
         input.tools = if (srv.text.native_deepseek) try @import("deepseek_request.zig").active(cx, body.get("tools"), body.get("tool_choice")) else try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
