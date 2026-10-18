@@ -166,8 +166,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, any world on a mesh
     .{ .name = "l2pf", .src = "deepseek_v41/l2pf", .flags = &.{"-O3"} }, // DeepSeek V4.1's L2 prefetch of a weight table, as GLM's too (records: glm_l2pf_pending.zig)
     .{ .name = "l2pace", .src = "deepseek_v41/l2pace", .flags = &.{"-O3"} }, // and its paced form
-    // our Flash Next CUDA engine (MiaAI-Lab lineage, families/flashnext/cuda.zig: EXL3, FP4-Local); every name fn_*
-    // Flash Next (qwen4_exp): copies of its extensions' device code (zig/tests/cuda/copies.py), the same flags
+    // our Flash Next CUDA engine (MiaAI-Lab lineage), fn_*: its extensions' device code (zig/tests/cuda/copies.py)
     .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
     .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
     .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2

@@ -1,6 +1,4 @@
-//! ``--vision-helper``'s prompts (our Flash Next engine): a request's image_url and video_url parts split out for the
-//! helper (Python's ``split_images`` with videos on), the template rendered with its image and video parts, and the
-//! helper's token ids and media for the engine. Such a prompt is neither kept nor resumed.
+//! --vision-helper's prompts: media parts split out (Python's split_images), template rendered, helper's ids and media.
 const std = @import("std");
 const json = @import("json");
 const errors = @import("errors.zig");
@@ -14,8 +12,7 @@ const Source = helper_mod.Source;
 const Value = json.Value;
 const Cx = errors.Cx;
 
-/// The request's messages (chat.Input.media) through the helper: normalized with their image_url and video_url
-/// parts, split, rendered, then the helper's processor and tower: Python's token ids and the media the engine takes.
+/// chat.Input.media through the helper: normalized, split, rendered, then the helper's token ids and media.
 pub fn prepare(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
     const helper = srv.vision_helper orelse return cx.refuse("image input requires --vision-helper");
     const kept = try messages.normalizeWith(cx, raw, srv.late_system, srv.needs_user_after_tool, .{ .images = true, .videos = true });
@@ -79,9 +76,7 @@ pub const MediaLimits = struct {
     allow_urls: bool = false,
 };
 
-/// A request's messages for the template and its media in order (``split_images`` with videos on): each
-/// image_url part (user and tool messages) becomes ``{"type": "image", "detail": d}``, each video_url part (user
-/// messages) ``{"type": "video"}``; text parts stay as they are. Python's checks and messages.
+/// split_images: image_url parts become {"type": "image", "detail"}, video_url {"type": "video"}; media in order.
 pub fn splitMedia(cx: *Cx, list_in: ?Value, limits: MediaLimits, sources: *std.ArrayList(Source)) errors.Refused!Value {
     const list = list_in orelse return cx.refuse("messages must be a non-empty list");
     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
