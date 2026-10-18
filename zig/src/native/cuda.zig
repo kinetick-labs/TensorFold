@@ -467,7 +467,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .structures = served.backend.vtable.first_masked != null,
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
-        .media = @hasDecl(F, "takes_media") and F.takes_media and o.vision_helper, // our engine's --vision-helper rows
+        .media = @hasDecl(F, "takes_media") and F.takes_media and (o.vision_helper or o.vision != null), // our engine's rows
         .admit = admit,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
@@ -483,7 +483,7 @@ const toGib = family_memory.toGib;
 test {
     _ = windows;
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
-    _ = .{ refusals, flashnext_mia }; // and the engine variable's test
+    _ = .{ refusals, flashnext_mia, @import("cuda_mia_vision.zig") }; // and ours
     _ = lane_backend;
     _ = snaps;
     _ = cuda_device; // the device and variable tests
