@@ -7,8 +7,7 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const flashnext = @import("flashnext");
-/// Our Flash Next engine (EXL3, FP4-Local), for qwen4_exp when TENSORFOLD_FLASHNEXT_ENGINE=mia (cuda_mia.zig).
-const flashnext_mia = @import("cuda_mia.zig");
+const flashnext_mia = @import("cuda_mia.zig"); // ours for qwen4_exp when TENSORFOLD_FLASHNEXT_ENGINE=mia
 const family_memory = @import("cuda_family_memory.zig");
 const pool = family_memory.pool;
 const family_options = @import("cuda_options.zig");
@@ -529,8 +528,7 @@ test {
     _ = windows;
     _ = @import("cuda_startup_test.zig");
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
-    _ = refusals;
-    _ = flashnext_mia; // the engine variable's test
+    _ = .{ refusals, flashnext_mia }; // and the engine variable's test
     _ = lane_backend;
     _ = snaps;
     _ = prompt_pages;

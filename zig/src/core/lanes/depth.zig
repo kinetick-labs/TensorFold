@@ -70,8 +70,7 @@ pub const Rule = struct {
     node_probabilities: bool,
     granted_depth: bool = false, // node_probabilities: a stream drafts its last grant plus draft_slack, lone ones too
     confidence_floor: ?f64 = null,
-    /// the head stops each chain by its own rule (a running product of its draws' probabilities): every ask is the
-    /// most drafts the stream's room allows, and the head's stops are the depth (no acceptance-rate guess cuts them)
+    /// the head stops each chain by the running product of its draws' probabilities; asks take the stream's whole room
     head_stops: bool = false,
     /// ... while at most this many streams are live (`live` is never set, so stopsNow stays false)
     head_stops_most: u32 = std.math.maxInt(u32),
