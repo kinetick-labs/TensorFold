@@ -5,6 +5,7 @@ const lanes = @import("lanes");
 const api = @import("engine_api");
 const mia = @import("flashnext_mia");
 const N = mia.native;
+const tower = @import("cuda_mia_vision.zig");
 
 /// The variable that picks this engine for qwen4_exp checkpoints.
 pub const env_engine = "TENSORFOLD_FLASHNEXT_ENGINE";
@@ -43,6 +44,7 @@ pub const Options = struct {
     parallel: u32 = 1,
     prompt_cache_gib: ?f64 = null,
     vision_helper: bool = false,
+    vision: ?tower.Limits = null, // --vision: upstream's tower from TENSORFOLD_VISION_TOWER_DIR (cuda_mia_vision.zig)
 };
 
 /// What native/cuda.zig drives; `target` is our prompt cache's hooks (null: this rank keeps no states).
@@ -57,6 +59,7 @@ pub const Loaded = struct {
     deinit: *const fn (*anyopaque) void,
     target: *anyopaque,
     follow: ?*const fn (*anyopaque) anyerror!void = null,
+    vision: ?*tower.Vision = null,
 };
 
 /// The engine's own state behind `Loaded.ctx`: its Loaded and the cache hooks `target` points at.
@@ -64,6 +67,7 @@ const Held = struct {
     gpa: std.mem.Allocator,
     inner: N.Loaded,
     hooks: @FieldType(N.Loaded, "cache"),
+    vision: ?*tower.Vision = null,
 };
 
 fn held(p: *anyopaque) *Held {
@@ -73,7 +77,18 @@ fn held(p: *anyopaque) *Held {
 fn release(p: *anyopaque) void {
     const h = held(p);
     h.inner.deinit(h.inner.ctx);
+    if (h.vision) |v| v.deinit();
     h.gpa.destroy(h);
+}
+
+fn makeMedia(p: *anyopaque, ids: []const u32, images: []const lanes.stream.Image) anyerror!*const lanes.stream.Media {
+    const v: *tower.Vision = @ptrCast(@alignCast(p));
+    return v.media(ids, images);
+}
+
+fn freeMedia(p: *anyopaque, m: *const lanes.stream.Media) void {
+    const v: *tower.Vision = @ptrCast(@alignCast(p));
+    v.free(m);
 }
 
 fn followFn(p: *anyopaque) anyerror!void {
@@ -100,9 +115,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // this engine replays a captured Triton set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<cc>
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const kdir = kernels orelse try kernelDir(io, try ctx.capability(), &dir_buf);
+    // --vision: the tower is resident before the engine reads its memory budget; one rank only
+    if (o.vision != null and (o.tp > 1 or o.rank != 0)) return error.VisionOneRank;
+    const v: ?*tower.Vision = if (o.vision) |l| try tower.Vision.load(gpa, io, ctx.d, tower.towerDir(dir), l) else null;
+    errdefer if (v) |x| x.deinit();
     const h = try gpa.create(Held);
     errdefer gpa.destroy(h);
-    h.* = .{ .gpa = gpa, .hooks = null, .inner = try N.open(gpa, io, ctx, dir, kdir, .{
+    h.* = .{ .gpa = gpa, .hooks = null, .vision = v, .inner = try N.open(gpa, io, ctx, dir, kdir, .{
         .context = o.context,
         .drafts = o.drafts,
         .parallel = o.parallel,
@@ -113,6 +132,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .master_port = o.master_port,
         .kv_dtype = if (o.kv8) .fp8 else .bf16,
         .vision = o.vision_helper,
+        .media_hook = if (v) |x| .{ .ptr = x, .make = makeMedia, .free = freeMedia } else null,
     }) };
     h.hooks = h.inner.cache;
     return .{
@@ -124,6 +144,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .deinit = release,
         .target = h,
         .follow = if (h.inner.follow != null) followFn else null,
+        .vision = v,
     };
 }
 
@@ -154,7 +175,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoPromptCache => "this rank keeps no prompt states",
         error.BadDepth => "TF_FLASHNEXT_DEPTH is a draft count from 1 to the engine's maximum",
         error.UnsupportedTp => "this Flash Next engine serves --tp 1 or 2",
-        else => null,
+        error.VisionOneRank => "--vision with TENSORFOLD_FLASHNEXT_ENGINE=mia serves one rank; use --vision-helper",
+        error.NoImageTower => "image rows need --vision (TENSORFOLD_VISION_TOWER_DIR) or --vision-helper",
+        else => tower.Vision.explain(err),
     };
 }
 
