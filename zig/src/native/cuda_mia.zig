@@ -29,6 +29,8 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = N.prompt_rows;
 /// A kept state depends on its tokens alone (a resume absorbs the next prompt token into the MTP head).
 pub const snap_lookahead: u32 = N.cache_rules.lookahead;
+/// The engine takes --vision-helper's image and video rows (Request.media).
+pub const takes_media = N.media;
 
 /// The serve options this engine takes: upstream's (context, drafts, segments, slide, the two-rank link, --kv-cache
 /// fp8 as kv8) and ours that family_options.zig forwards by name (parallel, prompt_cache_gib, vision_helper).

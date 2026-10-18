@@ -9,14 +9,14 @@ const Cx = errors.Cx;
 
 const roles = [_][]const u8{ "system", "developer", "user", "assistant", "tool" };
 
-fn isRole(role: ?Value) bool {
+pub fn isRole(role: ?Value) bool {
     const r = role orelse return false;
     if (r != .string) return false;
     for (roles) |name| if (std.mem.eql(u8, name, r.string)) return true;
     return false;
 }
 
-fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*json.Object {
+pub fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*json.Object {
     const copy = try json.copyObject(cx.a, o);
     try copy.put(cx.a, key, value);
     return copy;
