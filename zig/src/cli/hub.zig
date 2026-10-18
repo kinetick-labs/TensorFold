@@ -140,14 +140,6 @@ pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
     var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-<<<<<<< HEAD
-    const q = parsed.value.object.get("quantization") orelse return null;
-    if (q != .object) return null;
-    const bits = if (q.object.get("bits")) |b| (if (b == .integer) b.integer else return null) else return null;
-    const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else return null) else 32;
-    if (bits <= 0 or group <= 0) return null;
-    return .{ .bits = @intCast(bits), .group = @intCast(group) };
-=======
     const root = parsed.value.object;
     // ExLlamaV3: `quantization_config` (or `quantization`) carrying quant_method "exl3".
     for ([_]?std.json.Value{ root.get("quantization_config"), root.get("quantization") }) |block| {
@@ -171,7 +163,8 @@ pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
     if (root.get("quantization")) |q| {
         if (q != .object) return null;
         const bits = if (q.object.get("bits")) |b| (if (b == .integer) b.integer else return null) else return null;
-        const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else 32) else 32;
+        const group = if (q.object.get("group_size")) |g| (if (g == .integer) g.integer else return null) else 32;
+        if (bits <= 0 or group <= 0) return null;
         return .{ .affine = .{ .bits = @intCast(bits), .group = @intCast(group) } };
     }
     return null;
@@ -180,7 +173,16 @@ pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
 fn intOrNull(v: ?std.json.Value) ?i64 {
     const x = v orelse return null;
     return if (x == .integer) x.integer else null;
->>>>>>> bd37cf837 (feat(zig exl3): read the EXL3 quantization header and derive per-tensor bits)
+}
+
+
+/// MLX-affine bits/group only (null for EXL3 or unquantized). Kept for older callers and the negative-metadata test.
+pub fn quantization(a: Allocator, io: std.Io, dir: []const u8) ?struct { bits: u64, group: u64 } {
+    const f = format(a, io, dir) orelse return null;
+    return switch (f) {
+        .affine => |q| q,
+        .exl3 => null,
+    };
 }
 
 /// Bytes of the files under `dir`, symlinks followed, hidden ones left out (a download's .cache, --slide's snapshot).
