@@ -21,3 +21,4 @@ zig-out/
 
 # Versioned GUI build resources, generated app engines stay ignored in app/.gitignore.
 !app/build/
+.tf-pull-*
