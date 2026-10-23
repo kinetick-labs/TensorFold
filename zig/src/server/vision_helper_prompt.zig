@@ -31,7 +31,7 @@ pub fn prepare(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking
         error.Template => return cx.fail(.request, "the chat template rejected the request: {s}", .{problem}),
     };
     const window = srv.info.context_window;
-    const result = helper.prepare(cx.a, text, sources.items, if (window > 0) window else null) catch |e| switch (e) {
+    const result = helper.prepare(cx.a, text.text, sources.items, if (window > 0) window else null) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return cx.fail(.capacity, "image processing failed ({s}); retry shortly", .{@errorName(e)}),
     };
