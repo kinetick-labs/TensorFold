@@ -140,6 +140,7 @@ pub const Spec = struct {
     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
+    media: ?*const Media = null, // helper/tower rows for a media engine; such a prompt is neither kept nor resumed
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
 };
 
@@ -214,6 +215,7 @@ pub const Stream = struct {
     decide: ?u32 = null,
     untaught: bool = false,
     images: []const Image = &.{},
+    media: ?*const Media = null,
     key: []const u32 = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
@@ -294,6 +296,7 @@ pub const Stream = struct {
             .grammar = spec.grammar,
             .decode_spans = spec.decode_spans,
             .images = spec.images,
+            .media = spec.media,
             .key = spec.key,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
@@ -585,3 +588,19 @@ test "answer_max limits the reply after the think block, not the reasoning" {
     try std.testing.expectEqual(@as(usize, 4), try long.commit(gpa, &.{ 5, 6, 7, 8, 9 }, &.{}));
     try std.testing.expectEqual(Reason.length, long.reason);
 }
+
+test "media rows, positions and features must cover the prompt" {
+    const feats: [16]u8 = @splat(0);
+    const pos: [15]i32 = @splat(0);
+    var m: Media = .{ .rows = &.{ 1, 2 }, .positions = &pos, .delta = -1, .features = &feats, .width = 4 };
+    try m.check(5);
+    try std.testing.expectError(error.BadMedia, m.check(4)); // positions of another prompt
+    m.rows = &.{ 2, 1 };
+    try std.testing.expectError(error.BadMedia, m.check(5)); // rows out of order
+    m.rows = &.{ 1, 2 };
+    m.features = &.{}; // a following rank: no features (they arrive by broadcast)
+    try m.check(5);
+    m.features = feats[0..8];
+    try std.testing.expectError(error.BadMedia, m.check(5));
+}
+
