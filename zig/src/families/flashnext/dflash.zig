@@ -14,6 +14,8 @@ pub const Config = config.Config;
 
 const DeviceBuffer = cuda.DeviceBuffer;
 const Affine4 = cuda.qlinear.Affine4;
+const fp8 = @import("cuda_fp8.zig");
+pub const Lin = weights.Lin;
 
 /// Rows an absorb runs at once (a prompt chunk's taps in pieces).
 const max_rows = 128;
@@ -46,6 +48,9 @@ pub const Engine = struct {
     fns: struct { sums: cuda.Function, norm: cuda.Function, mlp_act: cuda.Function },
     embedder: Embedder,
     hidden: usize,
+    /// the target engine's MXFP8 lane matmul (TF_FLASHNEXT_DFLASH_MX: the drafter's projections in MXFP8)
+    k8: ?*const fp8.Kernels = null,
+    mx: bool = false,
     head: Affine4 = undefined,
     head_arena: ?DeviceBuffer = null,
     q35: cuda.Module = undefined,
@@ -212,7 +217,7 @@ pub const Draft = struct {
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen35_draft);
         errdefer d.mod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
-        d.w = try weights.load(gpa, io, e, dir, .{ .hidden = c.hidden, .intermediate = c.intermediate, .layers = c.layers, .vocab = c.vocab, .q_width = c.qWidth(), .kv_width = c.kvWidth(), .head_dim = c.head_dim, .dynamic = c.dynamic(), .rank = c.rank, .taps = c.n_taps });
+        d.w = try weights.load(gpa, io, e, dir, .{ .hidden = c.hidden, .intermediate = c.intermediate, .layers = c.layers, .vocab = c.vocab, .q_width = c.qWidth(), .kv_width = c.kvWidth(), .head_dim = c.head_dim, .dynamic = c.dynamic(), .rank = c.rank, .taps = c.n_taps }, e.mx);
         errdefer d.w.deinit(gpa);
         d.scratch = try DeviceBuffer.alloc(e.d, try d.layout(false));
         errdefer d.scratch.free();
@@ -330,28 +335,44 @@ pub const Draft = struct {
         return d.ringK(ctx, layer) + d.c.ringRows() * d.c.kvWidth() * 2;
     }
 
-    pub fn proj(d: *Draft, l: Affine4, x: u64, out: u64, rows: usize) !void {
+    pub fn proj(d: *Draft, l: anytype, x: u64, out: u64, rows: usize) !void {
         return d.projSums(l, x, out, rows, true);
     }
 
-    pub fn projAgain(d: *Draft, l: Affine4, x: u64, out: u64, rows: usize) !void {
+    pub fn projAgain(d: *Draft, l: anytype, x: u64, out: u64, rows: usize) !void {
         return d.projSums(l, x, out, rows, false);
     }
 
-    pub fn projMany(d: *Draft, ls: []const Affine4, x: u64, outs: []const u64, rows: usize) !void {
+    pub fn projMany(d: *Draft, ls: []const Lin, x: u64, outs: []const u64, rows: usize) !void {
         const e = d.e;
-        if (rows > 16 or ls.len > cuda.qlinear.Affine4Kernels.segs_max) {
+        var any_mx = false;
+        for (ls) |l| any_mx = any_mx or l.mx != null;
+        if (any_mx or rows > 16 or ls.len > cuda.qlinear.Affine4Kernels.segs_max) {
             for (ls, outs, 0..) |l, out, i| try d.projSums(l, x, out, rows, i == 0);
             return;
         }
-        try e.run(e.fns.sums, .{ rows, (ls[0].k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(ls[0].k)), @as(u64, 0) });
+        try e.run(e.fns.sums, .{ rows, (ls[0].a.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(ls[0].a.k)), @as(u64, 0) });
         var many: [cuda.qlinear.Affine4Kernels.segs_max]cuda.qlinear.Affine4Kernels.Out = undefined;
-        for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l, .out = out };
+        for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a, .out = out };
         try e.affine.decodeMany(e.stream, x, d.xs, many[0..ls.len], rows);
     }
 
+    /// A projection (a Lin or a bare Affine4): MXFP8 on the engine's lane matmul (the 64-group sums still taken when
+    /// asked, for affine-4 projections after it on the same rows), else qwen3_5's affine path.
+    pub fn projSums(d: *Draft, l: anytype, x: u64, out: u64, rows: usize, sums: bool) !void {
+        if (@TypeOf(l) == Lin) {
+            if (l.mx) |m| {
+                const e = d.e;
+                if (sums) try e.run(e.fns.sums, .{ rows, (l.a.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.a.k)), @as(u64, 0) });
+                return fp8.matmul(e.k8 orelse return error.NoFp8Kernels, e.stream, x, l.a.k, m, out, false, rows);
+            }
+            return d.projAffine(l.a, x, out, rows, sums);
+        }
+        return d.projAffine(l, x, out, rows, sums);
+    }
+
     /// qwen3_5's cuda_draft_precision.affine: a prompt's rows past 16 on the prompt GEMM, else the verify tiles.
-    pub fn projSums(d: *Draft, l: Affine4, x: u64, out: u64, rows: usize, sums: bool) !void {
+    fn projAffine(d: *Draft, l: Affine4, x: u64, out: u64, rows: usize, sums: bool) !void {
         const e = d.e;
         if (d.projection_role == .prompt and rows > 16) return e.affine.prompt(e.stream, x, l, out, rows);
         if (sums) try e.run(e.fns.sums, .{ rows, (l.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.k)), @as(u64, 0) });
