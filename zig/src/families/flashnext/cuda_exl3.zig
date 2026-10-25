@@ -1022,7 +1022,7 @@ pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64
             a.add(int(maxm));
             a.add(int(slots));
             const items_max = @min((p + 63) / 64 + experts, 1 << 16);
-            for (k2s) |k2| {   // the pack's widths only (an empty program per expert of another width)
+            for (k2s) |k2| { // the pack's widths only (an empty program per expert of another width)
                 if (k2 < lo or k2 > hi) continue;
                 try cuda.launch.launch(k.prompt[k2].?, .{ .grid = .{ .x = @intCast(n / 64), .y = @intCast(items_max), .z = @intCast(mats) }, .block = .{ .x = 128 } }, s, &a);
             }
