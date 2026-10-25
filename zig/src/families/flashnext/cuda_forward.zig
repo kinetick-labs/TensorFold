@@ -127,6 +127,8 @@ pub const Seq = struct {
     hy_rate: [2]f64 = .{ 0, 0 },
     hy_n: [2]u64 = .{ 0, 0 },
     hy_rounds: u64 = 0,
+    /// the drafter of the round before hy_last's (a sample counts only when both match: a switch round pays catch-up)
+    hy_prev: u8 = 0,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
