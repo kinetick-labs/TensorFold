@@ -833,6 +833,94 @@ pub fn gmShapeOk(kk: usize, n: usize, sk: usize, shipped_w: usize) bool {
     return (per_split / gm_subw) % gm_ks == 0;
 }
 
+/// The decode cp.async arm: picks up to this many on the (8, 4, 1) tile take grouped_async (the same tile, the same
+/// k walk and fold, the trellis words through a 4-deep shared ring). TF_FLASHNEXT_X3_ASYNC=0: off.
+pub const async_max_picks = 64;
+pub const arm_stages = [4]usize{ 4, 0, 2, 3 };
+/// TF_FLASHNEXT_X3_ARM: the decode arm (0-3, arm_stages); default 3 (cp.async ring 3 deep + 8-row fold)
+fn armIndex() usize {
+    const st = struct {
+        var v: usize = 3;
+        var read: bool = false;
+    };
+    if (!st.read) {
+        if (std.c.getenv("TF_FLASHNEXT_X3_ARM")) |x| st.v = @min(3, std.fmt.parseInt(usize, std.mem.span(x), 10) catch 3);
+        st.read = true;
+    }
+    return st.v;
+}
+/// ring bytes: stages x 4 warps x 8 tiles x the widest k2's 4 * k2 words
+pub fn asyncSmem(stages: usize, hi: u32) usize {
+    return stages * 4 * 8 * 4 * @as(usize, hi) * 4;
+}
+const async_smem_max = asyncSmem(4, 16);
+fn asyncOn() bool {
+    const st = struct {
+        var on: bool = true;
+        var read: bool = false;
+    };
+    if (!st.read) {
+        if (std.c.getenv("TF_FLASHNEXT_X3_ASYNC")) |v| st.on = !std.mem.eql(u8, std.mem.span(v), "0");
+        st.read = true;
+    }
+    return st.on;
+}
+
+/// Whether the prompt arm runs (TF_FLASHNEXT_X3_PROMPT, on by default; 0 turns it off).
+pub fn promptOn() bool {
+    const v: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_X3_PROMPT")) |e| std.mem.span(e) else null;
+    return if (v == null) true else wideFlag(v);
+}
+
+/// The grouped expert GEMM; returns the splits its Z holds for the epilogue: 1 when the prompt arm summed them in the
+/// kernel (the same order: sub-ranges of the gm arm, splits from 0.f), else `sk`.
+pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !usize {
+    const t = tile_settings[setting];
+    const lo = ranges[range].lo;
+    const hi = ranges[range].hi;
+    const kt = kk / 16;
+    const shape = sk > 0 and kt % sk == 0 and (kt / sk) % 4 == 0 and n % 64 == 0 and t.w == gm_subw;
+    if (p >= gm_min_picks and promptOn() and shape) {
+        var have = true;
+        for (k2s) |k2| {
+            if (k2 >= lo and k2 <= hi and k.prompt[k2] == null) have = false;
+        }
+        if (k.prompt_items == null or experts > 1024) have = false;
+        if (have) {
+            var ia: cuda.Args = .{};
+            ia.add(ucount);
+            ia.add(members);
+            ia.add(int(maxm));
+            try cuda.launch.launch(k.prompt_items.?, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, s, &ia);
+            var a: cuda.Args = .{};
+            a.add(x0);
+            a.add(x1);
+            a.add(tp0);
+            a.add(tp1);
+            a.add(k2_0);
+            a.add(k2_1);
+            a.add(uids);
+            a.add(ucount);
+            a.add(members);
+            a.add(z);
+            a.add(int(kk));
+            a.add(int(n));
+            a.add(int(p));
+            a.add(int(sk));
+            a.add(int(maxm));
+            a.add(int(slots));
+            const items_max = @min((p + 63) / 64 + experts, 1 << 16);
+            for (k2s) |k2| { // the pack's widths only (an empty program per expert of another width)
+                if (k2 < lo or k2 > hi) continue;
+                try cuda.launch.launch(k.prompt[k2].?, .{ .grid = .{ .x = @intCast(n / 64), .y = @intCast(items_max), .z = @intCast(mats) }, .block = .{ .x = 128 } }, s, &a);
+            }
+            return 1;
+        }
+    }
+    try groupedLaunch(k, setting, range, x0, x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, kk, n, p, sk, maxm, slots, experts, mats, s);
+    return sk;
+}
+
 /// The grouped expert GEMM: 16 members a program, or 32 in the wide arm (tf_exl3x, opt-in and off by default).
 pub fn grouped(k: *const Kernels, setting: usize, range: usize, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, uids: u64, ucount: u64, members: u64, z: u64, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, slots: usize, experts: usize, mats: usize, s: cuda.Stream) !void {
     const t = tile_settings[setting];
