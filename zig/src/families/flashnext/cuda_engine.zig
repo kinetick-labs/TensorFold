@@ -377,6 +377,17 @@ pub const Engine = struct {
     df_e: ?*dflash.Engine = null,
     df_rounds: u64 = 0,
     df_drafted: u64 = 0,
+    /// verify windows of drafted streams and the rows they kept (the pending token and its accepted drafts)
+    df_windows: u64 = 0,
+    df_kept: u64 = 0,
+    /// TF_FLASHNEXT_DFLASH_DRAFTS: drafts a round at most (default block - 1); TF_FLASHNEXT_DFLASH_CUT: a later
+    /// draft only while the drafter's running product of chances is at least this (0: the whole chain);
+    /// TF_FLASHNEXT_DFLASH_TUNE=<file>: "drafts cut" reread every 64 rounds (tests); TF_FLASHNEXT_DFLASH_STATS=N:
+    /// a stats line every N rounds
+    df_max: usize = 0,
+    df_cut: f64 = 0,
+    df_tune: ?[]const u8 = null,
+    df_stats: u64 = 0,
     seq_pool_max: usize = 0,
     pool_reused: u64 = 0,
     /// TF_FLASHNEXT_GRAPH_LOG: wall seconds of solo windows that captured (eager run + capture + instantiate)
@@ -705,13 +716,18 @@ pub const Engine = struct {
         e.df = df;
         e.df_e = de;
         e.f.taps = df.taps();
+        e.df_max = df.c.block - 1;
+        if (envGet("TF_FLASHNEXT_DFLASH_DRAFTS")) |v| e.df_max = @min(df.c.block - 1, @max(1, std.fmt.parseInt(usize, v, 10) catch return error.BadDflashDrafts));
+        if (envGet("TF_FLASHNEXT_DFLASH_CUT")) |v| e.df_cut = std.fmt.parseFloat(f64, v) catch return error.BadDflashCut;
+        e.df_tune = envGet("TF_FLASHNEXT_DFLASH_TUNE");
+        if (envGet("TF_FLASHNEXT_DFLASH_STATS")) |v| e.df_stats = std.fmt.parseInt(u64, v, 10) catch 0;
         e.f.tap_rows = df.c.window + state.max_rows + dflash_margin;
         std.log.info("dflash2 drafts in place of the MTP head: taps {any} (stream mean), {d} tap rows a sequence ({d:.1} MB), up to {d} drafts a round", .{ df.taps(), e.f.tap_rows, @as(f64, @floatFromInt(e.tapBytes())) / 1e6, df.c.block - 1 });
     }
 
     fn dropDflash(e: *Engine) void {
         if (e.df) |df| {
-            if (e.df_rounds > 0) std.log.info("dflash2: {d} rounds, {d} drafts ({d:.2} a round)", .{ e.df_rounds, e.df_drafted, @as(f64, @floatFromInt(e.df_drafted)) / @as(f64, @floatFromInt(e.df_rounds)) });
+            if (e.df_rounds > 0) e.dflashStats();
             df.deinit();
         }
         if (e.df_e) |de| {
@@ -751,7 +767,7 @@ pub const Engine = struct {
         for (reqs, 0..) |*r, i| {
             r.drafted = 0;
             r.seq.spec_n = 0;
-            const room = @min(r.count, r.out.len, df.c.block - 1);
+            const room = @min(r.count, r.out.len, e.df_max);
             if (room == 0 or r.next.len == 0) continue;
             const seq = r.seq;
             const ring = seq.taps orelse return error.NoTapRing;
@@ -787,7 +803,17 @@ pub const Engine = struct {
             for (k..k + m) |j| {
                 const r = &reqs[at[j]];
                 const c = ctxs[j];
-                const got = @min(c.held_n, items[j].depth);
+                var got = @min(c.held_n, items[j].depth);
+                if (e.df_cut > 0) {
+                    var prod: f64 = 1;
+                    for (1..got) |q| {
+                        prod *= c.probs[q - 1];
+                        if (prod * c.probs[q] < e.df_cut) {
+                            got = @intCast(q);
+                            break;
+                        }
+                    }
+                }
                 @memcpy(r.out[0..got], c.held[0..got]);
                 r.drafted = got;
                 e.df_drafted += got;
@@ -795,6 +821,36 @@ pub const Engine = struct {
             k += m;
         }
         e.df_rounds += 1;
+        if (e.df_tune) |path| if (e.df_rounds % 64 == 0) e.retune(path);
+        if (e.df_stats > 0 and e.df_rounds % e.df_stats == 0) e.dflashStats();
+    }
+
+    fn dflashStats(e: *Engine) void {
+        const w: f64 = @floatFromInt(@max(e.df_windows, 1));
+        std.log.info("dflash2 stats: {d} rounds, {d:.2} drafts a round, {d} windows keep {d:.3} rows (accept length), drafts<={d} cut {d:.2}", .{ e.df_rounds, @as(f64, @floatFromInt(e.df_drafted)) / @as(f64, @floatFromInt(@max(e.df_rounds, 1))), e.df_windows, @as(f64, @floatFromInt(e.df_kept)) / w, e.df_max, e.df_cut });
+    }
+
+    /// The tune file's "drafts cut" (a bad or missing file keeps the current ones); the counters restart on a change.
+    fn retune(e: *Engine, path: []const u8) void {
+        var buf: [64]u8 = undefined;
+        const text = std.Io.Dir.cwd().readFile(e.io, path, &buf) catch return;
+        var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        const a = std.fmt.parseInt(usize, it.next() orelse return, 10) catch return;
+        const b = std.fmt.parseFloat(f64, it.next() orelse "0") catch return;
+        const m = @min(e.dfMaxCap(), @max(1, a));
+        if (m == e.df_max and b == e.df_cut) return;
+        e.dflashStats();
+        e.df_max = m;
+        e.df_cut = b;
+        e.df_rounds = 0;
+        e.df_drafted = 0;
+        e.df_windows = 0;
+        e.df_kept = 0;
+        std.log.info("dflash2 tune: drafts<={d} cut {d:.2}", .{ m, b });
+    }
+
+    fn dfMaxCap(e: *const Engine) usize {
+        return if (e.df) |df| df.c.block - 1 else 1;
     }
 
     /// The prompt buffers' DeltaNet taps: row r reads [conv state (3) | rows] at r .. r + 3, stream 0 (Python
@@ -1803,6 +1859,10 @@ pub const Engine = struct {
         if (i >= e.round_n) return error.NoSuchWindow;
         const sg = e.round_segs[i];
         try e.f.commitAt(sg.seq, &e.buf, sg.a1 - sg.a0, keep, sg.a0);
+        if (e.df != null and sg.a1 - sg.a0 > 1) {
+            e.df_windows += 1;
+            e.df_kept += keep;
+        }
     }
 
     /// Where a stream's absorb reads the main model's final streams: its prompt's last row, or its window's
