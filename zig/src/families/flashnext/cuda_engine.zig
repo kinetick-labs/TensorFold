@@ -108,6 +108,8 @@ pub const Seq = fwd.Seq;
 /// and the attention context bucket (Python Graphs.main / Graphs.mtp keys).
 /// `media`: the sequence's image/video attachment (SeqMedia.epoch; 0: text): an image sequence's launches bake in its
 /// rotary table and prompt length, so its graphs are its own.
+pub const Drafter = enum { dflash, hybrid, hybrid_conc };
+
 const GraphKey = struct { seq: usize, version: u32, mtp: bool, rows: u32, parity: u32, ctx: usize, media: u64 = 0, screen: bool = false };
 
 /// A shared round's (or shared MTP step's) graph and the sequences whose buffers it bakes in.
@@ -386,6 +388,17 @@ pub const Engine = struct {
     /// a stats line every N rounds
     df_max: usize = 0,
     df_cut: f64 = 0,
+    /// TF_FLASHNEXT_DFLASH_CUT_WIDE: rounds of several drafting streams keep a later draft only at or above this
+    /// chance of its own (MTP's wide per-draft rule; 0: the single-stream cut)
+    df_cut_wide: f64 = 0,
+    /// TF_FLASHNEXT_DRAFTER (with TF_FLASHNEXT_DFLASH): dflash (default), hybrid (each stream's drafter by its
+    /// measured rate, the other probed now and then), hybrid-conc (DFlash2 while one stream drafts, MTP above).
+    /// The MTP head absorbs every round in both hybrids so either drafter can take any round.
+    drafter: Drafter = .dflash,
+    /// hybrid: probe the other drafter every this many rounds; switch only past this margin
+    hy_probe: u64 = 24,
+    hy_margin: f64 = 0.05,
+    hy_counts: [2]u64 = .{ 0, 0 },
     df_tune: ?[]const u8 = null,
     df_stats: u64 = 0,
     seq_pool_max: usize = 0,
@@ -692,6 +705,13 @@ pub const Engine = struct {
         e.f.budget = &e.budget;
         e.budget.floor = @intFromFloat(@min(reserve_gib, 10) * (1 << 30));
         std.log.info("sequence memory: {d:.2} GiB ({d:.2} GiB free, {d:.1} GiB kept free); {s} KV cache, {d} bytes a position a layer", .{ @as(f64, @floatFromInt(e.budget.limit)) / (1 << 30), @as(f64, @floatFromInt(free)) / (1 << 30), reserve_gib, @tagName(e.g.kv), e.g.kRow() + e.g.vRow() });
+        if (envGet("TF_FLASHNEXT_DRAFTER")) |v| {
+            if (std.mem.eql(u8, v, "hybrid")) e.drafter = .hybrid else if (std.mem.eql(u8, v, "hybrid-conc")) e.drafter = .hybrid_conc else if (!std.mem.eql(u8, v, "dflash")) return error.BadDrafter;
+            if (e.drafter != .dflash and e.w.mtp == null) return error.HybridNeedsMtpHead;
+        }
+        if (envGet("TF_FLASHNEXT_HYBRID_PROBE")) |v| e.hy_probe = @max(2, std.fmt.parseInt(u64, v, 10) catch return error.BadDrafter);
+        if (envGet("TF_FLASHNEXT_HYBRID_MARGIN")) |v| e.hy_margin = std.fmt.parseFloat(f64, v) catch return error.BadDrafter;
+        if (envGet("TF_FLASHNEXT_DFLASH_STATS")) |v| e.df_stats = std.fmt.parseInt(u64, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_DFLASH")) |ddir| try e.loadDflash(ddir, dir, o);
         errdefer e.dropDflash();
         e.own = try e.newSeq(e.max_len);
@@ -712,6 +732,10 @@ pub const Engine = struct {
         errdefer e.gpa.destroy(de);
         de.* = try dflash.Engine.init(e.ctx.d, e.stream, .{ .ctx = e, .f = dflashEmbed }, e.g.hidden);
         errdefer de.deinit();
+        if (envGet("TF_FLASHNEXT_DFLASH_MX")) |v| if (std.mem.eql(u8, v, "1")) {
+            de.k8 = if (e.k8) |*k| k else return error.NoFp8Kernels;
+            de.mx = true;
+        };
         const df = try dflash.Draft.init(e.gpa, e.io, de, ddir, target_dir, .{ .hidden = e.g.hidden, .vocab = e.c.vocab, .layers = e.w.layers.len }, o.streams);
         e.df = df;
         e.df_e = de;
@@ -719,10 +743,11 @@ pub const Engine = struct {
         e.df_max = df.c.block - 1;
         if (envGet("TF_FLASHNEXT_DFLASH_DRAFTS")) |v| e.df_max = @min(df.c.block - 1, @max(1, std.fmt.parseInt(usize, v, 10) catch return error.BadDflashDrafts));
         if (envGet("TF_FLASHNEXT_DFLASH_CUT")) |v| e.df_cut = std.fmt.parseFloat(f64, v) catch return error.BadDflashCut;
+        if (envGet("TF_FLASHNEXT_DFLASH_CUT_WIDE")) |v| e.df_cut_wide = std.fmt.parseFloat(f64, v) catch return error.BadDflashCut;
         e.df_tune = envGet("TF_FLASHNEXT_DFLASH_TUNE");
         if (envGet("TF_FLASHNEXT_DFLASH_STATS")) |v| e.df_stats = std.fmt.parseInt(u64, v, 10) catch 0;
         e.f.tap_rows = df.c.window + state.max_rows + dflash_margin;
-        std.log.info("dflash2 drafts in place of the MTP head: taps {any} (stream mean), {d} tap rows a sequence ({d:.1} MB), up to {d} drafts a round", .{ df.taps(), e.f.tap_rows, @as(f64, @floatFromInt(e.tapBytes())) / 1e6, df.c.block - 1 });
+        std.log.info("dflash2 drafts in place of the MTP head: taps {any} (stream mean), {d} tap rows a sequence ({d:.1} MB), up to {d} drafts a round, projections {s} ({d:.1} MB MXFP8)", .{ df.taps(), e.f.tap_rows, @as(f64, @floatFromInt(e.tapBytes())) / 1e6, df.c.block - 1, if (de.mx) "MXFP8" else "affine-4", @as(f64, @floatFromInt(df.w.mx_bytes)) / 1e6 });
     }
 
     fn dropDflash(e: *Engine) void {
@@ -804,7 +829,12 @@ pub const Engine = struct {
                 const r = &reqs[at[j]];
                 const c = ctxs[j];
                 var got = @min(c.held_n, items[j].depth);
-                if (e.df_cut > 0) {
+                if (n > 1 and e.df_cut_wide > 0) {
+                    for (1..got) |q| if (c.probs[q] < e.df_cut_wide) {
+                        got = @intCast(q);
+                        break;
+                    };
+                } else if (e.df_cut > 0) {
                     var prod: f64 = 1;
                     for (1..got) |q| {
                         prod *= c.probs[q - 1];
@@ -827,7 +857,7 @@ pub const Engine = struct {
 
     fn dflashStats(e: *Engine) void {
         const w: f64 = @floatFromInt(@max(e.df_windows, 1));
-        std.log.info("dflash2 stats: {d} rounds, {d:.2} drafts a round, {d} windows keep {d:.3} rows (accept length), drafts<={d} cut {d:.2}", .{ e.df_rounds, @as(f64, @floatFromInt(e.df_drafted)) / @as(f64, @floatFromInt(@max(e.df_rounds, 1))), e.df_windows, @as(f64, @floatFromInt(e.df_kept)) / w, e.df_max, e.df_cut });
+        std.log.info("dflash2 stats: {d} rounds, {d:.2} drafts a round, {d} windows keep {d:.3} rows (accept length), drafts<={d} cut {d:.2} wide {d:.2}", .{ e.df_rounds, @as(f64, @floatFromInt(e.df_drafted)) / @as(f64, @floatFromInt(@max(e.df_rounds, 1))), e.df_windows, @as(f64, @floatFromInt(e.df_kept)) / w, e.df_max, e.df_cut, e.df_cut_wide });
     }
 
     /// The tune file's "drafts cut" (a bad or missing file keeps the current ones); the counters restart on a change.
@@ -837,16 +867,18 @@ pub const Engine = struct {
         var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
         const a = std.fmt.parseInt(usize, it.next() orelse return, 10) catch return;
         const b = std.fmt.parseFloat(f64, it.next() orelse "0") catch return;
+        const bw = std.fmt.parseFloat(f64, it.next() orelse "0") catch return;
         const m = @min(e.dfMaxCap(), @max(1, a));
-        if (m == e.df_max and b == e.df_cut) return;
+        if (m == e.df_max and b == e.df_cut and bw == e.df_cut_wide) return;
         e.dflashStats();
         e.df_max = m;
         e.df_cut = b;
+        e.df_cut_wide = bw;
         e.df_rounds = 0;
         e.df_drafted = 0;
         e.df_windows = 0;
         e.df_kept = 0;
-        std.log.info("dflash2 tune: drafts<={d} cut {d:.2}", .{ m, b });
+        std.log.info("dflash2 tune: drafts<={d} cut {d:.2} wide {d:.2}", .{ m, b, bw });
     }
 
     fn dfMaxCap(e: *const Engine) usize {
@@ -944,8 +976,8 @@ pub const Engine = struct {
         s.last_streams = try cuda.DeviceBuffer.alloc(e.ctx.d, e.g.wide() * 2);
         if (e.df != null) {
             s.taps = try cuda.DeviceBuffer.alloc(e.ctx.d, e.tapBytes());
-            s.charged += e.tapBytes() + e.df.?.streamBytes();
-            e.budget.used += e.tapBytes() + e.df.?.streamBytes();
+            s.charged += e.tapBytes();
+            e.budget.used += e.tapBytes();
         }
         try e.f.reset(s);
         return s;
@@ -1859,9 +1891,11 @@ pub const Engine = struct {
         if (i >= e.round_n) return error.NoSuchWindow;
         const sg = e.round_segs[i];
         try e.f.commitAt(sg.seq, &e.buf, sg.a1 - sg.a0, keep, sg.a0);
-        if (e.df != null and sg.a1 - sg.a0 > 1) {
+        if (sg.a1 - sg.a0 > 1) {
             e.df_windows += 1;
             e.df_kept += keep;
+            if (e.df == null and e.df_stats > 0 and e.df_windows % e.df_stats == 0)
+                std.log.info("mtp stats: {d} windows keep {d:.3} rows (accept length)", .{ e.df_windows, @as(f64, @floatFromInt(e.df_kept)) / @as(f64, @floatFromInt(e.df_windows)) });
         }
     }
 
@@ -1886,7 +1920,72 @@ pub const Engine = struct {
     /// streams still drafting (the first draft always kept, a later one only at or above the confidence), each
     /// draw with its stream's rule at its own position. Each stream's drafts equal its solo chain's.
     pub fn draftMany(e: *Engine, reqs: []DraftReq) !void {
-        if (e.df) |df| return e.draftDflash(df, reqs);
+        if (e.df) |df| {
+            if (e.drafter == .dflash) return e.draftDflash(df, reqs);
+            return e.draftHybrid(df, reqs);
+        }
+        return e.draftMtp(reqs);
+    }
+
+    /// Both drafters: each stream's choice this round (its last round's rate sample taken first), then the MTP
+    /// head's step over every stream (it absorbs the kept rows; streams on DFlash2 ask it no drafts), then DFlash2's
+    /// round for the streams on it. A stream's drafts change only speed: the verify keeps the target's tokens.
+    fn draftHybrid(e: *Engine, df: *dflash.Draft, reqs: []DraftReq) !void {
+        if (reqs.len > 64) return error.TooManyStreams;
+        const now = std.Io.Clock.awake.now(e.io);
+        var use_df: [64]bool = undefined;
+        var counts: [64]usize = undefined;
+        for (reqs, 0..) |*r, i| {
+            const s = r.seq;
+            // the last round's sample: tokens committed since it drafted, over the wall time since
+            if (s.hy_last != 0 and s.st.pos > s.hy_pos) {
+                const dt = @as(f64, @floatFromInt(s.hy_t.durationTo(now).toNanoseconds())) / 1e9;
+                if (dt > 0 and dt < 1.0) {
+                    const k = s.hy_last - 1;
+                    const rate = @as(f64, @floatFromInt(s.st.pos - s.hy_pos)) / dt;
+                    s.hy_rate[k] = if (s.hy_n[k] == 0) rate else 0.85 * s.hy_rate[k] + 0.15 * rate;
+                    s.hy_n[k] += 1;
+                }
+            }
+            if (s.hy_pos > s.st.pos) s.hy_n = .{ 0, 0 }; // a new prompt in a reused sequence
+            use_df[i] = switch (e.drafter) {
+                .hybrid_conc => reqs.len == 1,
+                else => blk: {
+                    s.hy_rounds += 1;
+                    // each drafter tried a few times first, then the faster one, the other probed now and then
+                    if (s.hy_n[1] < 3) break :blk true;
+                    if (s.hy_n[0] < 3) break :blk false;
+                    const best_df = if (s.hy_last == 2) s.hy_rate[1] * (1 + e.hy_margin) >= s.hy_rate[0] else s.hy_rate[1] > s.hy_rate[0] * (1 + e.hy_margin);
+                    break :blk if (s.hy_rounds % e.hy_probe == 0) !best_df else best_df;
+                },
+            };
+            counts[i] = r.count;
+            if (use_df[i]) r.count = 0;
+            s.hy_last = if (use_df[i]) 2 else 1;
+            s.hy_t = now;
+            s.hy_pos = s.st.pos;
+            e.hy_counts[@intFromBool(use_df[i])] += 1;
+        }
+        try e.draftMtp(reqs);
+        var sub: [64]DraftReq = undefined;
+        var at: [64]usize = undefined;
+        var n: usize = 0;
+        for (reqs, 0..) |*r, i| {
+            if (!use_df[i]) continue;
+            r.count = counts[i];
+            sub[n] = r.*;
+            at[n] = i;
+            n += 1;
+        }
+        if (n > 0) {
+            try e.draftDflash(df, sub[0..n]);
+            for (sub[0..n], at[0..n]) |q, i| reqs[i].drafted = q.drafted;
+        }
+        if (e.df_stats > 0 and (e.hy_counts[0] + e.hy_counts[1]) % e.df_stats == 0)
+            std.log.info("hybrid: stream rounds MTP {d} DFlash2 {d}", .{ e.hy_counts[0], e.hy_counts[1] });
+    }
+
+    fn draftMtp(e: *Engine, reqs: []DraftReq) !void {
         const mb = &(e.mbuf orelse return error.NoMtpHead);
         const d = &(e.draws orelse return error.NoMtpHead);
         if (reqs.len == 0) return;
