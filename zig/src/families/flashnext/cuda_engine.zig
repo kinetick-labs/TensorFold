@@ -391,6 +391,7 @@ pub const Engine = struct {
     /// TF_FLASHNEXT_DFLASH_CUT_WIDE: rounds of several drafting streams keep a later draft only at or above this
     /// chance of its own (MTP's wide per-draft rule; 0: the single-stream cut)
     df_cut_wide: f64 = 0,
+    df_batch: bool = true,
     /// TF_FLASHNEXT_DRAFTER (with TF_FLASHNEXT_DFLASH): dflash (default), hybrid (each stream's drafter by its
     /// measured rate, the other probed now and then), hybrid-conc (DFlash2 while one stream drafts, MTP above).
     /// The MTP head absorbs every round in both hybrids so either drafter can take any round.
@@ -745,6 +746,7 @@ pub const Engine = struct {
         if (envGet("TF_FLASHNEXT_DFLASH_CUT")) |v| e.df_cut = std.fmt.parseFloat(f64, v) catch return error.BadDflashCut;
         if (envGet("TF_FLASHNEXT_DFLASH_CUT_WIDE")) |v| e.df_cut_wide = std.fmt.parseFloat(f64, v) catch return error.BadDflashCut;
         e.df_tune = envGet("TF_FLASHNEXT_DFLASH_TUNE");
+        e.df_batch = !envOff("TF_FLASHNEXT_DFLASH_BATCH_ABSORB");
         if (envGet("TF_FLASHNEXT_DFLASH_STATS")) |v| e.df_stats = std.fmt.parseInt(u64, v, 10) catch 0;
         e.f.tap_rows = df.c.window + state.max_rows + dflash_margin;
         std.log.info("dflash2 drafts in place of the MTP head: taps {any} (stream mean), {d} tap rows a sequence ({d:.1} MB), up to {d} drafts a round, projections {s} ({d:.1} MB MXFP8)", .{ df.taps(), e.f.tap_rows, @as(f64, @floatFromInt(e.tapBytes())) / 1e6, df.c.block - 1, if (de.mx) "MXFP8" else "affine-4", @as(f64, @floatFromInt(df.w.mx_bytes)) / 1e6 });
@@ -787,6 +789,8 @@ pub const Engine = struct {
         var items: [64]dflash.Hold = undefined;
         var ctxs: [64]*dflash.Ctx = undefined;
         var at: [64]usize = undefined;
+        var absorbs: [64]dflash.Draft.Absorb = undefined;
+        var na: usize = 0;
         var n: usize = 0;
         if (reqs.len > items.len) return error.TooManyStreams;
         for (reqs, 0..) |*r, i| {
@@ -810,7 +814,8 @@ pub const Engine = struct {
             if (ctx.begin > ctx.end) ctx.begin = ctx.end;
             const lo = @max(@max(ctx.end, valid), at_pos -| df.c.window);
             if (lo < at_pos) {
-                try df.absorbRing(ctx, ring.ptr, e.f.tap_rows, lo, at_pos - lo);
+                absorbs[na] = .{ .ctx = ctx, .ring = ring.ptr, .start = lo, .n = at_pos - lo };
+                na += 1;
             } else if (ctx.end != at_pos) {
                 // nothing to absorb (a restored prompt's first draft): an empty context at its position
                 ctx.begin = at_pos;
@@ -821,6 +826,8 @@ pub const Engine = struct {
             at[n] = i;
             n += 1;
         }
+        // TF_FLASHNEXT_DFLASH_BATCH_ABSORB=0: each stream's rows absorbed alone (the first port's way)
+        if (e.df_batch) try df.absorbMany(absorbs[0..na], e.f.tap_rows) else for (absorbs[0..na]) |q| try df.absorbRing(q.ctx, q.ring, e.f.tap_rows, q.start, q.n);
         var k: usize = 0;
         while (k < n) {
             const m = @min(n - k, df.frame_streams);
