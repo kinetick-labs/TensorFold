@@ -108,7 +108,7 @@ pub const Seq = fwd.Seq;
 /// and the attention context bucket (Python Graphs.main / Graphs.mtp keys).
 /// `media`: the sequence's image/video attachment (SeqMedia.epoch; 0: text): an image sequence's launches bake in its
 /// rotary table and prompt length, so its graphs are its own.
-pub const Drafter = enum { dflash, hybrid, hybrid_conc };
+pub const Drafter = enum { dflash, hybrid, hybrid_rate, hybrid_conc };
 
 const GraphKey = struct { seq: usize, version: u32, mtp: bool, rows: u32, parity: u32, ctx: usize, media: u64 = 0, screen: bool = false };
 
@@ -402,6 +402,9 @@ pub const Engine = struct {
     /// TF_FLASHNEXT_HYBRID_CONC: the most streams a round at which hybrid still picks DFlash2 (above: MTP)
     hy_conc: usize = 1,
     hy_counts: [2]u64 = .{ 0, 0 },
+    /// hybrid: the other drafter drafts in the shadow every this many rounds (TF_FLASHNEXT_HYBRID_SHADOW)
+    hy_shadow: u64 = 8,
+    hy_shadows: u64 = 0,
     df_tune: ?[]const u8 = null,
     df_stats: u64 = 0,
     seq_pool_max: usize = 0,
@@ -709,11 +712,12 @@ pub const Engine = struct {
         e.budget.floor = @intFromFloat(@min(reserve_gib, 10) * (1 << 30));
         std.log.info("sequence memory: {d:.2} GiB ({d:.2} GiB free, {d:.1} GiB kept free); {s} KV cache, {d} bytes a position a layer", .{ @as(f64, @floatFromInt(e.budget.limit)) / (1 << 30), @as(f64, @floatFromInt(free)) / (1 << 30), reserve_gib, @tagName(e.g.kv), e.g.kRow() + e.g.vRow() });
         if (envGet("TF_FLASHNEXT_DRAFTER")) |v| {
-            if (std.mem.eql(u8, v, "hybrid")) e.drafter = .hybrid else if (std.mem.eql(u8, v, "hybrid-conc")) e.drafter = .hybrid_conc else if (!std.mem.eql(u8, v, "dflash")) return error.BadDrafter;
+            if (std.mem.eql(u8, v, "hybrid")) e.drafter = .hybrid else if (std.mem.eql(u8, v, "hybrid-rate")) e.drafter = .hybrid_rate else if (std.mem.eql(u8, v, "hybrid-conc")) e.drafter = .hybrid_conc else if (!std.mem.eql(u8, v, "dflash")) return error.BadDrafter;
             if (e.drafter != .dflash and e.w.mtp == null) return error.HybridNeedsMtpHead;
         }
         if (envGet("TF_FLASHNEXT_HYBRID_PROBE")) |v| e.hy_probe = @max(2, std.fmt.parseInt(u64, v, 10) catch return error.BadDrafter);
         if (envGet("TF_FLASHNEXT_HYBRID_MARGIN")) |v| e.hy_margin = std.fmt.parseFloat(f64, v) catch return error.BadDrafter;
+        if (envGet("TF_FLASHNEXT_HYBRID_SHADOW")) |v| e.hy_shadow = @max(1, std.fmt.parseInt(u64, v, 10) catch return error.BadDrafter);
         if (envGet("TF_FLASHNEXT_HYBRID_CONC")) |v| e.hy_conc = std.fmt.parseInt(usize, v, 10) catch return error.BadDrafter;
         if (envGet("TF_FLASHNEXT_DFLASH_STATS")) |v| e.df_stats = std.fmt.parseInt(u64, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_DFLASH")) |ddir| try e.loadDflash(ddir, dir, o);
@@ -1932,6 +1936,7 @@ pub const Engine = struct {
     pub fn draftMany(e: *Engine, reqs: []DraftReq) !void {
         if (e.df) |df| {
             if (e.drafter == .dflash) return e.draftDflash(df, reqs);
+            if (e.drafter == .hybrid) return e.draftShadow(df, reqs);
             return e.draftHybrid(df, reqs);
         }
         return e.draftMtp(reqs);
@@ -1984,7 +1989,7 @@ pub const Engine = struct {
             counts[i] = r.count;
             if (use_df[i]) r.count = 0;
             s.hy_prev = s.hy_last;
-            s.hy_last = if (e.drafter == .hybrid and reqs.len > e.hy_conc) 0 else if (use_df[i]) 2 else 1;
+            s.hy_last = if (e.drafter == .hybrid_rate and reqs.len > e.hy_conc) 0 else if (use_df[i]) 2 else 1;
             s.hy_t = now;
             s.hy_pos = s.st.pos;
             e.hy_counts[@intFromBool(use_df[i])] += 1;
@@ -2006,6 +2011,159 @@ pub const Engine = struct {
         }
         if (e.df_stats > 0 and (e.hy_counts[0] + e.hy_counts[1]) % e.df_stats == 0)
             std.log.info("hybrid: stream rounds MTP {d} DFlash2 {d}", .{ e.hy_counts[0], e.hy_counts[1] });
+    }
+
+    /// Score drafter `k`'s drafts on the target's kept tokens: a depth is tried while the drafts before it were
+    /// kept and the target's tokens reach it (a depth past them is censored, no try), kept on a match.
+    fn hyScore(s: *fwd.Seq, k: usize, drafts: []const u32, kept: []const u32) void {
+        for (&s.hy_hit[k], &s.hy_try[k]) |*h, *t| {
+            h.* *= 0.98;
+            t.* *= 0.98;
+        }
+        for (drafts[0..@min(drafts.len, 16)], 0..) |d, j| {
+            if (j >= kept.len) break;
+            s.hy_try[k][j] += 1;
+            if (d != kept[j]) break;
+            s.hy_hit[k][j] += 1;
+        }
+    }
+
+    /// Drafter `k`'s expected kept tokens a round over its time: (1 + the expected kept drafts at its drafts a
+    /// round, a depth kept with its kept/tried odds given the ones before) / its round time.
+    fn hyValue(s: *const fwd.Seq, k: usize) f64 {
+        var e: f64 = 0;
+        var p: f64 = 1;
+        for (0..16) |j| {
+            const w = std.math.clamp(s.hy_dn[k] - @as(f64, @floatFromInt(j)), 0, 1);
+            if (w <= 0) break;
+            p *= (@as(f64, s.hy_hit[k][j]) + 0.5) / (@as(f64, s.hy_try[k][j]) + 1);
+            e += w * p;
+        }
+        return (1 + e) / @max(s.hy_dt[k], 1e-4);
+    }
+
+    /// TF_FLASHNEXT_DRAFTER=hybrid: each stream drafts with the drafter of more expected kept tokens a second. Its
+    /// drafts every round, and the other drafter's drafted in the shadow every hy_shadow rounds (never verified),
+    /// are scored on the tokens the target keeps, so both drafters' odds come from the same text; a round's time
+    /// is its drafter's own (a switch round pays catch-up and is no sample). The switch takes the margin. Past
+    /// hy_conc streams the MTP head drafts every stream. The verify keeps the target's tokens either way.
+    fn draftShadow(e: *Engine, df: *dflash.Draft, reqs: []DraftReq) !void {
+        if (reqs.len > 64) return error.TooManyStreams;
+        const now = std.Io.Clock.awake.now(e.io);
+        var use_df: [64]bool = undefined;
+        var shadow: [64]bool = undefined;
+        var counts: [64]usize = undefined;
+        var outs: [64][]u32 = undefined;
+        const solo = reqs.len <= e.hy_conc;
+        for (reqs, 0..) |*r, i| {
+            const s = r.seq;
+            if (s.hy_pos > s.st.pos or s.hy_last == 0 and s.hy_pos == 0) {
+                // a new prompt in a reused sequence (or a new one): its text's odds start over
+                s.hy_n = .{ 0, 0 };
+                s.hy_hit = .{ @splat(0), @splat(0) };
+                s.hy_try = .{ @splat(0), @splat(0) };
+                s.hy_last = 0;
+                s.sh_k = 0;
+            }
+            if (s.hy_last != 0 and s.st.pos > s.hy_pos) {
+                hyScore(s, s.hy_last - 1, s.act_tok[0..s.act_n], r.next);
+                if (s.sh_k != 0) hyScore(s, s.sh_k - 1, s.sh_tok[0..s.sh_n], r.next);
+                if (s.hy_last == s.hy_prev) {
+                    const dt = @as(f64, @floatFromInt(s.hy_t.durationTo(now).toNanoseconds())) / 1e9;
+                    if (dt > 0 and dt < 1.0) {
+                        const k = s.hy_last - 1;
+                        s.hy_dt[k] = if (s.hy_n[k] == 0) dt else 0.9 * s.hy_dt[k] + 0.1 * dt;
+                        s.hy_n[k] += 1;
+                    }
+                }
+            }
+            s.sh_k = 0;
+            shadow[i] = false;
+            if (!solo) {
+                use_df[i] = false;
+                s.hy_prev = 0;
+                s.hy_last = 0; // no sample: the shared round's time is no solo drafter's
+            } else {
+                s.hy_rounds += 1;
+                use_df[i] = blk: {
+                    // each drafter's round time first (a few of its own rounds), then the better value
+                    if (s.hy_n[1] < 3) break :blk true;
+                    if (s.hy_n[0] < 3) break :blk false;
+                    const vd = hyValue(s, 1);
+                    const vm = hyValue(s, 0);
+                    break :blk if (s.hy_last == 2) vd * (1 + e.hy_margin) >= vm else vd > vm * (1 + e.hy_margin);
+                };
+                shadow[i] = s.hy_n[0] >= 3 and s.hy_n[1] >= 3 and s.hy_rounds % e.hy_shadow == 0;
+                s.hy_prev = s.hy_last;
+                s.hy_last = if (use_df[i]) 2 else 1;
+            }
+            s.hy_t = now;
+            s.hy_pos = s.st.pos;
+            counts[i] = r.count;
+            outs[i] = r.out;
+            e.hy_counts[@intFromBool(use_df[i])] += 1;
+        }
+        var sub: [64]DraftReq = undefined;
+        var at: [64]usize = undefined;
+        var n: usize = 0;
+        // DFlash2 in the shadow first (a drafter resets the stream's sampled-verify drafts; the real one goes last)
+        for (reqs, 0..) |*r, i| {
+            if (use_df[i] or !shadow[i]) continue;
+            sub[n] = r.*;
+            sub[n].out = r.seq.sh_tok[0..];
+            at[n] = i;
+            n += 1;
+        }
+        if (n > 0) {
+            e.hy_shadows += n;
+            try e.draftDflash(df, sub[0..n]);
+            for (sub[0..n], at[0..n]) |q, i| {
+                reqs[i].seq.sh_n = @intCast(@min(q.drafted, 16));
+                reqs[i].seq.sh_k = 2;
+            }
+        }
+        // the MTP head over every stream (it absorbs the kept rows): its real drafts, its shadow ones, or none
+        for (reqs, 0..) |*r, i| {
+            if (!use_df[i]) continue;
+            if (shadow[i]) r.out = r.seq.sh_tok[0..] else r.count = 0;
+        }
+        try e.draftMtp(reqs);
+        n = 0;
+        for (reqs, 0..) |*r, i| {
+            if (!use_df[i]) continue;
+            if (shadow[i]) {
+                e.hy_shadows += 1;
+                r.seq.sh_n = @intCast(@min(r.drafted, 16));
+                r.seq.sh_k = 1;
+            }
+            r.out = outs[i];
+            r.count = counts[i];
+            r.drafted = 0;
+            sub[n] = r.*;
+            at[n] = i;
+            n += 1;
+        }
+        if (n > 0) {
+            try e.draftDflash(df, sub[0..n]);
+            for (sub[0..n], at[0..n]) |q, i| reqs[i].drafted = q.drafted;
+        }
+        for (reqs, 0..) |*r, i| {
+            const s = r.seq;
+            const d = @min(r.drafted, 16);
+            @memcpy(s.act_tok[0..d], r.out[0..d]);
+            s.act_n = @intCast(d);
+            if (s.hy_last != 0) {
+                const k = s.hy_last - 1;
+                s.hy_dn[k] = if (s.hy_n[k] == 0 and s.hy_dn[k] == 0) @floatFromInt(d) else 0.9 * s.hy_dn[k] + 0.1 * @as(f64, @floatFromInt(d));
+            }
+            if (s.sh_k != 0) {
+                const k = s.sh_k - 1;
+                s.hy_dn[k] = 0.9 * s.hy_dn[k] + 0.1 * @as(f64, @floatFromInt(s.sh_n));
+            }
+            _ = i;
+        }
+        if (e.df_stats > 0 and (e.hy_counts[0] + e.hy_counts[1]) % e.df_stats == 0)
+            std.log.info("hybrid: stream rounds MTP {d} DFlash2 {d}, {d} shadow drafts", .{ e.hy_counts[0], e.hy_counts[1], e.hy_shadows });
     }
 
     fn draftMtp(e: *Engine, reqs: []DraftReq) !void {
