@@ -68,6 +68,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .decide = r.decide,
         .untaught = r.untaught,
         .images = r.images,
+        .media = r.media, // our mia engine's --vision-helper rows (Stream.media, 224a74c0)
         .key = r.cache_key,
     }) catch {
         freeProposer(h, job);
