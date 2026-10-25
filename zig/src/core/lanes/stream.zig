@@ -607,4 +607,3 @@ test "media rows, positions and features must cover the prompt" {
     m.features = feats[0..8];
     try std.testing.expectError(error.BadMedia, m.check(5));
 }
-
