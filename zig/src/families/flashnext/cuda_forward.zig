@@ -119,6 +119,14 @@ pub const Seq = struct {
     /// Forward.reset's count (the drafter's context of an earlier prompt starts over)
     taps_gen: u64 = 0,
     dctx: ?*anyopaque = null,
+    /// TF_FLASHNEXT_DRAFTER=hybrid: the drafter of the stream's last round (0 none, 1 MTP, 2 DFlash2), when that
+    /// round drafted and at which position, and each drafter's running rate (committed tokens a second) and rounds
+    hy_last: u8 = 0,
+    hy_t: std.Io.Timestamp = .zero,
+    hy_pos: usize = 0,
+    hy_rate: [2]f64 = .{ 0, 0 },
+    hy_n: [2]u64 = .{ 0, 0 },
+    hy_rounds: u64 = 0,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
