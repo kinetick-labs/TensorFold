@@ -452,6 +452,69 @@ pub const Draft = struct {
         }
     }
 
+    /// One stream's target rows to absorb from its tap ring (absorbMany).
+    pub const Absorb = struct { ctx: *Ctx, ring: u64, start: u64, n: usize };
+
+    /// Several streams' tap rows in shared projections: each stream's rows gathered back to back, then the fc
+    /// projection, the norm and every layer's key and value projections once over all of them, each stream's
+    /// rotary norm and ring store on its own rows (a prompt's long runs, and what does not fit, go alone).
+    pub fn absorbMany(d: *Draft, items: []const Absorb, ring_rows: usize) !void {
+        const c = d.c;
+        const row = d.tapRowBytes();
+        const width = c.n_taps * c.hidden;
+        const kvw = c.kvWidth();
+        var batch: [64]Absorb = undefined;
+        var nb: usize = 0;
+        var total: usize = 0;
+        for (items) |it0| {
+            var it = it0;
+            if (it.n > c.window) {
+                it.start += it.n - c.window;
+                it.n = c.window;
+            }
+            if (it.n == 0) continue;
+            if (it.n > 16 or total + it.n > max_rows or nb == batch.len) {
+                try d.absorbRing(it.ctx, it.ring, ring_rows, it.start, it.n);
+                continue;
+            }
+            batch[nb] = it;
+            nb += 1;
+            total += it.n;
+        }
+        if (nb == 0) return;
+        if (nb == 1) return d.absorbRing(batch[0].ctx, batch[0].ring, ring_rows, batch[0].start, batch[0].n);
+        const previous = d.projection_role;
+        defer d.projection_role = previous;
+        d.projection_role = .live;
+        const e = d.e;
+        var off: usize = 0;
+        for (batch[0..nb]) |it| {
+            try e.run(d.fns.gather_taps, .{ it.n, 1, 1 }, .{ 256, 1, 1 }, .{ it.ring, @as(c_int, @intCast(ring_rows)), @as(c_longlong, @intCast(it.start)), @as(c_int, @intCast(width)), d.taps_in + off * row });
+            off += it.n;
+            const ctx = it.ctx;
+            if (it.start < ctx.end) ctx.end = it.start;
+            if (it.start > ctx.end) ctx.begin = it.start;
+        }
+        try d.proj(d.w.fc, d.taps_in, d.th, total);
+        try d.norm(d.th, d.w.hidden_norm, d.thn, total);
+        for (d.w.layers, 0..) |l, i| {
+            try d.projAgain(l.k, d.thn, d.kabs, total);
+            try d.projAgain(l.v, d.thn, d.vabs, total);
+            off = 0;
+            for (batch[0..nb]) |it| {
+                const at = off * kvw * 2;
+                try d.normRope(d.kabs + at, l.k_norm, d.kn + at, it.n, c.kv_heads, it.start);
+                try e.run(d.fns.ring_put, .{ it.n, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn + at, d.vabs + at, d.ringK(it.ctx, i), d.ringV(it.ctx, i), @as(c_int, @intCast(kvw)), @as(c_longlong, @intCast(it.start)), @as(c_int, @intCast(c.ringRows())) });
+                off += it.n;
+            }
+        }
+        for (batch[0..nb]) |it| {
+            const ctx = it.ctx;
+            ctx.end = it.start + it.n;
+            if (ctx.end > c.window and ctx.begin < ctx.end - c.window) ctx.begin = ctx.end - c.window;
+        }
+    }
+
     /// One block pass for every item (its context's end must be its position - 1): each context then holds its drafts.
     pub fn hold(d: *Draft, items: []const Hold, contexts: []const *Ctx) !void {
         if (items.len == 0) return;
