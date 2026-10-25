@@ -109,6 +109,16 @@ pub const Seq = struct {
     /// TF_FLASHNEXT_SPEC_SAMPLE: the head's last chain's draft distributions (draft d at spec_q[d]), spec_n of them
     spec_q: [state.max_rows]spec.Dist = undefined,
     spec_n: usize = 0,
+    /// TF_FLASHNEXT_DFLASH: the DFlash2 drafter's tap ring [Forward.tap_rows, taps, hidden] bf16 (each main pass
+    /// writes its rows' taps at (position % tap_rows)), the first position whose taps it holds (a restored prompt's
+    /// rows before it never ran here), and the drafter's context (cuda_dflash.Ctx, the engine's)
+    taps: ?cuda.DeviceBuffer = null,
+    taps_from: usize = 0,
+    /// past the last position a pass wrote taps for (a ring row older than taps_hi - tap_rows is overwritten)
+    taps_hi: usize = 0,
+    /// Forward.reset's count (the drafter's context of an earlier prompt starts over)
+    taps_gen: u64 = 0,
+    dctx: ?*anyopaque = null,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
@@ -122,6 +132,8 @@ pub const Seq = struct {
         for (s.regions.items) |*r| r.deinit(gpa);
         s.regions.deinit(gpa);
         if (s.last_streams) |*b| b.free();
+        if (s.taps) |*b| b.free();
+        s.taps = null;
         s.window.deinit(gpa);
         s.st.deinit();
     }
@@ -698,6 +710,10 @@ pub const Forward = struct {
     cs: ?cuda.Stream = null,
     cs_ev: [4]cuda.Event = undefined,
     cs_i: usize = 0,
+    /// TF_FLASHNEXT_DFLASH: the decoder layers whose completed streams the drafter taps (ascending; empty: none),
+    /// and the rows of each sequence's tap ring
+    taps: []const u32 = &.{},
+    tap_rows: usize = 0,
     /// what the comm stream overlaps (TF_FLASHNEXT_OVERLAP bits): 1 the mixers' out_proj (attention: the peer's
     /// rows first), 2 the MoE in two row halves (the peer's first)
     overlap: u8 = 1,
@@ -1222,6 +1238,9 @@ pub const Forward = struct {
         try f.th.zero(st.rec, g.linear_layers * g.nv * state.gdn_dv * state.gdn_dk * 4);
         st.cur = @splat(0);
         seq.held = 0;
+        seq.taps_from = 0;
+        seq.taps_hi = 0;
+        seq.taps_gen +%= 1;
         try f.th.zero(st.ple_tail, (g.ple_kernel - 1) * g.ngram_size * g.wide() * 2);
         for (f.w.layers) |l| if (l.ple) |p| p.ngram.initialHistory(st.history[0 .. p.ngram.n - 1]);
         seq.staged = false;
@@ -1589,6 +1608,8 @@ pub const Forward = struct {
             try f.putLayer(layer, "h_ple", b.h, R * g.wide() * 2);
         }
         try f.hcBlock(&layer.attn_hc, x, R, b.h, pend, b.inj_a, sp);
+        // b.h now holds the layer before's completed streams (its MoE written back): the drafter's tap of it
+        if (!mtp and f.taps.len > 0 and sp == null) try f.tapRows(layer, segs, b.h);
         try f.putLayer(layer, "hc_a", b.mixed, R * g.hidden * 2);
         f.pf_mixer = prefetchHc(&layer.mlp_hc);
         const br = if (layer.linear) try f.gdnBlock(layer, segs, x, R) else try f.attnBlock(layer, segs, x, R, mtp);
@@ -1601,6 +1622,24 @@ pub const Forward = struct {
         try f.putLayer(layer, "router_wts", b.moe_wts, R * (g.topKFor(mtp) + 1) * 4);
         try f.putBranch(layer, "moe_y", moe, R);
         return .{ .branch = moe, .inject = b.inj_m };
+    }
+
+    /// DFlash2's taps: when the layer before `layer` is a tap, each segment's rows of h averaged over the streams
+    /// into its sequence's tap ring (sequences without a ring skip). A launch reads the sequence's device position,
+    /// so a captured round replays it.
+    fn tapRows(f: *Forward, layer: *const W.Layer, segs: []const Seg, h: u64) !void {
+        const base = @intFromPtr(f.w.layers.ptr);
+        const at = @intFromPtr(layer);
+        if (at < base) return;
+        const li = (at - base) / @sizeOf(W.Layer);
+        if (li == 0 or li >= f.w.layers.len) return;
+        const slot = std.mem.indexOfScalar(u32, f.taps, @intCast(li - 1)) orelse return;
+        const Wd = f.g.wide();
+        for (segs) |sg| {
+            const ring = sg.seq.taps orelse continue;
+            const n = sg.a1 - sg.a0;
+            try f.th.tapRing(h + sg.a0 * Wd * 2, ring.ptr, sg.seq.st.pos_dev, slot, f.taps.len, f.g.hidden, f.g.streams, f.tap_rows, n, n -| f.tap_rows);
+        }
     }
 
     fn putBranch(f: *Forward, layer: *const W.Layer, what: []const u8, br: tri.Branch, R: usize) !void {
@@ -2458,6 +2497,7 @@ pub const Forward = struct {
             const taps = (g.ple_kernel - 1) * g.ngram_size;
             try f.t.shiftWindows(st.ple_tail, b.ple_nrow + at * Wd * 2, keep, taps * Wd, b.rows * Wd, Wd, 1, Wd, taps);
         }
+        seq.taps_hi = @max(seq.taps_hi, st.pos + R);
         try f.setPos(st, st.pos + keep);
     }
 };
