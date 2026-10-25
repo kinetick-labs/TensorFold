@@ -238,3 +238,22 @@ extern "C" cudaError_t tf_fn_nucleus_mass(const void* logits, uint64_t ld, uint6
         static_cast<int64_t*>(mass), static_cast<unsigned long long*>(sums));
     return cudaGetLastError();
 }
+
+// DFlash2 taps (TF_FLASHNEXT_DFLASH): a layer's completed hyper-connection streams h [rows, S, D] bf16, averaged
+// over the S streams in fp32 (s = 0, 1, ... in order) and rounded once, into slot `slot` of the sequence's tap ring
+// ring [ring_rows, taps, D] bf16 at ring row (pos + r) % ring_rows; `pos` is the sequence's device position (the
+// window's first row, read at run time so a captured graph replays it). Rows below `skip` are left out (a prompt
+// chunk longer than the ring writes its last ring_rows rows only). grid (rows - skip, ceil(D / blockDim.x)).
+extern "C" __global__ void tf_fn_tap_ring_kernel(const __nv_bfloat16* h, __nv_bfloat16* ring, const int32_t* pos,
+                                                 uint32_t slot, uint32_t taps, uint32_t D, uint32_t S,
+                                                 uint32_t ring_rows, uint32_t skip) {
+    const uint64_t r = uint64_t(blockIdx.x) + skip;
+    const uint32_t d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    const __nv_bfloat16* src = h + r * uint64_t(S) * D + d;
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < S; ++s) acc = __fadd_rn(acc, __bfloat162float(src[uint64_t(s) * D]));
+    const float mean = __fdiv_rn(acc, float(S));
+    const uint64_t row = (uint64_t(uint32_t(pos[0])) + r) % ring_rows;
+    ring[(row * taps + slot) * D + d] = __float2bfloat16_rn(mean);
+}

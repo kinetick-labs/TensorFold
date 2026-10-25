@@ -62,6 +62,8 @@ pub const Functions = struct {
     candidates: cuda.Function,
     nucleus_mass: cuda.Function,
     fp4_serial: cuda.Function,
+    /// DFlash2's tap ring (null: a kernel set built before it; TF_FLASHNEXT_DFLASH refuses)
+    tap_ring: ?cuda.Function = null,
     lse: Lse,
 
     pub fn resolve(m: []const cuda.Module) !Functions {
@@ -87,6 +89,7 @@ pub const Functions = struct {
             .candidates = try m[i(.ops)].function("tf_fn_candidates_kernel"),
             .nucleus_mass = try m[i(.ops)].function("tf_fn_nucleus_mass_kernel"),
             .fp4_serial = try m[i(.ops)].function("tf_fn_fp4_serial_kernel"),
+            .tap_ring = m[i(.ops)].function("tf_fn_tap_ring_kernel") catch null,
             .lse = try Lse.resolve(m[i(.lse)]),
         };
     }
@@ -274,6 +277,20 @@ pub const Torch = struct {
         for ([_]u64{ rows, source_rows, row_bytes }) |v| a.add(v);
         a.add(invalid);
         try t.go(t.f.gather, .{ rows, 1 }, 256, &a);
+    }
+
+    /// DFlash2's taps: `rows` rows of h [rows, S, D] bf16 averaged over the S streams into slot `slot` of the
+    /// tap ring [ring_rows, taps, D] at row (pos + r) % ring_rows, `pos` the i32 device position; the first `skip`
+    /// rows left out.
+    pub fn tapRing(t: Torch, h: u64, ring: u64, pos: u64, slot: usize, taps: usize, D: usize, S: usize, ring_rows: usize, rows: usize, skip: usize) !void {
+        if (rows <= skip) return;
+        const f = t.f.tap_ring orelse return error.NoTapRingKernel;
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(ring);
+        a.add(pos);
+        for ([_]usize{ slot, taps, D, S, ring_rows, skip }) |v| a.add(@as(u32, @intCast(v)));
+        try t.go(f, .{ rows - skip, (D + 255) / 256 }, 256, &a);
     }
 
     // -- the shared expert ---------------------------------------------------------------------------------
