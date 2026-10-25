@@ -35,6 +35,7 @@ const profs = @import("cuda_prof.zig");
 const tel = @import("cuda_telemetry.zig");
 const prompt_mm = @import("cuda_mia_prompt.zig");
 const moep = @import("cuda_moe_prompt.zig");
+const dflash = @import("dflash.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -370,6 +371,12 @@ pub const Engine = struct {
     full_redone: u64 = 0,
     /// TF_FLASHNEXT_SEQ_POOL (reuseSeq): parked sequences, their most, and reuses so far
     seq_pool: std.ArrayList(*Seq) = .empty,
+    /// TF_FLASHNEXT_DFLASH=<dir>: the DFlash2 drafter in place of the MTP head (chains, greedy-exact verification)
+    /// over the target's layer taps (Forward.taps), and its kernels' adapter
+    df: ?*dflash.Draft = null,
+    df_e: ?*dflash.Engine = null,
+    df_rounds: u64 = 0,
+    df_drafted: u64 = 0,
     seq_pool_max: usize = 0,
     pool_reused: u64 = 0,
     /// TF_FLASHNEXT_GRAPH_LOG: wall seconds of solo windows that captured (eager run + capture + instantiate)
@@ -674,11 +681,120 @@ pub const Engine = struct {
         e.f.budget = &e.budget;
         e.budget.floor = @intFromFloat(@min(reserve_gib, 10) * (1 << 30));
         std.log.info("sequence memory: {d:.2} GiB ({d:.2} GiB free, {d:.1} GiB kept free); {s} KV cache, {d} bytes a position a layer", .{ @as(f64, @floatFromInt(e.budget.limit)) / (1 << 30), @as(f64, @floatFromInt(free)) / (1 << 30), reserve_gib, @tagName(e.g.kv), e.g.kRow() + e.g.vRow() });
+        if (envGet("TF_FLASHNEXT_DFLASH")) |ddir| try e.loadDflash(ddir, dir, o);
+        errdefer e.dropDflash();
         e.own = try e.newSeq(e.max_len);
         e.bound = e.own;
         try e.stream.synchronize();
         e.load_seconds = seconds(io, t0);
         return e;
+    }
+
+    /// Tap rows a sequence's ring holds: the drafter's window, a verify window's rows past the committed ones and a
+    /// margin (a prompt chunk longer than the ring writes its last rows only).
+    const dflash_margin: usize = 64;
+
+    fn loadDflash(e: *Engine, ddir: []const u8, target_dir: []const u8, o: Options) !void {
+        if (o.world > 1) return error.DflashNeedsOneGpu;
+        if (e.torch.f.tap_ring == null) return error.NoTapRingKernel;
+        const de = try e.gpa.create(dflash.Engine);
+        errdefer e.gpa.destroy(de);
+        de.* = try dflash.Engine.init(e.ctx.d, e.stream, .{ .ctx = e, .f = dflashEmbed }, e.g.hidden);
+        errdefer de.deinit();
+        const df = try dflash.Draft.init(e.gpa, e.io, de, ddir, target_dir, .{ .hidden = e.g.hidden, .vocab = e.c.vocab, .layers = e.w.layers.len }, o.streams);
+        e.df = df;
+        e.df_e = de;
+        e.f.taps = df.taps();
+        e.f.tap_rows = df.c.window + state.max_rows + dflash_margin;
+        std.log.info("dflash2 drafts in place of the MTP head: taps {any} (stream mean), {d} tap rows a sequence ({d:.1} MB), up to {d} drafts a round", .{ df.taps(), e.f.tap_rows, @as(f64, @floatFromInt(e.tapBytes())) / 1e6, df.c.block - 1 });
+    }
+
+    fn dropDflash(e: *Engine) void {
+        if (e.df) |df| {
+            if (e.df_rounds > 0) std.log.info("dflash2: {d} rounds, {d} drafts ({d:.2} a round)", .{ e.df_rounds, e.df_drafted, @as(f64, @floatFromInt(e.df_drafted)) / @as(f64, @floatFromInt(e.df_rounds)) });
+            df.deinit();
+        }
+        if (e.df_e) |de| {
+            de.deinit();
+            e.gpa.destroy(de);
+        }
+        e.df = null;
+        e.df_e = null;
+        e.f.taps = &.{};
+    }
+
+    fn tapBytes(e: *const Engine) usize {
+        return e.f.tap_rows * e.f.taps.len * e.g.hidden * 2;
+    }
+
+    /// The drafter's embedding: the target's bf16 token table, one copy a row.
+    fn dflashEmbed(ctx: *anyopaque, ids: u64, out: u64, rows: usize) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        try e.f.t.embed(ids, e.w.embed, out, rows, e.g.hidden, 1);
+    }
+
+    /// The drafter's context of `s` (null: none yet) given back.
+    fn releaseDctx(e: *Engine, s: *Seq) void {
+        if (s.dctx) |p| if (e.df) |df| df.release(@ptrCast(@alignCast(p)));
+        s.dctx = null;
+    }
+
+    /// DFlash2's round: each stream's tap rows since its context's end absorbed, then one block pass a group of
+    /// streams; each request's drafts are its chain (at most block - 1). The drafts' distributions are not kept
+    /// (spec_n 0: a sampled window verifies by matching its draws).
+    fn draftDflash(e: *Engine, df: *dflash.Draft, reqs: []DraftReq) !void {
+        var items: [64]dflash.Hold = undefined;
+        var ctxs: [64]*dflash.Ctx = undefined;
+        var at: [64]usize = undefined;
+        var n: usize = 0;
+        if (reqs.len > items.len) return error.TooManyStreams;
+        for (reqs, 0..) |*r, i| {
+            r.drafted = 0;
+            r.seq.spec_n = 0;
+            const room = @min(r.count, r.out.len, df.c.block - 1);
+            if (room == 0 or r.next.len == 0) continue;
+            const seq = r.seq;
+            const ring = seq.taps orelse return error.NoTapRing;
+            if (seq.dctx == null) seq.dctx = try df.open();
+            const ctx: *dflash.Ctx = @ptrCast(@alignCast(seq.dctx.?));
+            const at_pos = seq.st.pos;
+            // rows whose taps the ring holds: written since the reset (or copied) and not overwritten since
+            const valid = @max(seq.taps_from, seq.taps_hi -| e.f.tap_rows);
+            // a reset sequence starts a new context; a restored one rewinds it to its position
+            if (ctx.gen != seq.taps_gen) {
+                ctx.reset();
+                ctx.gen = seq.taps_gen;
+            }
+            if (ctx.end > at_pos) ctx.end = at_pos;
+            if (ctx.begin > ctx.end) ctx.begin = ctx.end;
+            const lo = @max(@max(ctx.end, valid), at_pos -| df.c.window);
+            if (lo < at_pos) {
+                try df.absorbRing(ctx, ring.ptr, e.f.tap_rows, lo, at_pos - lo);
+            } else if (ctx.end != at_pos) {
+                // nothing to absorb (a restored prompt's first draft): an empty context at its position
+                ctx.begin = at_pos;
+                ctx.end = at_pos;
+            }
+            items[n] = .{ .pending = r.next[r.next.len - 1], .position = at_pos + 1, .depth = @intCast(room) };
+            ctxs[n] = ctx;
+            at[n] = i;
+            n += 1;
+        }
+        var k: usize = 0;
+        while (k < n) {
+            const m = @min(n - k, df.frame_streams);
+            try df.hold(items[k .. k + m], ctxs[k .. k + m]);
+            for (k..k + m) |j| {
+                const r = &reqs[at[j]];
+                const c = ctxs[j];
+                const got = @min(c.held_n, items[j].depth);
+                @memcpy(r.out[0..got], c.held[0..got]);
+                r.drafted = got;
+                e.df_drafted += got;
+            }
+            k += m;
+        }
+        e.df_rounds += 1;
     }
 
     /// The prompt buffers' DeltaNet taps: row r reads [conv state (3) | rows] at r .. r + 3, stream 0 (Python
@@ -711,6 +827,7 @@ pub const Engine = struct {
         for (e.seq_pool.items) |q| e.destroySeq(q);
         e.seq_pool.deinit(e.gpa);
         e.freeSeq(e.own);
+        e.dropDflash();
         e.gpa.free(e.draft_host);
         e.gpa.free(e.round_segs);
         e.extra.buf.free();
@@ -769,6 +886,11 @@ pub const Engine = struct {
         try e.f.register(s);
         errdefer e.f.unregister(s);
         s.last_streams = try cuda.DeviceBuffer.alloc(e.ctx.d, e.g.wide() * 2);
+        if (e.df != null) {
+            s.taps = try cuda.DeviceBuffer.alloc(e.ctx.d, e.tapBytes());
+            s.charged += e.tapBytes() + e.df.?.streamBytes();
+            e.budget.used += e.tapBytes() + e.df.?.streamBytes();
+        }
         try e.f.reset(s);
         return s;
     }
@@ -845,6 +967,7 @@ pub const Engine = struct {
 
     fn destroySeq(e: *Engine, s: *Seq) void {
         if (e.bound == s and s != e.own) e.bound = e.own;
+        e.releaseDctx(s);
         e.budget.used -|= s.charged;
         e.f.unregister(s);
         e.dropGraphs(@intFromPtr(s), null);
@@ -1014,6 +1137,13 @@ pub const Engine = struct {
             try e.f.th.copy(dst.st.ikc[i] + first_ikc * g.index_dim * 2, src.st.ikc[i] + first_ikc * g.index_dim * 2, (n - first_ikc) * g.index_dim * 2);
             try e.f.th.copy(dst.st.pooled[i], src.st.pooled[i], (n / g.index_ratio) * g.index_dim * 2);
         }
+        // the drafter's tap rows: the source's ring (its rows not yet overwritten), else none before `rows`
+        if (dst.taps != null and src.taps != null) {
+            try e.f.th.copy(dst.taps.?.ptr, src.taps.?.ptr, e.tapBytes());
+            dst.taps_from = @min(rows, @max(src.taps_from, src.taps_hi -| e.f.tap_rows));
+            dst.taps_hi = src.taps_hi;
+        } else dst.taps_from = rows;
+        e.releaseDctx(dst);
     }
 
     /// decode.prefill with kept states: the prompt's chunks (one ends at `keep_at`, whose state is kept; prompt
@@ -1696,6 +1826,7 @@ pub const Engine = struct {
     /// streams still drafting (the first draft always kept, a later one only at or above the confidence), each
     /// draw with its stream's rule at its own position. Each stream's drafts equal its solo chain's.
     pub fn draftMany(e: *Engine, reqs: []DraftReq) !void {
+        if (e.df) |df| return e.draftDflash(df, reqs);
         const mb = &(e.mbuf orelse return error.NoMtpHead);
         const d = &(e.draws orelse return error.NoMtpHead);
         if (reqs.len == 0) return;
