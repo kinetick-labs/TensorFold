@@ -399,6 +399,8 @@ pub const Engine = struct {
     /// hybrid: probe the other drafter every this many rounds; switch only past this margin
     hy_probe: u64 = 24,
     hy_margin: f64 = 0.05,
+    /// TF_FLASHNEXT_HYBRID_CONC: the most streams a round at which hybrid still picks DFlash2 (above: MTP)
+    hy_conc: usize = 1,
     hy_counts: [2]u64 = .{ 0, 0 },
     df_tune: ?[]const u8 = null,
     df_stats: u64 = 0,
@@ -712,6 +714,7 @@ pub const Engine = struct {
         }
         if (envGet("TF_FLASHNEXT_HYBRID_PROBE")) |v| e.hy_probe = @max(2, std.fmt.parseInt(u64, v, 10) catch return error.BadDrafter);
         if (envGet("TF_FLASHNEXT_HYBRID_MARGIN")) |v| e.hy_margin = std.fmt.parseFloat(f64, v) catch return error.BadDrafter;
+        if (envGet("TF_FLASHNEXT_HYBRID_CONC")) |v| e.hy_conc = std.fmt.parseInt(usize, v, 10) catch return error.BadDrafter;
         if (envGet("TF_FLASHNEXT_DFLASH_STATS")) |v| e.df_stats = std.fmt.parseInt(u64, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_DFLASH")) |ddir| try e.loadDflash(ddir, dir, o);
         errdefer e.dropDflash();
@@ -1945,7 +1948,9 @@ pub const Engine = struct {
         for (reqs, 0..) |*r, i| {
             const s = r.seq;
             // the last round's sample: tokens committed since it drafted, over the wall time since
-            if (s.hy_last != 0 and s.st.pos > s.hy_pos) {
+            // a round right after a switch pays the new drafter's catch-up (DFlash2 absorbs every row since its
+            // last round), so it is no sample of that drafter's steady rate
+            if (s.hy_last != 0 and s.hy_last == s.hy_prev and s.st.pos > s.hy_pos) {
                 const dt = @as(f64, @floatFromInt(s.hy_t.durationTo(now).toNanoseconds())) / 1e9;
                 if (dt > 0 and dt < 1.0) {
                     const k = s.hy_last - 1;
@@ -1954,21 +1959,32 @@ pub const Engine = struct {
                     s.hy_n[k] += 1;
                 }
             }
-            if (s.hy_pos > s.st.pos) s.hy_n = .{ 0, 0 }; // a new prompt in a reused sequence
+            if (s.hy_pos > s.st.pos) {
+                s.hy_n = .{ 0, 0 }; // a new prompt in a reused sequence
+                s.hy_last = 0;
+            }
             use_df[i] = switch (e.drafter) {
                 .hybrid_conc => reqs.len == 1,
                 else => blk: {
+                    // past hy_conc streams a round the MTP head drafts every stream (the shared verify's rows cost more
+                    // than DFlash2's longer drafts gain there), and those rounds are no samples
+                    if (reqs.len > e.hy_conc) {
+                        s.hy_last = 0;
+                        break :blk false;
+                    }
                     s.hy_rounds += 1;
                     // each drafter tried a few times first, then the faster one, the other probed now and then
                     if (s.hy_n[1] < 3) break :blk true;
                     if (s.hy_n[0] < 3) break :blk false;
                     const best_df = if (s.hy_last == 2) s.hy_rate[1] * (1 + e.hy_margin) >= s.hy_rate[0] else s.hy_rate[1] > s.hy_rate[0] * (1 + e.hy_margin);
-                    break :blk if (s.hy_rounds % e.hy_probe == 0) !best_df else best_df;
+                    // a probe is two rounds: the first pays the switch, the second is its sample
+                    break :blk if (s.hy_rounds % e.hy_probe < 2) !best_df else best_df;
                 },
             };
             counts[i] = r.count;
             if (use_df[i]) r.count = 0;
-            s.hy_last = if (use_df[i]) 2 else 1;
+            s.hy_prev = s.hy_last;
+            s.hy_last = if (e.drafter == .hybrid and reqs.len > e.hy_conc) 0 else if (use_df[i]) 2 else 1;
             s.hy_t = now;
             s.hy_pos = s.st.pos;
             e.hy_counts[@intFromBool(use_df[i])] += 1;
