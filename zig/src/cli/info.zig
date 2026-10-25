@@ -45,7 +45,7 @@ pub fn run(a: Allocator, io: std.Io, out: *std.Io.Writer, env: ?*const std.proce
     };
     const title = if (details.is_bolt) "Nemotron 3.5 Bolt" else family.title;
     try out.print("family: {s} ({s})\n", .{ title, family.model_type });
-    const exl3: ?@FieldType(hub.Format, "exl3") = if (hub.format(a, io, dir)) |f| switch (f) {
+    const exl3: ?@FieldType(hub.Format, "exl3") = if (hub.quantFormat(a, io, dir)) |f| switch (f) {
         .exl3 => |q| q,
         else => null,
     } else null;
