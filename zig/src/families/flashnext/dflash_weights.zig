@@ -5,6 +5,15 @@ const cuda = @import("cuda");
 const core = @import("core");
 
 const Affine4 = cuda.qlinear.Affine4;
+const fp8 = @import("cuda_fp8.zig");
+const q4 = @import("cuda_mtp_q4.zig");
+
+/// One drafter projection: affine-4 (qwen3_5's), or MXFP8 (TF_FLASHNEXT_DFLASH_MX=1: e4m3 a weight, a power-of-two
+/// scale a 32 inputs, run by the engine's MXFP8 lane matmul); `a` carries the shape either way.
+pub const Lin = struct {
+    a: Affine4,
+    mx: ?fp8.Linear = null,
+};
 const DeviceBuffer = cuda.DeviceBuffer;
 fn aligned(n: usize) usize {
     return std.mem.alignForward(usize, n, 256);
@@ -13,33 +22,38 @@ fn aligned(n: usize) usize {
 pub const Layer = struct {
     input_norm: u64,
     post_norm: u64,
-    q: Affine4,
-    k: Affine4,
-    v: Affine4,
-    o: Affine4,
+    q: Lin,
+    k: Lin,
+    v: Lin,
+    o: Lin,
     q_norm: u64,
     k_norm: u64,
-    gate: Affine4,
-    up: Affine4,
-    down: Affine4,
-    attn_conv: Affine4, // kernel_projection: hidden -> 4 * groups dynamic coefficients
+    gate: Lin,
+    up: Lin,
+    down: Lin,
+    attn_conv: Lin, // kernel_projection: hidden -> 4 * groups dynamic coefficients
     attn_base: u64, // base_kernel (2 branches, 2 lags, hidden) bf16
-    mlp_conv: Affine4,
+    mlp_conv: Lin,
     mlp_base: u64,
 };
 
 pub const Weights = struct {
-    fc: Affine4, // the taps' concatenation -> hidden
+    fc: Lin, // the taps' concatenation -> hidden
     hidden_norm: u64,
     final_norm: u64,
-    selector: Affine4, // hidden_projection: hidden -> rank
+    selector: Lin, // hidden_projection: hidden -> rank
     predecessor: []u16, // codebooks (vocab, rank) bf16, on the host
     successor: []u16,
     layers: []Layer,
     arena: DeviceBuffer,
     arena_at: usize = 0,
+    /// the MXFP8 projections' own buffers (fragments, then tiled scales)
+    mx: std.ArrayList(DeviceBuffer) = .empty,
+    mx_bytes: usize = 0,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
+        for (w.mx.items) |*b| b.free();
+        w.mx.deinit(gpa);
         w.arena.free();
         gpa.free(w.predecessor);
         gpa.free(w.successor);
@@ -158,6 +172,35 @@ pub fn linear(gpa: std.mem.Allocator, e: anytype, stage: *DeviceBuffer, w: *Weig
     return out;
 }
 
+/// `linear`, or the MXFP8 form when `mx` (the engine's lane matmul must be loaded).
+pub fn lin(gpa: std.mem.Allocator, e: anytype, stage: *DeviceBuffer, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize, mx: bool) !Lin {
+    if (!mx) return .{ .a = try linear(gpa, e, stage, w, ck, name, n, k) };
+    const t = try ck.expect(name, .bf16, &.{ n, k });
+    const rows = std.mem.bytesAsSlice(u16, t.bytes);
+    const codes = try gpa.alloc(u8, n * k);
+    defer gpa.free(codes);
+    const sc = try gpa.alloc(u8, n * (k / 32));
+    defer gpa.free(sc);
+    const host = try gpa.alloc(u16, n * k);
+    defer gpa.free(host);
+    @memcpy(host, rows);
+    q4.quantizeMx(host, n, k, codes, sc);
+    const npad = fp8.npadOf(n);
+    const frag = try gpa.alloc(u8, npad * k);
+    defer gpa.free(frag);
+    try fp8.fragmentOrder(codes, n, k, npad, frag);
+    const tiled = try gpa.alloc(u8, npad * (k / 64) * 2);
+    defer gpa.free(tiled);
+    try fp8.tileMxScales(sc, n, k, npad, tiled);
+    var buf = try DeviceBuffer.alloc(e.d, frag.len + tiled.len);
+    errdefer buf.free();
+    try buf.upload(0, frag);
+    try buf.upload(frag.len, tiled);
+    try w.mx.append(gpa, buf);
+    w.mx_bytes += buf.len;
+    return .{ .a = .{ .w = 0, .s = 0, .b = 0, .n = n, .k = k, .npad = npad }, .mx = .{ .w8 = buf.ptr, .bs = buf.ptr + frag.len, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad), .mx = true } };
+}
+
 fn vector(w: *Weights, ck: *core.Checkpoint, name: []const u8, shape: []const usize) !u64 {
     const t = try ck.expect(name, .bf16, shape);
     const p = try w.alloc(t.bytes.len);
@@ -172,7 +215,7 @@ fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shap
     return out;
 }
 
-pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, s: Shape) !Weights {
+pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, s: Shape, mx: bool) !Weights {
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
     var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try DeviceBuffer.alloc(e.d, total(s)) };
@@ -182,10 +225,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, s: 
     defer stage.free();
     w.layers = try gpa.alloc(Layer, s.layers);
     errdefer gpa.free(w.layers);
-    w.fc = try linear(gpa, e, &stage, &w, &ck, "fc.weight", s.hidden, s.taps * s.hidden);
+    w.fc = try lin(gpa, e, &stage, &w, &ck, "fc.weight", s.hidden, s.taps * s.hidden, mx);
     w.hidden_norm = try vector(&w, &ck, "hidden_norm.weight", &.{s.hidden});
     w.final_norm = try vector(&w, &ck, "norm.weight", &.{s.hidden});
-    w.selector = try linear(gpa, e, &stage, &w, &ck, "candidate_selector.hidden_projection.weight", s.rank, s.hidden);
+    w.selector = try lin(gpa, e, &stage, &w, &ck, "candidate_selector.hidden_projection.weight", s.rank, s.hidden, mx);
     w.predecessor = try hostBf16(gpa, &ck, "candidate_selector.predecessor_codebook", &.{ s.vocab, s.rank });
     errdefer gpa.free(w.predecessor);
     w.successor = try hostBf16(gpa, &ck, "candidate_selector.successor_codebook", &.{ s.vocab, s.rank });
@@ -203,18 +246,18 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, s: 
         l.* = .{
             .input_norm = try vector(&w, &ck, try nm.of("input_layernorm.weight"), &.{s.hidden}),
             .post_norm = try vector(&w, &ck, try nm.of("post_attention_layernorm.weight"), &.{s.hidden}),
-            .q = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.q_proj.weight"), s.q_width, s.hidden),
-            .k = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.k_proj.weight"), s.kv_width, s.hidden),
-            .v = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.v_proj.weight"), s.kv_width, s.hidden),
-            .o = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.o_proj.weight"), s.hidden, s.q_width),
+            .q = try lin(gpa, e, &stage, &w, &ck, try nm.of("self_attn.q_proj.weight"), s.q_width, s.hidden, mx),
+            .k = try lin(gpa, e, &stage, &w, &ck, try nm.of("self_attn.k_proj.weight"), s.kv_width, s.hidden, mx),
+            .v = try lin(gpa, e, &stage, &w, &ck, try nm.of("self_attn.v_proj.weight"), s.kv_width, s.hidden, mx),
+            .o = try lin(gpa, e, &stage, &w, &ck, try nm.of("self_attn.o_proj.weight"), s.hidden, s.q_width, mx),
             .q_norm = try vector(&w, &ck, try nm.of("self_attn.q_norm.weight"), &.{s.head_dim}),
             .k_norm = try vector(&w, &ck, try nm.of("self_attn.k_norm.weight"), &.{s.head_dim}),
-            .gate = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.gate_proj.weight"), s.intermediate, s.hidden),
-            .up = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.up_proj.weight"), s.intermediate, s.hidden),
-            .down = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.down_proj.weight"), s.hidden, s.intermediate),
-            .attn_conv = try linear(gpa, e, &stage, &w, &ck, try nm.of("attention_conv.kernel_projection.weight"), s.dynamic, s.hidden),
+            .gate = try lin(gpa, e, &stage, &w, &ck, try nm.of("mlp.gate_proj.weight"), s.intermediate, s.hidden, mx),
+            .up = try lin(gpa, e, &stage, &w, &ck, try nm.of("mlp.up_proj.weight"), s.intermediate, s.hidden, mx),
+            .down = try lin(gpa, e, &stage, &w, &ck, try nm.of("mlp.down_proj.weight"), s.hidden, s.intermediate, mx),
+            .attn_conv = try lin(gpa, e, &stage, &w, &ck, try nm.of("attention_conv.kernel_projection.weight"), s.dynamic, s.hidden, mx),
             .attn_base = try vector(&w, &ck, try nm.of("attention_conv.base_kernel"), &.{ 2, 2, s.hidden }),
-            .mlp_conv = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp_conv.kernel_projection.weight"), s.dynamic, s.hidden),
+            .mlp_conv = try lin(gpa, e, &stage, &w, &ck, try nm.of("mlp_conv.kernel_projection.weight"), s.dynamic, s.hidden, mx),
             .mlp_base = try vector(&w, &ck, try nm.of("mlp_conv.base_kernel"), &.{ 2, 2, s.hidden }),
         };
     }
