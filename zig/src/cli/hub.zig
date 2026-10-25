@@ -215,7 +215,7 @@ pub const Format = union(enum) {
 };
 
 /// config.json's quantization, or null when unquantized; an `exl3` codebook string points into the caller's `text`.
-pub fn format(a: Allocator, io: std.Io, dir: []const u8) ?Format {
+pub fn quantFormat(a: Allocator, io: std.Io, dir: []const u8) ?Format {
     const text = @import("checkpoint_config").optional(a, io, dir) orelse return null;
     var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return null;
     defer parsed.deinit();
@@ -335,7 +335,7 @@ test "cache layout helpers read a synthetic cache" {
     const snapshot = (try cachedSnapshot(a, io, hub, "Org/Name")).?;
     try std.testing.expect(std.mem.endsWith(u8, snapshot, "0123456789abcdef0123456789abcdef01234567"));
     try std.testing.expectEqualStrings("qwen4_exp", modelType(a, io, snapshot));
-    const q = format(a, io, snapshot).?;
+    const q = quantFormat(a, io, snapshot).?;
     try std.testing.expectEqual(@as(u64, 6), q.affine.bits);
     try std.testing.expectEqual(@as(u64, 32), q.affine.group);
     try std.testing.expect((try sizeOf(a, io, snapshot)) >= 4096);
