@@ -129,6 +129,18 @@ pub const Seq = struct {
     hy_rounds: u64 = 0,
     /// the drafter of the round before hy_last's (a sample counts only when both match: a switch round pays catch-up)
     hy_prev: u8 = 0,
+    /// hybrid (shadow scoring): each drafter's round time (EMA, seconds, its own non-switch rounds), drafts a round
+    /// (EMA), and per draft depth the kept and tried counts (decayed) scored on the target's kept tokens; the
+    /// round's real drafts and, on a shadow round, the other drafter's (sh_k 1 MTP, 2 DFlash2, 0 none)
+    hy_dt: [2]f64 = .{ 0, 0 },
+    hy_dn: [2]f64 = .{ 0, 0 },
+    hy_hit: [2][16]f32 = .{ @splat(0), @splat(0) },
+    hy_try: [2][16]f32 = .{ @splat(0), @splat(0) },
+    act_tok: [16]u32 = @splat(0),
+    act_n: u8 = 0,
+    sh_tok: [16]u32 = @splat(0),
+    sh_n: u8 = 0,
+    sh_k: u8 = 0,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
