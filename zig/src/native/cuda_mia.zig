@@ -108,7 +108,7 @@ pub fn placementWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, w
     _ = drafts;
     const own = try residentBytes(a, io, dir);
     // a checkpoint whose shards sit below the top level (FP4-Local's tensors/): upstream's count
-    return if (own > 0) own else @import("cuda_memory.zig").weightBytes(io, dir);
+    return if (own > 0) own else @import("cuda_memory.zig").weightBytes(a, io, dir);
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
