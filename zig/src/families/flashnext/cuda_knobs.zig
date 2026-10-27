@@ -67,3 +67,10 @@ pub fn sharedDirect() bool {
     const v = std.c.getenv("TF_FLASHNEXT_PROMPT_SHARED_DIRECT") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
+
+/// TF_FLASHNEXT_PROMPT_GEMM2=1: the MX128 prompt tile (GDN in-projection, attention qkv, out projections) runs with two pipeline
+/// stages and two blocks an SM: one block output stores and pipeline fill overlap the other K loop. Same arithmetic, same bits.
+pub fn promptGemm2() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_PROMPT_GEMM2") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}

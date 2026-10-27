@@ -167,6 +167,7 @@ pub const Engine = struct {
         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
         // refused before anything loads: a bad TF_FLASHNEXT_CHUNK or TF_FLASHNEXT_PROMPT_EXPERT_TILE leaves no module
         cuda.qmmf.prompt_mx_min_n = knobs.mx128MinN();
+        cuda.qmmf.mx2_tile = knobs.promptGemm2();
         const chunk = try chunkRows();
         const expert_tile = try cuda.nvfp4_tile.Config.fromEnv();
         const e = try gpa.create(Engine);

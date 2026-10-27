@@ -526,8 +526,8 @@ __device__ __forceinline__ void prompt_mx_body(
         }
 }
 
-#define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32)                                                                    \
-    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(                                                   \
+#define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32, MINB)                                                              \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32, MINB) NAME(                                             \
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,     \
         float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {                      \
         tf_qmmf::prompt_mx_body<BM, BN, WM, WN, ST, F32>(x, w, bs, scale, out, M, N, K, npad, ldx, group);                   \
@@ -536,5 +536,9 @@ __device__ __forceinline__ void prompt_mx_body(
 }  // namespace tf_qmmf
 
 // Names the Zig launcher loads (qmmf.zig Lane.prompt_mx): block rows x columns, warps, stages, bf16 or fp32 out.
-TF_PROMPT_MX(tf_qmmf_prompt_mx_bf16, 128, 128, 2, 4, 3, false)
-TF_PROMPT_MX(tf_qmmf_prompt_mx_f32, 128, 128, 2, 4, 3, true)
+TF_PROMPT_MX(tf_qmmf_prompt_mx_bf16, 128, 128, 2, 4, 3, false, 1)
+TF_PROMPT_MX(tf_qmmf_prompt_mx_f32, 128, 128, 2, 4, 3, true, 1)
+// The same tile and arithmetic with two stages and two blocks an SM (TF_FLASHNEXT_PROMPT_GEMM2=1): one block output stores and
+// pipeline fill overlap the other K loop (61 -> 76 TF on the 2560 x 16512 projection, same bits).
+TF_PROMPT_MX(tf_qmmf_prompt_mx2_bf16, 128, 128, 2, 4, 2, false, 2)
+TF_PROMPT_MX(tf_qmmf_prompt_mx2_f32, 128, 128, 2, 4, 2, true, 2)
