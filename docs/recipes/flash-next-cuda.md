@@ -29,6 +29,11 @@ tensorfold-native serve /path/to/checkpoint --temperature 0
   layer reads 512 blocks of 4 keys a row, chosen by the model's block indexer, as the Python engine does.
 - `--parallel N` admits N streams. Each stream's caches are its own: about 110 MiB of DeltaNet state and the n-gram
   tail, plus 28 KiB a token of keys, values and indexer keys, and with drafts its MTP head's cache.
+- `--kv-cache fp8` (one rank, the engine's own glue; not with `--slide`) keeps keys and values as e4m3 codes with a
+  power-of-two scale a position and KV head: 1,056 bytes a position and layer instead of 2,048, so a token's caches take
+  about 17.5 KiB instead of 30 KiB (12 layers and the MTP head's). The indexer's keys, the pooled blocks and the DeltaNet
+  states stay bf16. Attention reads the codes widened to bf16 exactly, so it is the bf16 kernels' arithmetic on rows
+  rounded to e4m3: lossy against a bf16 cache, deterministic for a given prompt. bf16 stays the default.
 - `--no-drafts` serves without the MTP head; `"draft": false` on a request does the same for that request.
 - `TF_FLASHNEXT_DRAFTS` (1 to 15, default 6) and `TF_FLASHNEXT_CONFIDENCE` (default 0.60) set the head's chain.
 - The engine uploads 73.3 GiB of the checkpoint: the n-gram tables stay mapped from the shards, and the vision tower is

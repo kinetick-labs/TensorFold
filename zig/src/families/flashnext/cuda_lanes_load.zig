@@ -21,6 +21,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     if (o.tp != 1 and (mode != .modelopt or captured != null)) return error.UnsupportedQuantization;
     if (o.slide and (mode != .affine or o.tp != 1)) return error.UnsupportedLearningFormat;
     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
+    // --kv-cache fp8 (cuda_kv.zig) is written and read by our own glue on one rank, and the learner's passes keep bf16
+    if (o.kv8 and (o.tp != 1 or captured != null or o.slide)) return error.Fp8KvUnsupported;
     const driver: *cuda.Driver = @constCast(ctx.d);
     const own = try gpa.create(Cuda);
     errdefer gpa.destroy(own);
@@ -47,6 +49,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         r.deinit();
     };
     own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
+    own.engine.kv = if (o.kv8) .fp8 else .bf16;
     if (own.ranks) |r| {
         r.engine = own.engine;
         own.engine.collective = &r.collective;
@@ -56,6 +59,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         if (own.set != null) return error.VisionCapturedSetUnsupported;
         own.vision = try images.Vision.load(gpa, io, driver, own.stream, dir, limits, o.rank, own.glue.f.prep_media, own.glue.f.pool_media);
         own.engine.image_factory = own.vision;
+        if (o.kv8) own.vision.?.prep8 = own.glue.f.prep_media_kv8;
     }
     errdefer if (own.vision) |v| v.deinit();
     // the pass's scratch for a full chunk, once for the engine (every prompt, window, round and head pass)
@@ -76,11 +80,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     own.lanes = .empty;
     own.next = 0;
     if (o.slide) own.lay = try @import("cuda_slide.zig").layoutOf(gpa, io, dir);
-    var stream_bytes = prompt.seqBytes(window);
-    if (own.head) |h| {
-        stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk);
-    } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk);
-    if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
+    const stream_bytes = streamBytes(own.engine.kv, window, if (own.head) |h| h.ids.len else null, own.engine.chunk, o.drafts and o.tp == 2) + if (o.vision) |v| visionStreamBytes(v, o.context) else 0;
     return .{
         .vision = own.vision,
         .backend = own.backend(),
@@ -96,4 +96,19 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         .own_glue = own.set == null,
         .follow = if (o.rank != 0) F.follow else null,
     };
+}
+
+/// Device bytes each admitted stream allocates at a `window`-token cache: its sequence and, with the MTP head (`head_ids` its
+/// draft vocabulary, null without it), the head's cache and window buffers.
+pub fn streamBytes(kv: prompt.kv_format.Kv, window: usize, head_ids: ?usize, chunk: usize, tp_head: bool) usize {
+    var n = prompt.seqBytesFor(kv, window);
+    if (head_ids) |ids| {
+        n += mtp.Draft.bytesFor(kv, window, ids, chunk);
+    } else if (tp_head) n += mtp.Draft.bytesFor(kv, window, 1, chunk);
+    return n;
+}
+
+/// A stream's image rows: the features it holds and 16 bytes of each context position's row bookkeeping.
+fn visionStreamBytes(v: anytype, context: usize) usize {
+    return @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * context;
 }

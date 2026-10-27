@@ -19,6 +19,8 @@ pub const Vision = struct {
     mark_ids: [3]u32,
     prep: cuda.Function,
     pool: cuda.Function,
+    /// fn_attn_prep_media into fp8 caches (--kv-cache fp8); null: bf16 caches.
+    prep8: ?cuda.Function = null,
     pub fn load(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, limits: Limits, rank: usize, prep: cuda.Function, pool: cuda.Function) !*Vision {
         try shared.media.checkLimits(limits);
         const settings = (try shared.Settings.read(a, io, dir)) orelse return error.NoVisionTower;
@@ -67,11 +69,11 @@ pub const Vision = struct {
         return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
     }
     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image) !media.State {
-        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool };
+        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep8 = v.prep8 };
     }
     pub fn receive(v: *Vision, n: usize, runs: []const shared.media.Run) !media.State {
         const p = try shared.media.Plan.init(v.a, n, runs, v.limits);
-        return .{ .image = try shared.media.Media.allocate(p, v.encoder), .prep = v.prep, .pool = v.pool };
+        return .{ .image = try shared.media.Media.allocate(p, v.encoder), .prep = v.prep, .pool = v.pool, .prep8 = v.prep8 };
     }
     pub fn explain(err: anyerror) ?[]const u8 {
         return switch (err) {

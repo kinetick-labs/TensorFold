@@ -525,6 +525,8 @@ pub const SeqState = struct {
     cap: usize,
     /// Block scores for an attention block's rows [min(rows, att_rows), scoreStride(cap)] fp32 (the engine's).
     scores: u64,
+    /// The format of kc and vc (cuda_kv.zig): bf16 rows, or --kv-cache fp8's codes and scales.
+    kv: @import("cuda_kv.zig").Kv = .bf16,
 };
 
 /// The block scores' row stride for a cache of `cap` tokens: its blocks rounded up to 16 (the captured _scores').

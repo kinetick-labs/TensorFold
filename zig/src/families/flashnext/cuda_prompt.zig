@@ -10,6 +10,7 @@ const load = @import("cuda_prompt_load.zig");
 pub const batch = @import("cuda_batch.zig");
 const fb = @import("cuda_fn_back.zig");
 const pocket = @import("cuda_pocket.zig");
+pub const kv_format = @import("cuda_kv.zig");
 
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
@@ -106,8 +107,13 @@ pub const kv_row_bytes: usize = kv_heads * head_dim * 2;
 
 /// Device bytes `Engine.newSeq(cap)` allocates: conv tails, recurrent states, KV with indexer keys, the n-gram tail.
 pub fn seqBytes(cap: usize) usize {
+    return seqBytesFor(.bf16, cap);
+}
+
+/// seqBytes with the attention caches in format `format` (--kv-cache): 1,056 bytes a position and layer for fp8 keys and values.
+pub fn seqBytesFor(format: kv_format.Kv, cap: usize) usize {
     const linear = linear_n * ((gdn.taps - 1) * gdn.conv_dim * 2 + state_n * 4);
-    const attn = attn_n * (cap * (2 * kv_row_bytes + index_dim * 2) + pooledBytes(cap));
+    const attn = attn_n * (cap * format.position() + pooledBytes(cap));
     return linear + attn + ple_tail_n * wide * 2;
 }
 
@@ -148,6 +154,8 @@ pub const Engine = struct {
     pockets: pocket.Pockets = .{},
     /// During a round of taught and untaught streams: its rows' pocket scales (0 on an untaught row); 0: none.
     taught_rows: u64 = 0,
+    /// The attention caches' format of every sequence this engine makes (--kv-cache); set before the first newSeq.
+    kv: kv_format.Kv = .bf16,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         return initRank(gpa, io, driver, stream, model_dir, 1, 0);
@@ -168,6 +176,7 @@ pub const Engine = struct {
         e.collective = null;
         e.image_factory = null;
         e.round_graph = .{};
+        e.kv = .bf16;
         errdefer for (e.layers[0..e.n_layers]) |*l| l.free(gpa);
         e.model_dir = try gpa.dupe(u8, model_dir);
         errdefer gpa.free(e.model_dir);
@@ -306,14 +315,15 @@ pub const Engine = struct {
             .fed = 0,
             .logits = &.{},
             .cap = cap,
+            .kv = e.kv,
         };
         // One rollback owns every published array, and drains before releasing any destination.
         errdefer seq.deinit(e.gpa);
         seq.logits = try e.gpa.alloc(u8, vocab * 2);
         seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, (gdn.taps - 1) * gdn.conv_dim * 2);
         seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, state_n * 4);
-        seq.kc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * kv_heads * head_dim * 2);
-        seq.vc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * kv_heads * head_dim * 2);
+        seq.kc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * e.kv.keyRow());
+        seq.vc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * e.kv.valueRow());
         seq.ikc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * index_dim * 2);
         seq.pooled = try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
@@ -467,10 +477,12 @@ pub const Seq = struct {
     cap: usize,
     /// The model as shipped: no learned neuron acts on its rows (a lesson writer's and its judge's reads).
     untaught: bool = false,
+    /// The format of kc and vc (the engine's --kv-cache).
+    kv: kv_format.Kv = .bf16,
 
     /// The caches a batched pass reads and leaves; `scores` the engine's block scores (Engine.reserveScores).
     pub fn view(s: *Seq, scores: u64) batch.SeqState {
-        return .{ .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores };
+        return .{ .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores, .kv = s.kv };
     }
 
     pub fn deinit(s: *Seq, gpa: std.mem.Allocator) void {
@@ -513,6 +525,17 @@ test "a sequence's device bytes grow by the twelve attention layers' keys, value
     try std.testing.expectEqual(per_token, seqBytes(6) - seqBytes(5));
     try std.testing.expectEqual(per_token + attn_n * index_dim * 2, seqBytes(5) - seqBytes(4));
     try std.testing.expect(seqBytes(max_tokens) > max_tokens * per_token);
+}
+
+test "fp8 caches take 1,056 + 256 bytes a position and layer, and the pooled blocks stay bf16" {
+    const per_token = attn_n * (kv_format.Kv.fp8.kvRow() + index_dim * 2);
+    try std.testing.expectEqual(per_token, seqBytesFor(.fp8, 6) - seqBytesFor(.fp8, 5));
+    try std.testing.expectEqual(per_token + attn_n * index_dim * 2, seqBytesFor(.fp8, 5) - seqBytesFor(.fp8, 4));
+    // the default format is the one seqBytes always had
+    for ([_]usize{ 0, 1, 4, 5, 4096, max_tokens }) |cap| try std.testing.expectEqual(seqBytes(cap), seqBytesFor(.bf16, cap));
+    // 12 layers of 1,376 bytes a token against 2,368 (the MTP head's layer is counted by its draft cache)
+    const d = seqBytesFor(.bf16, max_tokens) - seqBytesFor(.fp8, max_tokens);
+    try std.testing.expectEqual(max_tokens * attn_n * (2048 - 1056), d);
 }
 
 test "a failed fill frees the buffer it was filling and every one before it" {
@@ -569,4 +592,5 @@ test "TF_FLASHNEXT_CHUNK takes 1 to the largest measured pass and refuses the re
 
 test {
     _ = @import("cuda_sequence_completion_test.zig");
+    _ = kv_format;
 }

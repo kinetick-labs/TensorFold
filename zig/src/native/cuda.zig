@@ -508,6 +508,7 @@ test "Flash Next takes --vision at family admission" {
     try @import("cuda_flashnext_refusal_test.zig").vision();
 }
 test {
+    _ = @import("cuda_flashnext_kv8_test.zig");
     _ = @import("cuda_health_test.zig");
     _ = @import("cuda_vision_offer.zig");
     _ = kv_pages;

@@ -6,8 +6,10 @@ pub const State = struct {
     image: shared.media.Media,
     prep: cuda.Function,
     pool: cuda.Function,
+    /// The prep kernel for fp8 caches (--kv-cache fp8); null: bf16 caches.
+    prep8: ?cuda.Function = null,
     pub fn view(s: *const State) View {
-        return .{ .image = s.image.view(), .prep = s.prep, .pool = s.pool };
+        return .{ .image = s.image.view(), .prep = s.prep, .pool = s.pool, .prep8 = s.prep8 };
     }
     pub fn deinit(s: *State) void {
         s.image.deinit();
@@ -17,7 +19,15 @@ pub const View = struct {
     image: shared.media.View,
     prep: cuda.Function,
     pool: cuda.Function,
+    prep8: ?cuda.Function = null,
     pub fn attn(v: View, stream: cuda.Stream, proj: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize) !void {
+        return v.attnWith(v.prep, stream, proj, pos, qw, kw, iw, inv, q, kc, vc, iq, ikc, eps, rows);
+    }
+    /// attn into fp8 caches (cuda_kv.zig); the same arguments and grid.
+    pub fn attnKv8(v: View, stream: cuda.Stream, proj: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize) !void {
+        return v.attnWith(v.prep8 orelse return error.Fp8KvUnsupported, stream, proj, pos, qw, kw, iw, inv, q, kc, vc, iq, ikc, eps, rows);
+    }
+    fn attnWith(v: View, prep: cuda.Function, stream: cuda.Stream, proj: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize) !void {
         var a: cuda.Args = .{};
         for ([_]u64{ proj, pos, qw, kw, iw, inv, q, kc, vc, iq, ikc }) |x| a.add(x);
         a.add(eps);
@@ -25,7 +35,7 @@ pub const View = struct {
         a.add(v.image.rope);
         a.add(@as(i32, @intCast(v.image.n)));
         a.add(v.image.delta);
-        try cuda.launch.launch(v.prep, .{ .grid = .{ .x = @intCast(rows), .y = wt.q_heads + wt.kv_heads + wt.index_heads + 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, stream, &a);
+        try cuda.launch.launch(prep, .{ .grid = .{ .x = @intCast(rows), .y = wt.q_heads + wt.kv_heads + wt.index_heads + 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, stream, &a);
     }
     pub fn pooled(v: View, stream: cuda.Stream, ikc: u64, out: u64, pos: u64, w: u64, inv: u64, eps: f32, rows: usize) !void {
         var a: cuda.Args = .{};
