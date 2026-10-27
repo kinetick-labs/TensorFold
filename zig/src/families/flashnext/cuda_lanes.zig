@@ -582,6 +582,7 @@ pub fn Namespace(comptime Tri: type) type {
                 if (l.draft != null) return error.TensorRankDraftSnapshotUnavailable;
                 return try r.save(&l.seq);
             }
+            if (l.draft) |*d| try self.ops().flushLate(&l.seq, d);
             return try snap.save(self.gpa, self.engine.driver, self.stream, &l.seq, if (l.draft) |*d| d else null);
         }
 

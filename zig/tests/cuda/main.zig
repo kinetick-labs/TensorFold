@@ -80,6 +80,7 @@ const flashnext_model_rank_tests = @import("flashnext_model_rank_tests.zig");
 const flashnext_fidelity_tests = @import("flashnext_fidelity_tests.zig");
 const flashnext_window_tests = @import("flashnext_window_tests.zig");
 const flashnext_windows_tests = @import("flashnext_windows_tests.zig");
+const flashnext_keep_late_tests = @import("flashnext_keep_late_tests.zig");
 const flashnext_mtp_parity_tests = @import("flashnext_mtp_parity_tests.zig");
 const flashnext_score_tests = @import("flashnext_score_tests.zig");
 const flashnext_rank_tests = @import("flashnext_rank_tests.zig");
@@ -115,6 +116,7 @@ const usage =
     \\  flashnext-fidelity-rank MODEL RANK PORT FIXTURE OUTPUT  fixed-history full score rows
     \\  flashnext-window-rank MODEL RANK PORT IDS_FILE  two-rank serial/window and rollback parity
     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+    \\  flashnext-keep-late MODEL IDS_FILE  windows kept in part with TF_FLASHNEXT_KEEP_LATE's waiting rows against the replaying rollback, byte for byte
     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE  explicit full-model replay experiment (no drafts)
@@ -291,6 +293,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single-serial")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), true);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-rank")) return flashnext_fidelity_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "flashnext-windows")) return flashnext_windows_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "flashnext-keep-late")) return flashnext_keep_late_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-mtp-parity")) return flashnext_mtp_parity_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-score")) return flashnext_score_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-window-rank")) return flashnext_window_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));

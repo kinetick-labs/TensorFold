@@ -16,6 +16,11 @@ pub const proj_width: usize = conv_dim + nv * dv + 2 * nv;
 pub const value_dim: usize = nv * dv;
 pub const groups: usize = value_dim / qmm.group;
 
+/// A row of the DeltaNet log (TF_FLASHNEXT_KEEP_LATE) a layer: the front's k [nk, dk], v [nv, dv] and decay and beta gates [nv, 2], fp32.
+pub const log_row_k: usize = nk * dk * 4;
+pub const log_row_v: usize = value_dim * 4;
+pub const log_row_gb: usize = nv * 2 * 4;
+
 const symbol: [:0]const u8 = "flashnext_gdn_chain";
 
 fn toBf16(v: f32) u16 {

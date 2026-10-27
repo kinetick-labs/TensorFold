@@ -89,6 +89,11 @@ pub const LayerKeep = struct {
     hist: u64 = 0,
     /// The chain's end state goes here, the sequence's own left as before the chunk; 0: in place.
     state_out: u64 = 0,
+    /// DeltaNet with TF_FLASHNEXT_KEEP_LATE: the lane's log of rows [rows, ...] as the front leaves them (k [rows, 16, 128], v and
+    /// the decay and beta gates [rows, 48, 128 | 2], fp32); the window's rows go after the Keep's `pend` rows already waiting there.
+    log_k: u64 = 0,
+    log_v: u64 = 0,
+    log_gb: u64 = 0,
     attn_hc: HcKeep = .{},
     mlp_hc: HcKeep = .{},
     /// The mixer's and the MoE's branches [rows, dims] bf16 as the write-backs add them (the MoE's with its pocket).
@@ -109,6 +114,8 @@ pub const LayerKeep = struct {
 pub const Keep = struct {
     layers: [layers_n]LayerKeep = @splat(.{}),
     mixer: HcKeep = .{},
+    /// Rows of earlier windows kept but not yet taken by the DeltaNet states (the logs' first rows): this pass's chain takes them first.
+    pend: u32 = 0,
 };
 
 /// A sequence of a training pass (Pass.spans): its first row and its rows.
@@ -161,6 +168,10 @@ pub const Kernels = struct {
     front: cuda.Function,
     chain: cuda.Function,
     chain_to: cuda.Function,
+    /// fn_gdn_rows_to after the rows a log holds (TF_FLASHNEXT_KEEP_LATE).
+    chain_late: cuda.Function,
+    /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
+    conv_roll: cuda.Function,
     chain_tpr: cuda.Function,
     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
     gdn_fused: cuda.Function,
@@ -208,6 +219,8 @@ pub const Kernels = struct {
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
+        k.chain_late = try k.batch.function("fn_gdn_rows_late");
+        k.conv_roll = try k.batch.function("fn_conv_roll");
         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
         k.gdn_fused = try k.batch.function("fn_gdn_fused");
