@@ -48,6 +48,7 @@ pub const act_rows = @import("act_rows.zig");
 pub const gdn_prep = @import("gdn_prep.zig");
 pub const qk_rows = @import("qk_rows.zig");
 pub const experts = @import("experts.zig");
+pub const nvfp4_tile = @import("nvfp4_tile.zig");
 pub const sample = @import("sample.zig");
 pub const rank_scatter = @import("rank_scatter.zig");
 pub const relay_plan = @import("relay_plan.zig");
@@ -91,6 +92,7 @@ test {
     _ = @import("qk_rows.zig");
     _ = @import("exl3_candidate.zig");
     _ = @import("experts.zig");
+    _ = nvfp4_tile;
     _ = @import("sample.zig");
     _ = @import("roce.zig");
     _ = @import("roce_nap.zig");

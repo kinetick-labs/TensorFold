@@ -2,6 +2,10 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- Flash Next on CUDA runs the routed NVFP4 experts of prompt chunks of 1,024 rows or more (the NVIDIA FP4 checkpoint) on shared-memory row tiles of 64 pairs, `nvfp4_experts_tile.cu`, with the decode kernel's bytes: a pair's sums run in the same order, so output does not depend on the kernel or the plan's tile. `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` (the default at one rank) takes gate/up and down, `1` gate/up only, `0` keeps the decode kernel on 16-pair items; `_CFG=pairs,gate_up,down` and `_ROWS` tune it. `tf-cuda-test nvfp4-experts-tile` compares the bytes and times a layer on a GPU. `tf-cuda-test` and `install` build again: `w4a8_tests.zig` passes the quantizer flag `Kernels.prompt` takes, and `contract_controls.cu` includes `act_round.cuh` before it uses it.
+
 ## 1.1.4
 
 - Qwen3.8-27B on CUDA has a new default prompt and decode recipe: prompts run in 4,096-row chunks with tensor-core attention and a chained delta rule, decode attention runs on tensor cores for bf16 and fp8 caches, and DFlash2 verify rounds take less time. On a GB10, cold prefill goes from 834 to 1,281 tokens/s at 2k (+54%), 612 to 1,266 at 8k (+107%), 326 to 1,165 at 32k (+258%) and 203 to 1,045 at 64k (+416%), and the decode sweep gains 1.8% to 2.2% at 1 to 8 streams. Quality equals the previous recipe's, 27 of 40 exact cases on both. The prompt arithmetic changed, so replies can differ in bits from 1.1.3; every stream still equals its run alone, a resumed prompt equals a fresh one, and a reply's tokens are always the target's picks. A query-to-KV head ratio or window the kernels do not take is refused at admission, before anything is allocated (#1079, #1080, #1168). Thanks to @BobClawblaw.

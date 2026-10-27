@@ -155,6 +155,8 @@ pub const Kernels = struct {
     tiles: tk.TileKernels,
     native_lane: cuda.qmmf.Lane,
     nvfp4: cuda.experts.Nvfp4Experts,
+    /// Prompt chunks' routed NVFP4 experts on shared-memory row tiles, the decode kernel's bits; null: not taken.
+    expert_tile: ?cuda.nvfp4_tile.Tile,
     front: cuda.Function,
     chain: cuda.Function,
     chain_to: cuda.Function,
@@ -169,7 +171,7 @@ pub const Kernels = struct {
     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
     select: cuda.Function,
 
-    pub fn load(d: *const cuda.Driver) !Kernels {
+    pub fn load(d: *const cuda.Driver, tile_cfg: cuda.nvfp4_tile.Config) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var k: Kernels = undefined;
         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
@@ -194,6 +196,9 @@ pub const Kernels = struct {
         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, device), "cuDeviceGetAttribute");
         k.nvfp4 = try cuda.experts.Nvfp4Experts.load(d, @intCast(sms));
         errdefer k.nvfp4.unload();
+        k.expert_tile = if (tile_cfg.mode == .off) null else try cuda.nvfp4_tile.Tile.load(d, @intCast(sms), tile_cfg);
+        errdefer if (k.expert_tile) |*t| t.unload();
+        std.log.info("flashnext: prompt experts on shared-memory row tiles: {s}, {d} pairs an item, from {d} rows", .{ @tagName(tile_cfg.mode), tile_cfg.pairs, tile_cfg.min_rows });
         k.sum = try k.batch.function("fn_sum_slices");
         k.moe_sum = try k.batch.function("fn_moe_sum");
         k.copy_cols = try k.batch.function("fn_copy_cols");
@@ -211,6 +216,7 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
+        if (k.expert_tile) |*t| t.unload();
         k.nvfp4.unload();
         k.native_lane.unload();
         k.batch.unload();

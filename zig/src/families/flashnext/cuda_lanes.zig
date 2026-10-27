@@ -541,7 +541,7 @@ pub fn Namespace(comptime Tri: type) type {
             _ = @import("cuda_score.zig").CapabilityCases(Cuda);
         }
 
-        test "a bad TF_FLASHNEXT_CHUNK is refused at load before the loader takes a stream, a module or a buffer" {
+        test "a bad TF_FLASHNEXT_CHUNK or PROMPT_EXPERT_TILE is refused at load before the loader takes anything" {
             const env = @import("sys").env;
             defer _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
             // every driver entry point undefined: the refusal must come before the first call
@@ -550,6 +550,12 @@ pub fn Namespace(comptime Tri: type) type {
             for ([_][*:0]const u8{ "0", "16385", "4k" }) |bad| {
                 _ = env.setenv("TF_FLASHNEXT_CHUNK", bad, 1);
                 try std.testing.expectError(error.BadChunk, open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
+            }
+            _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
+            defer _ = env.unsetenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE");
+            for ([_][*:0]const u8{ "3", "on" }) |bad| {
+                _ = env.setenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE", bad, 1);
+                try std.testing.expectError(error.BadExpertTile, open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
             }
         }
 

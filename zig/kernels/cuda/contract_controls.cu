@@ -75,6 +75,8 @@ extern "C" __global__ void __launch_bounds__(tf_qk_round::WIDE) tf_ctl_qk_round(
     tf_qk_round::rows(in, nw, cosv, sinv, inv, rot, pos, slot, dst, kc, vc, len, h, hk, eps, keep);
 }
 
+#include "act_round.cuh"
+
 // Gate 3: act_rows.cu's tf_softcap_rows keeping only the rounding points in `keep`; the exact check must go red.
 extern "C" __global__ void __launch_bounds__(256) tf_ctl_softcap(const __nv_bfloat16* x, __nv_bfloat16* out, int n,
                                                                   float cap, int keep) {

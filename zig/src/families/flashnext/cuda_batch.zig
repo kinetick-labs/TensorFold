@@ -460,12 +460,8 @@ pub fn Pass(comptime Tri: type) type {
             const e = experts_n + 1;
             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
             if (lw.native_experts) |*native| {
-                const owned = &native.experts;
                 try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
-                try self.k.router.route(self.stream, s.picks, pairs, e, 16, plan);
-                const items = cuda.grouped.maxItems(pairs, e, 16);
-                try self.k.nvfp4.run(self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, experts_n);
-                try self.k.nvfp4.run(self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, experts_n);
+                try @import("cuda_batch_moe.zig").nativeRouted(self, native, plan);
                 if (native.rank == 0) {
                     const glue = self.tri.own orelse return error.NativeGlueRequired;
                     try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
