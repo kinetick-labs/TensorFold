@@ -2,6 +2,7 @@
 const lanes = @import("lanes");
 const prompt = @import("cuda_prompt.zig");
 const mtp = @import("cuda_mtp.zig");
+const hd = @import("cuda_host_draw.zig");
 const be = lanes.backend;
 
 /// Windows a shared pass takes at most (a round's streams).
@@ -28,7 +29,17 @@ pub fn windows(self: anytype, wins: []const be.Window, out: []be.Verified, draft
         if (n == 1 or self.ranks != null or cap <= 1) {
             for (seqs[0..n], ds[0..n], idss[0..n]) |q, d, ids| try self.ops().verify(q, d, ids);
         } else try self.ops().verifyMany(seqs[0..n], ds[0..n], idss[0..n], self.logits.ptr);
-        for (drafted[at..][0..n], ds[0..n]) |wi, d| try self.ops().draws(d, wins[wi].stream.sampling, wins[wi].masks, out[wi].sampled[0..wins[wi].rows()]);
+        if ((hd.threads() > 0 or mtp.candidatesOn()) and n > 0) {
+            var sms: [round_streams]?mtp.Sampling = undefined;
+            var masks: [round_streams][]const u32 = undefined;
+            var outs: [round_streams][]u32 = undefined;
+            for (drafted[at..][0..n], 0..) |wi, i| {
+                sms[i] = wins[wi].stream.sampling;
+                masks[i] = wins[wi].masks;
+                outs[i] = out[wi].sampled[0..wins[wi].rows()];
+            }
+            try self.ops().drawsMany(ds[0..n], sms[0..n], masks[0..n], outs[0..n]);
+        } else for (drafted[at..][0..n], ds[0..n]) |wi, d| try self.ops().draws(d, wins[wi].stream.sampling, wins[wi].masks, out[wi].sampled[0..wins[wi].rows()]);
         at += n;
     }
 }
