@@ -172,6 +172,11 @@ pub const Kernels = struct {
     chain_late: cuda.Function,
     /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
     conv_roll: cuda.Function,
+    /// The three launches a lane-batched shared round takes a DeltaNet layer (TF_FLASHNEXT_GDN_LANES): front with the projection
+    /// copy, the late chain, the history copy with the window shift, each for every lane.
+    front_lanes: cuda.Function,
+    chain_lanes: cuda.Function,
+    shift_lanes: cuda.Function,
     chain_tpr: cuda.Function,
     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
     gdn_fused: cuda.Function,
@@ -221,6 +226,9 @@ pub const Kernels = struct {
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
         k.chain_late = try k.batch.function("fn_gdn_rows_late");
         k.conv_roll = try k.batch.function("fn_conv_roll");
+        k.front_lanes = try k.batch.function("fn_gdn_front_lanes");
+        k.chain_lanes = try k.batch.function("fn_gdn_rows_late_lanes");
+        k.shift_lanes = try k.batch.function("fn_shift_window_lanes");
         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
         k.gdn_fused = try k.batch.function("fn_gdn_fused");
@@ -363,6 +371,8 @@ pub const Scratch = struct {
     host: ?cuda.HostBuffer = null,
     /// The uploads from `host` and the event recorded after a pass's last one: the next pass waits before writing it.
     staging: ?Staging(Uploads) = null,
+    /// The shared expert's second stream and its fork and join events, made on first use (cuda_batch_side.zig).
+    side: ?@import("cuda_batch_side.zig").Side = null,
 
     fn add(s: *Scratch, gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !u64 {
         var b = try cuda.DeviceBuffer.alloc(d, @max(len, 256));
@@ -517,6 +527,8 @@ pub const Scratch = struct {
     }
 
     pub fn free(s: *Scratch, gpa: std.mem.Allocator) void {
+        // the stream drains first: its kernels read and write buffers freed below
+        if (s.side) |*sd| sd.deinit();
         if (s.staging) |*g| {
             // no queued upload may still read `host`; a wait that fails has lost the context, and its copies with it
             g.ready() catch {};

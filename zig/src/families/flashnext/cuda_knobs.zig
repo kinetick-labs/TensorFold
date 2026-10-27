@@ -74,3 +74,10 @@ pub fn promptGemm2() bool {
     const v = std.c.getenv("TF_FLASHNEXT_PROMPT_GEMM2") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
+
+/// TF_FLASHNEXT_GDN_LANES=1: a shared round's DeltaNet layers take every lane's rows in three launches (front, late chain, window
+/// shift) instead of five a lane. Each lane's kernel program is the per-lane one's on its own pointers: the same bytes out.
+pub fn gdnLanes() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_GDN_LANES") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}

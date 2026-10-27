@@ -12,6 +12,7 @@ const batch_lanes = @import("cuda_batch_lanes.zig");
 const tiles = @import("cuda_tiles.zig");
 const tk = @import("cuda_tile_kernels.zig");
 const knobs = @import("cuda_knobs.zig");
+const side_ = @import("cuda_batch_side.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -309,6 +310,8 @@ pub fn Pass(comptime Tri: type) type {
             } else if (self.lanes.len == 0) {
                 try self.gdnFront(lw, s.proj, self.seq.conv[li].ptr, n, s.gq, s.gk, s.gv, s.ggb);
                 try self.gdnChain(s.gq, s.gk, s.gv, s.ggb, self.seq.state[li].ptr, keep.state_out, n, s.ys);
+            } else if (try self.gdnLanesBatched(lw, layer, li)) {
+                // every lane's rows in three launches (TF_FLASHNEXT_GDN_LANES)
             } else {
                 // shared rounds: each lane's rows kept, fronted and chained on its own conv window and state
                 var row0: usize = 0;
@@ -336,6 +339,62 @@ pub fn Pass(comptime Tri: type) type {
             if (!fused) try gdn_fused.norm(self.k.gnorm, self.stream, s.ys, s.proj, lw.norm.ptr, s.gout, s.gxs, n);
             if (self.lanes.len == 0) try self.shiftWindow(self.seq.conv[li].ptr, s.proj, gdn.proj_width, n, gdn.taps - 1, gdn.conv_dim);
             self.out_slices = try self.lane(s.gout, s.gxs, lw.out, s.dummy, s.part, n, out_sk);
+        }
+
+        /// A shared round's DeltaNet layer for all lanes at once when every lane logs its rows (TF_FLASHNEXT_GDN_LANES): the copies
+        /// of the projection rows and the conv history, the front, the late chain and the window shift as three launches. False
+        /// (nothing queued) when a lane does not log or there are more lanes than a launch takes.
+        fn gdnLanesBatched(self: *Self, lw: *const Layer, layer: usize, li: usize) !bool {
+            if (!knobs.gdnLanes() or self.lanes.len > gdn.lanes_max) return false;
+            const s = self.s;
+            for (self.lanes) |l| {
+                const kp = l.keep orelse return false;
+                const lk = kp.layers[layer];
+                if (lk.log_k == 0 or lk.log_v == 0 or lk.log_gb == 0 or lk.proj % 4 != 0) return false;
+            }
+            var tab: gdn.Lanes = std.mem.zeroes(gdn.Lanes);
+            var row0: usize = 0;
+            var max_rows: usize = 0;
+            for (self.lanes, 0..) |l, i| {
+                const kp = l.keep.?;
+                const lk = kp.layers[layer];
+                const st = l.seq.state[li].ptr;
+                tab.lane[i] = .{
+                    .proj = s.proj + row0 * gdn.proj_width * 2,
+                    .conv = l.seq.conv[li].ptr,
+                    .proj_save = lk.proj,
+                    .hist_save = lk.hist,
+                    .qn = s.gq + row0 * gdn.nk * gdn.dk * 4,
+                    .log_k = lk.log_k,
+                    .log_v = lk.log_v,
+                    .log_gb = lk.log_gb,
+                    .state_in = st,
+                    .state_out = if (lk.state_out != 0) lk.state_out else st,
+                    .ys = s.ys + row0 * gdn.value_dim * 4,
+                    .rows = cint(l.rows),
+                    .np = cint(kp.pend),
+                };
+                max_rows = @max(max_rows, l.rows);
+                row0 += l.rows;
+            }
+            tab.count = cint(self.lanes.len);
+            tab.max_rows = cint(max_rows);
+            const z: u32 = @intCast(self.lanes.len);
+            var f: cuda.Args = .{};
+            f.add(tab);
+            f.add(lw.cw.ptr);
+            f.add(lw.a_log.ptr);
+            f.add(lw.dt.ptr);
+            try cuda.launch.launch(self.k.front_lanes, .{ .grid = .{ .x = @intCast(max_rows), .y = gdn.nk + gdn.nv, .z = z }, .block = .{ .x = 256 } }, self.stream, &f);
+            var a: cuda.Args = .{};
+            a.add(tab);
+            try cuda.launch.launch(self.k.chain_lanes, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16, .z = z }, .block = .{ .x = 128 } }, self.stream, &a);
+            var h: cuda.Args = .{};
+            h.add(tab);
+            h.add(cint(gdn.taps - 1));
+            h.add(cint(gdn.conv_dim));
+            try cuda.launch.launch(self.k.shift_lanes, .{ .grid = .{ .x = @intCast(cdiv(gdn.conv_dim, 256)), .y = z }, .block = .{ .x = 256 } }, self.stream, &h);
+            return true;
         }
 
         /// fn_gdn_front over `rows` projection rows after the conv window `conv`.
@@ -498,11 +557,54 @@ pub fn Pass(comptime Tri: type) type {
             return self.moeBlockKeep(lw, .{});
         }
 
+        /// The native shared expert's three projections and SwiGLU, then its scatter into y's last slot (unless `direct`: the
+        /// next write-back reads the fp32 output where it lies), queued on `stream`.
+        fn sharedExpert(self: *Self, native: anytype, stream: cuda.Stream, direct: bool) !void {
+            const s = self.s;
+            const n = self.rows;
+            const glue = self.tri.own orelse return error.NativeGlueRequired;
+            try self.k.native_lane.matmul(stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+            try self.k.native_lane.matmul(stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+            try glue.sharedSwiGLU(stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
+            try self.k.native_lane.matmulF32(stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
+            if (!direct) try glue.sharedScatter(stream, s.shared_out, s.y, n, dims, slots);
+        }
+
+        /// The side stream's NaN fill of what the shared expert writes (TF_FLASHNEXT_SHARED_SIDE_POISON=1).
+        fn poisonShared(self: *Self, stream: cuda.Stream) !void {
+            const s = self.s;
+            const n = self.rows;
+            const d = stream.d;
+            inline for (.{ .{ s.shared_gate, n * moe_w * 2 }, .{ s.shared_up, n * moe_w * 2 }, .{ s.shared_act, n * moe_w * 2 }, .{ s.shared_out, n * dims * 4 }, .{ s.native_part, 8 * n * dims * 4 } }) |b| {
+                try d.check(d.api.cuMemsetD8Async(b[0], 0xff, b[1], stream.handle), "cuMemsetD8Async");
+            }
+        }
+
         /// moeBlock, keeping its input, experts and weights.
         pub fn moeBlockKeep(self: *Self, lw: *const Layer, keep: LayerKeep) !void {
             const s = self.s;
             const n = self.rows;
             const pairs = n * slots;
+            // The shared expert reads the normalized rows (s.mixed) and nothing the router and routed experts write; its
+            // scratch is its own for the window and its y slot is outside theirs. On the side stream it starts at once.
+            // A prompt chunk that reads the shared output in place (shared_direct) stays on the compute stream.
+            var side: ?*const side_.Side = null;
+            errdefer if (side) |sd| sd.end(self.stream) catch {};
+            var direct = false;
+            if (lw.native_experts) |*native| {
+                // one rank: the routed kernels and the shared scatter write every slot of every row; ranks sum partial rows
+                if (native.world != 1 or native.rank != 0) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
+                // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
+                direct = native.rank == 0 and self.prompt and knobs.sharedDirect() and (self.hooks.logits == .none or self.hooks.streams != 0) and self.hooks.moe_add == null and self.m.pocket == null and keep.moe_branch == 0 and native.world == 1;
+                if (native.rank == 0 and !direct) {
+                    if (try side_.get(&s.side, self.stream.d)) |sd| if (sd.applies(self.prompt)) {
+                        try sd.begin(self.stream);
+                        side = sd;
+                        if (side_.poison()) try self.poisonShared(sd.stream);
+                        try self.sharedExpert(native, sd.stream, false);
+                    };
+                }
+            }
             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
             try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
             try self.tri.topkMany(s.router_l, s.picks, s.wts, n);
@@ -511,19 +613,14 @@ pub fn Pass(comptime Tri: type) type {
             const e = experts_n + 1;
             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
             if (lw.native_experts) |*native| {
-                // one rank: the routed kernels and the shared scatter write every slot of every row; ranks sum partial rows
-                if (native.world != 1 or native.rank != 0) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
                 try @import("cuda_batch_moe.zig").nativeRouted(self, native, plan);
-                if (native.rank == 0) {
-                    const glue = self.tri.own orelse return error.NativeGlueRequired;
-                    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
-                    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
-                    try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
-                    try self.k.native_lane.matmulF32(self.stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
-                    // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
-                    if (self.prompt and knobs.sharedDirect() and (self.hooks.logits == .none or self.hooks.streams != 0) and self.hooks.moe_add == null and self.m.pocket == null and keep.moe_branch == 0 and native.world == 1) {
-                        self.shared_direct = true;
-                    } else try glue.sharedScatter(self.stream, s.shared_out, s.y, n, dims, slots);
+                if (side) |sd| {
+                    // behind the join nothing of the shared expert is in flight: s.y is whole and its scratch is free
+                    side = null;
+                    try sd.end(self.stream);
+                } else if (native.rank == 0) {
+                    try self.sharedExpert(native, self.stream, direct);
+                    if (direct) self.shared_direct = true;
                 }
                 if (native.world != 1) {
                     const collective = self.m.collective orelse return error.TensorParallelUnavailable;
