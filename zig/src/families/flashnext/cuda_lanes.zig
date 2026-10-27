@@ -273,7 +273,7 @@ pub fn Namespace(comptime Tri: type) type {
                     dropLane(self, l);
                     self.lanes.removeByPtr(gop.key_ptr);
                 }
-                if (drafting) l.draft = try mtp.Draft.initFor(self.engine.kv, self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
+                if (drafting) l.draft = try mtp.Draft.initFor(mtp.headFormat(self.engine.kv, cap, @min(self.context + mtp.max_rows, prompt.max_tokens), self.head.?.ids.len, self.engine.chunk), self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
                 if (s.images.len != 0) {
                     const v = self.vision orelse return error.VisionNotEnabled;
                     l.seq.media = try v.state(ids, s.images);
@@ -563,7 +563,8 @@ pub fn Namespace(comptime Tri: type) type {
 
         fn snapBytes(ptr: *anyopaque, at: u32) u64 {
             const self = of(ptr);
-            return snap.bytesFor(self.engine.kv, at, self.head != null);
+            // a state is sized by the larger head cache a stream may hold
+            return snap.bytesWith(self.engine.kv, if (self.head != null) .bf16 else null, at);
         }
 
         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).

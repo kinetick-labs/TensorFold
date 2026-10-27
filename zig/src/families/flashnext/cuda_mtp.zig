@@ -247,6 +247,7 @@ pub fn headBytes() usize {
     return experts + attn + draft + 2 * dims * dims / 2 * 5 / 4;
 }
 
+pub const headFormat = @import("cuda_mtp_draft.zig").headFormat;
 pub const Pick = @import("cuda_mtp_draft.zig").Pick;
 pub const Chain = @import("cuda_mtp_draft.zig").Chain;
 pub const Draft = @import("cuda_mtp_draft.zig").Draft;

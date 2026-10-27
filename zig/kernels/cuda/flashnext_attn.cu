@@ -309,7 +309,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
     // ONE: one [TK] buffer, the tile's keys and then, once the scores are taken, its values (fewer bytes, more blocks)
     __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NB * 2 * TK));
     __shared__ float red_m[4][QR], red_l[4][QR];
-    __shared__ int key_ids[NB][TK];
+    __shared__ int key_ids[KV8 ? 2 : NB][TK];
     const int r = blockIdx.x, hk = blockIdx.y, c = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     int n = POS0[0] + r + 1;
@@ -343,30 +343,46 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
             qmm_frag::commit();
         }
     };
-    // KV8: the keys (pass 0) or values (pass 1) of the tile whose ids are in key_ids[0], 16 codes a thread-item, widened
-    // into the one buffer (blockDim 128: a tile is TK x HD / 16 items, four a thread); an absent key is zero codes, scale 0
-    auto stage_kv8 = [&](int pass) {
+    // KV8: a thread's four 16-code items a tile and pass (blockDim 128: a tile is TK x HD / 16 items), their codes and the key's
+    // scale held in registers: the next tile's loads are issued before this tile's math, so their latency hides behind it. An
+    // absent key is zero codes, scale 0.
+    uint4 raw_k[4], raw_v[4];
+    float raw_sk[4], raw_sv[4];
+    auto fetch_kv8 = [&](int ids_buf, int pass) {
         const unsigned char* kc = reinterpret_cast<const unsigned char*>(KC);
         const unsigned char* vc = reinterpret_cast<const unsigned char*>(VC);
 #pragma unroll
         for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
-            const int e = threadIdx.x + i * 128, k = e / (HD / 16), c = e % (HD / 16), key = key_ids[0][k];
+            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16), key = key_ids[ids_buf][k];
             uint4 w = make_uint4(0u, 0u, 0u, 0u);
-            float s = 0.0f;
+            float sc = 0.0f;
             if (key >= 0) {
                 const long long slot = static_cast<long long>(key) * HK + hk;
                 const unsigned char* krow = kc + slot * KS;
-                w = *reinterpret_cast<const uint4*>((pass == 0 ? krow : vc + slot * HD) + 16 * c);
-                s = *reinterpret_cast<const float*>(krow + HD + 4 * pass);
+                w = *reinterpret_cast<const uint4*>((pass == 0 ? krow : vc + slot * HD) + 16 * cc16);
+                sc = *reinterpret_cast<const float*>(krow + HD + 4 * pass);
             }
-            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * c]) = kv8_widen8(w.x, w.y, s);
-            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * c + 8]) = kv8_widen8(w.z, w.w, s);
+            if (pass == 0) { raw_k[i] = w; raw_sk[i] = sc; } else { raw_v[i] = w; raw_sv[i] = sc; }
         }
-        qmm_frag::commit();  // the group holding the queries' copies (the first call), then an empty one
+    };
+    // the registers' tile widened into the one shared buffer (keys, pass 0, or values, pass 1)
+    auto widen_kv8 = [&](int pass) {
+#pragma unroll
+        for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
+            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16);
+            const uint4 w = pass == 0 ? raw_k[i] : raw_v[i];
+            const float sc = pass == 0 ? raw_sk[i] : raw_sv[i];
+            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16]) = kv8_widen8(w.x, w.y, sc);
+            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16 + 8]) = kv8_widen8(w.z, w.w, sc);
+        }
+    };
+    // a tile's key ids (-1 past the context)
+    auto id_of = [&](int tile_t0, int k) {
+        const int ki = start + tile_t0 + k;
+        return ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
     };
     // ONE: the keys (pass 0) or the values (pass 1) of the tile whose ids are in key_ids[0], into the one buffer
     auto load_one = [&](int pass) {
-        if constexpr (KV8) return stage_kv8(pass);
         const __nv_bfloat16* src = pass == 0 ? KC : VC;
         for (int e = threadIdx.x; e < TK * HD / 8; e += blockDim.x) {
             const int k = e / (HD / 8), v = e % (HD / 8), key = key_ids[0][k];
@@ -381,10 +397,23 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
     float o[8][4] = {};
     const int tiles = min(n - start, CH);
     if (NB == 2) load(0, 0);
+    if constexpr (KV8) {                                   // the first tile's ids, then its codes into registers
+        if (threadIdx.x < TK) key_ids[0][threadIdx.x] = id_of(0, threadIdx.x);
+        __syncthreads();
+        fetch_kv8(0, 0);
+        fetch_kv8(0, 1);
+        qmm_frag::commit();                                // the group holding the queries' copies
+    }
     for (int t0 = 0, it = 0; t0 < tiles; t0 += TK, ++it) {
         const int buf = NB == 2 ? it & 1 : 0;
         const bool ahead = NB == 2 && t0 + TK < tiles;  // the next tile's loads go out before this tile's math
-        if constexpr (ONE) {
+        const bool more = t0 + TK < tiles;
+        if constexpr (KV8) {
+            // this tile's codes are in registers (issued an iteration ago): its keys widen into the buffer, the next tile's ids beside
+            const int next_id = more && threadIdx.x < TK ? id_of(t0 + TK, threadIdx.x) : -1;
+            widen_kv8(0);
+            if (more && threadIdx.x < TK) key_ids[(it & 1) ^ 1][threadIdx.x] = next_id;
+        } else if constexpr (ONE) {
             if (threadIdx.x < TK) {
                 const int ki = start + t0 + threadIdx.x;
                 key_ids[0][threadIdx.x] = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
@@ -397,10 +426,13 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
         }
         Row* kt = tiles_kv + (ONE ? 0 : buf * 2 * TK);
         Row* vt = ONE ? kt : kt + TK;
-        const int* keys = key_ids[buf];
+        const int* keys = key_ids[KV8 ? (it & 1) : buf];
         if constexpr (ONE) qmm_frag::wait<0>();
         else if (ahead) qmm_frag::wait<3>(); else qmm_frag::wait<1>();
         __syncthreads();
+        if constexpr (KV8) {
+            if (more) fetch_kv8((it & 1) ^ 1, 0);           // the next tile's keys load during this tile's scores
+        }
         constexpr int JT = TK / 32;  // a warp's 8-key tiles
         float s[JT][4] = {};
 #pragma unroll 4
@@ -418,7 +450,12 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
         }
         if constexpr (ONE) {                              // every warp has read the keys: the values take their place
             __syncthreads();
-            load_one(1);
+            if constexpr (KV8) {
+                widen_kv8(1);
+                if (more) fetch_kv8((it & 1) ^ 1, 1);
+            } else {
+                load_one(1);
+            }
         }
         float tile_m[2] = {-INFINITY, -INFINITY};
 #pragma unroll

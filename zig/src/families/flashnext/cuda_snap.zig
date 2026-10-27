@@ -29,6 +29,12 @@ pub fn bytesFor(format: Kv, at: usize, head: bool) usize {
     return wt.linear_n * (conv_bytes + state_bytes) + (wt.attn_n + @intFromBool(head)) * attnBytes(format, at) + tail_bytes;
 }
 
+/// bytesFor with the head's cache (when `head_format` is not null) in its own format.
+pub fn bytesWith(format: Kv, head_format: ?Kv, at: usize) usize {
+    const head = if (head_format) |h| attnBytes(h, at) else 0;
+    return wt.linear_n * (conv_bytes + state_bytes) + wt.attn_n * attnBytes(format, at) + head + tail_bytes;
+}
+
 /// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs.
 pub const Snap = struct {
     rank_id: u64 = 0,
@@ -38,6 +44,8 @@ pub const Snap = struct {
     head: bool,
     /// The format of the attention rows it holds (the engine's --kv-cache).
     kv: Kv = .bf16,
+    /// The format of the head's rows when it holds them.
+    head_kv: Kv = .bf16,
 };
 
 const Way = enum { save, restore };
@@ -74,17 +82,17 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
         try dr.check(dr.api.cuMemcpyDtoDAsync_v2(dst, src, p.n, stream.handle), "cuMemcpyDtoDAsync");
         off += p.n;
     };
-    std.debug.assert(off == bytesFor(seq.kv, at, d != null));
+    std.debug.assert(off == bytesWith(seq.kv, if (d) |h| h.kv else null, at));
 }
 
 /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
 pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft) !*Snap {
     const at = seq.fed;
     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
-    if (d) |h| if (h.kv != seq.kv) return error.KvFormat;
+    const head_kv: Kv = if (d) |h| h.kv else .bf16;
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytesFor(seq.kv, at, d != null)), .at = at, .history = seq.history, .head = d != null, .kv = seq.kv };
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytesWith(seq.kv, if (d != null) head_kv else null, at)), .at = at, .history = seq.history, .head = d != null, .kv = seq.kv, .head_kv = head_kv };
     errdefer snap.buf.free();
     try move(stream, seq, d, snap.buf.ptr, at, .save);
     try stream.synchronize();
@@ -96,6 +104,7 @@ pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const S
     if (snap.at > seq.cap) return error.SequenceTooShort;
     if (snap.kv != seq.kv) return error.KvFormat;
     if (d) |h| if (!snap.head or snap.at > h.cap) return error.NoHeadState;
+    if (d) |h| if (h.kv != snap.head_kv) return error.NoHeadState;
     // a state with the head's rows serves a stream without drafts too: those rows stay in the buffer
     try move(stream, seq, d, snap.buf.ptr, snap.at, .restore);
     try stream.synchronize();
@@ -144,5 +153,14 @@ test "a piece list moves exactly a state's bytes in either format" {
             for (ps) |p| n += p.n;
             try std.testing.expectEqual(attnBytes(format, at), n);
         }
+    }
+}
+
+test "a state with the head's cache in bf16 under fp8 caches takes 2,048 + 256 bytes a token for the head and 1,056 + 256 for each layer" {
+    for ([_]usize{ 0, 1, 4, 513, 262144 }) |at| {
+        try std.testing.expectEqual(bytesFor(.fp8, at, true), bytesWith(.fp8, .fp8, at));
+        try std.testing.expectEqual(bytesFor(.fp8, at, false), bytesWith(.fp8, null, at));
+        try std.testing.expectEqual(bytesFor(.bf16, at, true), bytesWith(.bf16, .bf16, at));
+        try std.testing.expectEqual(at * (2048 - 1056), bytesWith(.fp8, .bf16, at) - bytesWith(.fp8, .fp8, at));
     }
 }

@@ -70,3 +70,24 @@ test "the prompt cache keeps about 1.6 times the states in fp8" {
     const kept_f8 = 16 * GiB / f8;
     try std.testing.expect(kept_f8 * 10 >= kept_bf * 15);
 }
+
+test "the MTP head's cache stays bf16 under fp8 main caches while the stream fits what it is charged" {
+    const mtp = flashnext.mtp;
+    const prompt = flashnext.prompt;
+    const full = window + 16;
+    const f8 = flashnext.lanes_load.streamBytes(.fp8, full, draft_ids, chunk, false);
+    // a bf16 engine's head is bf16; an fp8 engine's is bf16 for a stream whose own caches and head fit one full window's charge
+    try std.testing.expectEqual(flashnext.kv_format.Kv.bf16, mtp.headFormat(.bf16, full, full, draft_ids, chunk));
+    for ([_]usize{ 1, 4096, 65536, 200_000 }) |cap| {
+        try std.testing.expectEqual(flashnext.kv_format.Kv.bf16, mtp.headFormat(.fp8, cap, full, draft_ids, chunk));
+        const used = prompt.seqBytesFor(.fp8, cap) + mtp.Draft.bytesFor(.bf16, cap, draft_ids, chunk);
+        try std.testing.expect(used <= f8);
+    }
+    // the full window keeps the fp8 head: five of them still fit the room that holds five fp8 streams
+    try std.testing.expectEqual(flashnext.kv_format.Kv.fp8, mtp.headFormat(.fp8, full, full, draft_ids, chunk));
+    try std.testing.expectEqual(@as(u32, 5), try memory.admit(room(24.36), f8, 0, 5, true));
+    // the largest stream with a bf16 head is within a twentieth of the window
+    var cap: usize = full;
+    while (mtp.headFormat(.fp8, cap, full, draft_ids, chunk) == .fp8) cap -= 1024;
+    try std.testing.expect(cap * 20 > full * 18);
+}

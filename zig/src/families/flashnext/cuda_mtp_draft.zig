@@ -29,6 +29,20 @@ const max_rows = mtp.max_rows;
 const conv_bytes = mtp.conv_bytes;
 const proj_bytes = mtp.proj_bytes;
 
+/// The format of the MTP head's own attention cache for a stream of `cap` positions when the engine's main caches are `main`
+/// and a stream is charged its `window`'s bytes with the head's cache in `main` too (cuda_lanes_load.zig streamBytes). The head
+/// is one layer and its drafts are only proposals (the main model verifies every token), but fp8 rows there cost it about a
+/// fifth of its accepted drafts (fewer, less confident drafts). A bf16 head cache takes (2,048 - 1,056) bytes more a position,
+/// so it is used whenever the stream still fits what it is charged: all but a stream within a twentieth of the full window.
+/// TF_FLASHNEXT_HEAD_KV=fp8 keeps the head's cache in the main format.
+pub fn headFormat(main: kv_format.Kv, cap: usize, window: usize, draft_n: usize, rows: usize) kv_format.Kv {
+    if (main == .bf16) return .bf16;
+    if (std.c.getenv("TF_FLASHNEXT_HEAD_KV")) |v| if (std.mem.eql(u8, std.mem.span(v), "fp8")) return main;
+    const used = prompt.seqBytesFor(main, cap) + Draft.bytesFor(.bf16, cap, draft_n, rows);
+    const charged = prompt.seqBytesFor(main, window) + Draft.bytesFor(main, window, draft_n, rows);
+    return if (used <= charged) .bf16 else main;
+}
+
 /// One draft and its temperature-1 probability under the head.
 pub const Pick = struct { token: u32, prob: f64 };
 

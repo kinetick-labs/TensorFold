@@ -6,8 +6,10 @@ const core = @import("core");
 const projection = @import("cuda_projection.zig");
 
 pub const Mode = enum { bf16, affine4 };
+/// The draft head's rows: 4-bit by default (a fourth of the bytes a chained draft reads, 1.5 ms of the 2.9 a step in bf16; its drafts
+/// are only proposals, so the replies are the target's either way), TF_FLASHNEXT_DRAFT_HEAD=bf16 for the exact rows.
 pub fn mode() !Mode {
-    const value = if (std.c.getenv("TF_FLASHNEXT_DRAFT_HEAD")) |v| std.mem.span(v) else "bf16";
+    const value = if (std.c.getenv("TF_FLASHNEXT_DRAFT_HEAD")) |v| std.mem.span(v) else "affine4";
     if (std.mem.eql(u8, value, "bf16")) return .bf16;
     if (std.mem.eql(u8, value, "affine4")) return .affine4;
     return error.BadDraftHead;
