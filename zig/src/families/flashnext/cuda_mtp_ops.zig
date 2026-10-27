@@ -93,6 +93,14 @@ pub fn Ops(comptime Tri: type) type {
             return o.e.stream.*;
         }
 
+        /// Slots [0, n) of the head's candidate scratch (filled by Head.cand) on the host.
+        fn candidates(o: Self, n: usize, c: *mtp.Cands) !void {
+            const base = (o.h.cand_buf orelse return error.NoCandidates).ptr;
+            try download(o.stream(), std.mem.sliceAsBytes(c.vals[0 .. n * mtp.cand_max]), base);
+            try download(o.stream(), std.mem.sliceAsBytes(c.cols[0 .. n * mtp.cand_max]), base + mtp.cand_slots * mtp.cand_max * 4);
+            try download(o.stream(), std.mem.sliceAsBytes(c.flags[0..n]), base + 2 * mtp.cand_slots * mtp.cand_max * 4);
+        }
+
         /// Prompt rows [at, stop): the pass with its streams kept, then the head over each row with a known next token.
         pub fn prefillChunk(o: Self, seq: *prompt.Seq, d: *Draft, ids: []const u32, at: usize, stop: usize) !void {
             if (stop > d.cap or stop <= at or stop - at > d.rows_cap) return error.PromptTooLong;
@@ -208,6 +216,13 @@ pub fn Ops(comptime Tri: type) type {
                 const col: usize = @intCast(@as(i32, @bitCast(d.best_host[2])));
                 return .{ .token = try view_.global(@intCast(col)), .prob = @exp(@as(f64, top) - @as(f64, lse)) };
             }
+            if (mtp.candidatesOn()) if (mtp.candidateCount(sm, n)) |count| {
+                // the row's top_k best on the device: nothing of the row but those is copied (a NaN row is read whole)
+                var c: mtp.Cands = undefined;
+                try h.cand(o.stream(), d.dlogits.ptr, n, n, 1, count, 0);
+                try o.candidates(1, &c);
+                if (c.flags[0] == 0) return mtp.drawPickCandidates(o.e.gpa, c.vals[0..count], c.cols[0..count], h.ids, lse, position, sm);
+            };
             const row = d.host[0..n];
             try download(o.stream(), std.mem.sliceAsBytes(row), d.dlogits.ptr);
             return mtp.drawPick(o.e.gpa, row, h.ids, lse, position, sm);
@@ -370,10 +385,20 @@ pub fn Ops(comptime Tri: type) type {
             var step_next: [max_lanes][1]u32 = undefined;
             var step_nexts: [max_lanes][]const u32 = undefined;
             var step_rows: [max_lanes]u64 = undefined;
+            var cands: mtp.Cands = undefined;
             while (n_act > 0 and j < max_chain) : (j += 1) {
                 // every active lane's best draft (fn_row_best on its own scores), then one download of all of them
                 for (act[0..n_act], 0..) |i, r| try h.best(o.stream(), ds[i].dlogits.ptr, h.ids.len, h.ids.len, 1, ds[0].best.ptr + r * 16);
+                // a sampled lane's top_k best on the device too (TF_FLASHNEXT_SAMPLE_CAND=1), read back with the bests
+                var cand_k: [max_lanes]usize = @splat(0);
+                var any_cand = false;
+                if (mtp.candidatesOn()) for (act[0..n_act], 0..) |i, r| if (mtp.candidateCount(sms[i], h.ids.len)) |count| {
+                    cand_k[r] = count;
+                    any_cand = true;
+                    try h.cand(o.stream(), ds[i].dlogits.ptr, h.ids.len, h.ids.len, 1, count, r);
+                };
                 try download(o.stream(), std.mem.sliceAsBytes(best_host[0 .. n_act * 4]), ds[0].best.ptr);
+                if (any_cand) try o.candidates(n_act, &cands);
                 var next_act: usize = 0;
                 var n_step: usize = 0;
                 for (act[0..n_act], 0..) |i, r| {
@@ -382,10 +407,15 @@ pub fn Ops(comptime Tri: type) type {
                     const col: usize = @intCast(@as(i32, @bitCast(best_host[r * 4 + 2])));
                     var got: Pick = .{ .token = h.ids[col], .prob = @exp(@as(f64, top) - @as(f64, lse)) };
                     if (mtp.isSampled(sms[i])) {
-                        // the lane's whole row (the stream is idle after the download above): the keyed draw as pick makes it
-                        const row = ds[i].host[0..h.ids.len];
-                        try download(o.stream(), std.mem.sliceAsBytes(row), ds[i].dlogits.ptr);
-                        got = try mtp.drawPick(o.e.gpa, row, h.ids, lse, positions[i] + j, sms[i]);
+                        if (cand_k[r] > 0 and cands.flags[r] == 0) {
+                            const at = r * mtp.cand_max;
+                            got = try mtp.drawPickCandidates(o.e.gpa, cands.vals[at..][0..cand_k[r]], cands.cols[at..][0..cand_k[r]], h.ids, lse, positions[i] + j, sms[i]);
+                        } else {
+                            // the lane's whole row (the stream is idle after the download above): the keyed draw as pick makes it
+                            const row = ds[i].host[0..h.ids.len];
+                            try download(o.stream(), std.mem.sliceAsBytes(row), ds[i].dlogits.ptr);
+                            got = try mtp.drawPick(o.e.gpa, row, h.ids, lse, positions[i] + j, sms[i]);
+                        }
                     }
                     const out = outs[i];
                     const low = confidence > 0 and got.prob < confidence;
@@ -474,6 +504,17 @@ pub fn Ops(comptime Tri: type) type {
                 for (out[0..n], 0..) |*t, r| t.* = @intCast(@as(i32, @bitCast(d.best_host[4 * r + 2])));
                 return;
             }
+            if (masks.len == 0 and mtp.candidatesOn() and n <= mtp.cand_slots) if (mtp.candidateCount(sm, vocab)) |count| {
+                // each row's top_k best on the device, nothing else of the window's scores copied (a window with a NaN row
+                // is read whole below); the draw is drawRow's over the same candidates
+                var c: mtp.Cands = undefined;
+                try o.h.cand(o.stream(), d.logits.ptr, vocab, vocab, n, count, 0);
+                try o.candidates(n, &c);
+                if (std.mem.allEqual(i32, c.flags[0..n], 0)) {
+                    for (out[0..n], 0..) |*t, r| t.* = try mtp.drawCandidates(o.e.gpa, c.vals[r * mtp.cand_max ..][0..count], c.cols[r * mtp.cand_max ..][0..count], null, d.fed0 + 1 + r, sm);
+                    return;
+                }
+            };
             const rows = d.host[0 .. n * vocab];
             try download(o.stream(), std.mem.sliceAsBytes(rows), d.logits.ptr);
             const words = masks.len / n;
