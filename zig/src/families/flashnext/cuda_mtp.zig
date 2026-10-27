@@ -130,6 +130,25 @@ pub fn drawRow(gpa: std.mem.Allocator, row: []const u16, ids: ?[]const u32, posi
     return @intCast(try lanes.sampling.choose(gpa, vals, keys, position, s));
 }
 
+/// The draft head's keyed draw at `position` over its bf16 row (column j being token ids[j]) and the draw's temperature-1
+/// probability under the head, `lse` the row's log-sum-exp (Python Engine.sample_draft). A greedy `sm` takes the first best
+/// column. The lone head step (Ops.pick) and the batched one (Ops.draftMany) both draw through here, so a stream's drafts
+/// do not depend on whether it drafted alone.
+pub fn drawPick(gpa: std.mem.Allocator, row: []const u16, ids: []const u32, lse: f32, position: u64, sm: ?Sampling) !Pick {
+    const tok = try drawRow(gpa, row, ids, position, sm);
+    const col = std.sort.binarySearch(u32, ids, tok, struct {
+        fn order(t: u32, x: u32) std.math.Order {
+            return std.math.order(t, x);
+        }
+    }.order) orelse return .{ .token = tok, .prob = 0 };
+    return .{ .token = tok, .prob = @exp(@as(f64, promote(row[col])) - @as(f64, lse)) };
+}
+
+/// Whether `sm` draws keyed samples (a temperature above zero) rather than taking the best column.
+pub fn isSampled(sm: ?Sampling) bool {
+    return if (sm) |s| s.temperature > 0 else false;
+}
+
 // ---- the head's weights --------------------------------------------------------------------------------------------
 
 pub const Head = struct {
@@ -284,6 +303,38 @@ test "a keyed draw over the top-k columns is the draw over every column" {
         try std.testing.expectEqual(try all(gpa, &row, position, s), try drawRow(gpa, &row, null, position, s));
     }
     try std.testing.expectEqual(@as(u32, @intCast(argmaxRow(&row))), try drawRow(gpa, &row, null, 0, null));
+}
+
+test "a draft pick is the keyed draw over the head's row and that token's probability under it" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(9);
+    var row: [400]u16 = undefined;
+    var ids: [400]u32 = undefined;
+    for (&row, &ids, 0..) |*v, *id, col| {
+        v.* = @as(u16, 0x3f00) + prng.random().int(u8);
+        id.* = @intCast(1000 + 3 * col); // the draft vocabulary: ascending ids, as draftIds gives them
+    }
+    var top: f32 = -std.math.inf(f32);
+    for (row) |b| top = @max(top, promote(b));
+    var sum: f64 = 0;
+    for (row) |b| sum += @exp(@as(f64, promote(b)) - top);
+    const lse: f32 = @floatCast(top + @log(sum));
+    const s: Sampling = .{ .seed = 3, .temperature = 1.0, .top_k = 20, .top_p = 0.95 };
+    for (0..64) |position| {
+        const got = try drawPick(gpa, &row, &ids, lse, position, s);
+        try std.testing.expectEqual(try drawRow(gpa, &row, &ids, position, s), got.token);
+        const col = std.mem.indexOfScalar(u32, &ids, got.token).?;
+        try std.testing.expectApproxEqAbs(@exp(@as(f64, promote(row[col])) - @as(f64, lse)), got.prob, 1e-12);
+        try std.testing.expect(got.prob > 0 and got.prob < 1);
+    }
+    // greedy (no sampling, or temperature 0): the first best column, its probability the head's confidence
+    const best = argmaxRow(&row);
+    for ([_]?Sampling{ null, .{ .seed = 3, .temperature = 0 } }) |greedy| {
+        const got = try drawPick(gpa, &row, &ids, lse, 5, greedy);
+        try std.testing.expectEqual(ids[best], got.token);
+        try std.testing.expectApproxEqAbs(@exp(@as(f64, promote(row[best])) - @as(f64, lse)), got.prob, 1e-12);
+    }
+    try std.testing.expect(isSampled(s) and !isSampled(null) and !isSampled(.{ .seed = 1, .temperature = 0 }));
 }
 
 test "a masked row draws only allowed tokens, greedy the best of them" {

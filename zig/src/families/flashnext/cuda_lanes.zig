@@ -480,7 +480,8 @@ pub fn Namespace(comptime Tri: type) type {
             const self = of(ptr);
             if (self.head == null) return error.NoDraftHead;
             defer lanes_draft.depthLog(self, requests);
-            // greedy chains of a shared round: their heads in one pass a step (the drafts each would get alone)
+            // greedy chains of a shared round (sampled ones too with TF_FLASHNEXT_SAMPLED_HEADS=1): their heads in one pass a step
+            // (the drafts each would get alone)
             var batched: [mtp_ops.max_lanes]bool = @splat(false);
             if (lanes_draft.batchHeads() and requests.len > 1 and requests.len <= mtp_ops.max_lanes) try lanes_draft.batched(self, requests, &batched);
             for (requests, 0..) |r, ri| {

@@ -55,13 +55,22 @@ pub fn run(gpu: check.Gpu, dir: []const u8, ids_path: []const u8) !void {
     for (ids, 0..) |*t, i| t.* = base.items[i % base.items.len];
     // no confidence stop (the whole chain), then a stop above every probability (each chain keeps one token)
     for ([_]f64{ 0, 2 }) |confidence| {
-        for (shapes) |widths| try shape(gpu, e, ops, &stream, ids, widths, confidence);
+        for (shapes) |widths| _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, null);
     }
+    // sampled streams (the model card's temperature 1, top_k 20, top_p 0.95; TF_FLASHNEXT_SAMPLED_HEADS): the shared pass draws
+    // each lane's drafts as its lone pass does
+    const sampled: mtp.Sampling = .{ .seed = 19, .temperature = 1.0, .top_k = 20, .top_p = 0.95 };
+    for ([_]f64{ 0, 0.5 }) |confidence| for (shapes) |widths| {
+        _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, sampled);
+    };
+    check.pass("sampled heads: a shared pass's drafts equal each lone pass's", .{});
 }
 
 /// One shape's streams drafted alone and in one shared pass: the logits, the proposals, the probabilities and the stop.
-fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, ids: []const u32, widths: []const usize, confidence: f64) !void {
+/// With `sm` the streams draw keyed samples (all at position 5 of their keys). Returns the lone chains.
+fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, ids: []const u32, widths: []const usize, confidence: f64, sm: ?mtp.Sampling) ![6]mtp.Chain {
     const gpa = gpu.gpa;
+    const position: u64 = if (sm == null) 0 else 5;
     const cap = ids.len + 64;
     const count = 2;
     const n = widths.len;
@@ -89,7 +98,7 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
     // each stream's head alone: its own pass, its own chain
     var alone_chains: [6]mtp.Chain = undefined;
     for (widths, 0..) |w, i| {
-        try ops.draft(&alone.drafts[i], nexts[i][0..w], rows[i], 0, count, null, confidence, &alone_chains[i]);
+        try ops.draft(&alone.drafts[i], nexts[i][0..w], rows[i], position, count, sm, confidence, &alone_chains[i]);
     }
     // the same heads in one shared pass: one lane a stream
     var ds: [6]*mtp.Draft = undefined;
@@ -98,14 +107,18 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
     var counts: [6]usize = undefined;
     var chains: [6]mtp.Chain = undefined;
     var outs: [6]*mtp.Chain = undefined;
+    var positions: [6]u64 = undefined;
+    var sms: [6]?mtp.Sampling = undefined;
     for (widths, 0..) |w, i| {
+        positions[i] = position;
+        sms[i] = sm;
         ds[i] = &together.drafts[i];
         nexts_s[i] = nexts[i][0..w];
         rows_s[i] = rows[i];
         counts[i] = count;
         outs[i] = &chains[i];
     }
-    try ops.draftMany(ds[0..n], nexts_s[0..n], rows_s[0..n], counts[0..n], confidence, outs[0..n]);
+    try ops.draftMany(ds[0..n], nexts_s[0..n], rows_s[0..n], counts[0..n], confidence, outs[0..n], positions[0..n], sms[0..n]);
     try stream.synchronize();
     for (widths, 0..) |_, i| {
         try check.expect(try sameLogits(gpu, &alone.drafts[i], &together.drafts[i]), "a shared head's logits equal its lone pass's", .{});
@@ -122,5 +135,6 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
         try stream.synchronize();
         try check.expect(!(try sameLogits(gpu, &alone.drafts[1], &together.drafts[1])), "the planted broken gather is caught", .{});
     }
-    check.pass("a shared MTP head over {d} streams ({any} rows) equals each stream's own pass: logits, proposals, probabilities and the confidence stop", .{ n, widths });
+    check.pass("a shared MTP head over {d} streams ({any} rows, {s}) equals each stream's own pass: logits, proposals, probabilities and the confidence stop", .{ n, widths, if (sm == null) "greedy" else "sampled" });
+    return alone_chains;
 }
