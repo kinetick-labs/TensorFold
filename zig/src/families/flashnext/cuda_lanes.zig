@@ -8,6 +8,7 @@ const weights = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
 const mtp_ops = @import("cuda_mtp_ops.zig");
 const lanes_draft = @import("cuda_lanes_draft.zig");
+const round_costs = @import("cuda_round_costs.zig");
 const snap = @import("cuda_snap.zig");
 const ranks = @import("cuda_rank_engine.zig");
 const config = @import("cuda_config.zig");
@@ -216,6 +217,9 @@ pub fn Namespace(comptime Tri: type) type {
                     .hidden_rows = true,
                     .batch_rows = if (drafting) 4 * mtp.max_rows else round_streams,
                     .max_streams = round_streams,
+                    // a shared round's prices when TF_FLASHNEXT_ROUND_MS names them (cuda_round_costs.zig); else unpriced
+                    .shared_costs = round_costs.sharedCosts(),
+                    .draft_row_ms = round_costs.draftRowMs(),
                     // a shared round's greedy streams draft in one head pass a step (lanes_draft.batched)
                     .draft_streams = drafting and lanes_draft.batchHeads(),
                 };

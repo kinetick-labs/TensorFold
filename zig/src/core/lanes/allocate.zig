@@ -15,6 +15,11 @@ pub const HeadCost = struct {
     step_ms: f64 = 0.0,
     batched: bool = false,
     free_first: bool = false,
+    /// A3 (a draft row priced apart): above 0, a round's forward is `costs` at its `streams` (their pending rows, one a
+    /// stream: rows of different streams) plus `row_ms` for every other row it runs (drafts, forced rows: a stream's further
+    /// rows share its experts and cost less); 0: `costs` at the round's total rows.
+    row_ms: f64 = 0.0,
+    streams: u64 = 0,
 };
 
 /// allocate, each stream's drafts past its first costing one more head step.
@@ -36,7 +41,8 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
     var deepest: u32 = 0;
     var firsts: u64 = 0;
     const timed = !costs.empty();
-    var best = rate(costs, timed, rows, expected, overhead_ms);
+    const base = if (head.streams > 0) @min(head.streams, rows) else rows;
+    var best = rateRows(costs, timed, base, rows, expected, overhead_ms, head.row_ms);
     while (rows < max_rows) {
         // the likeliest next node, ties to the lowest stream (Python's heapq of (-p, stream))
         var pick: ?usize = null;
@@ -57,13 +63,21 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
         deepest = @max(deepest, counts[s]);
         expected += pick_p;
         const steps: f64 = @floatFromInt(if (head.batched) deepest else drafts - (if (head.free_first) firsts else 0));
-        const now = rate(costs, timed, rows, expected, overhead_ms + head.step_ms * steps);
+        const now = rateRows(costs, timed, base, rows, expected, overhead_ms + head.step_ms * steps, head.row_ms);
         if (now > best or (!timed and head.step_ms == 0)) {
             best = now;
             @memcpy(best_counts, counts);
         }
     }
     return best_counts;
+}
+
+/// rate with the forward priced by streams plus a draft row's ms (row_ms > 0), else by total rows.
+fn rateRows(costs: *const Table, timed: bool, base: u64, total: u64, expected: f64, overhead_ms: f64, row_ms: f64) f64 {
+    if (!(row_ms > 0.0)) return rate(costs, timed, total, expected, overhead_ms);
+    var cost: f64 = 1.0;
+    if (timed) cost = (costs.get(@intCast(base)) orelse return -1.0) + row_ms * @as(f64, @floatFromInt(total - base));
+    return expected / (cost + overhead_ms);
 }
 
 fn rate(costs: *const Table, timed: bool, total: u64, expected: f64, overhead_ms: f64) f64 {
@@ -185,6 +199,36 @@ test "a zero draft step prices rounds as allocate does" {
     const free = try allocate(gpa, &.{ 1, 1, 1 }, &probs, &costs, 2.0, 8);
     defer gpa.free(free);
     try std.testing.expectEqualSlices(u32, free, priced);
+}
+
+test "a draft row priced apart keeps drafts the table at total rows would cut" {
+    const gpa = std.testing.allocator;
+    // the round table rises 10 ms a row: three streams' first rows cost 50 ms, each further row another 10
+    var steep = try extendCosts(gpa, &.{ .{ .width = 1, .ms = 30.0 }, .{ .width = 8, .ms = 100.0 } }, 9);
+    defer steep.deinit(gpa);
+    const probs = [_][]const f64{ &.{ 0.5, 0.25 }, &.{ 0.5, 0.25 }, &.{ 0.5, 0.25 } };
+    const ones = [_]u32{ 1, 1, 1 };
+    const plain = try allocate(gpa, &ones, &probs, &steep, 0.0, 9);
+    defer gpa.free(plain);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0 }, plain); // 10 ms a row for 0.5 tokens: not worth it
+    // row_ms 0 prices as before, whatever the streams
+    const same = try allocateDrafts(gpa, &ones, &probs, &steep, 0.0, 9, .{ .row_ms = 0.0, .streams = 3 });
+    defer gpa.free(same);
+    try std.testing.expectEqualSlices(u32, plain, same);
+    // draft rows at 1 ms each beside the 50 ms the three streams cost: every draft pays
+    const cheap = try allocateDrafts(gpa, &ones, &probs, &steep, 0.0, 9, .{ .row_ms = 1.0, .streams = 3 });
+    defer gpa.free(cheap);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2, 2 }, cheap);
+    // draft rows at 40 ms each do not
+    const dear = try allocateDrafts(gpa, &ones, &probs, &steep, 0.0, 9, .{ .row_ms = 40.0, .streams = 3 });
+    defer gpa.free(dear);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0 }, dear);
+    // forced rows count among the streams' rows (fixed), not as draft rows: two rows of one stream and one of another
+    const forced = [_]u32{ 2, 1 };
+    const two = [_][]const f64{ &.{0.5}, &.{0.5} };
+    const mixed = try allocateDrafts(gpa, &forced, &two, &steep, 0.0, 9, .{ .row_ms = 1.0, .streams = 2 });
+    defer gpa.free(mixed);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1 }, mixed);
 }
 
 test "extendCosts interpolates and extrapolates" {

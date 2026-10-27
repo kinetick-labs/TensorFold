@@ -56,6 +56,7 @@ pub const Rule = struct {
     shared_costs: *const Table,
     mtp_step_ms: f64,
     draft_step_ms: f64 = 0, // a shared round's draft past a stream's first (budgets price it)
+    draft_row_ms: f64 = 0, // A3: a shared round's row past one a stream, apart from the table at its streams (0: the table at its rows)
     plain_guard: bool,
     node_probabilities: bool,
     confidence_floor: ?f64 = null,
@@ -299,9 +300,19 @@ pub const Rule = struct {
         return r.mtp_step_ms * @as(f64, @floatFromInt(steps));
     }
 
+    /// A shared round's forward at `rows` rows of `streams` streams: the table at the rows, or with draft_row_ms the table at
+    /// the streams plus draft_row_ms for each row past one a stream (the split allocate prices by). Null: no timed cost.
+    pub fn forwardMs(r: *const Rule, streams: u32, rows: u64) ?f64 {
+        if (r.draft_row_ms > 0.0 and rows >= streams) {
+            const base = r.shared_costs.get(@intCast(streams)) orelse return null;
+            return base + r.draft_row_ms * @as(f64, @floatFromInt(rows - streams));
+        }
+        return r.shared_costs.get(@intCast(rows));
+    }
+
     /// `sampled`: the round drew keyed samples, so it counts for sampled streams' overhead alone; `head_ms` its drafts.
     pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64, sampled: bool, head_ms: f64) !void {
-        const forward = r.shared_costs.get(@intCast(rows)) orelse return;
+        const forward = r.forwardMs(streams, rows) orelse return;
         const extra = if (ms - forward > 0.0) ms - forward else 0.0;
         const fixed = if (extra - head_ms > 0.0) extra - head_ms else 0.0;
         try r.addOverhead(&r.overhead, streams, fixed, extra - fixed);
@@ -350,6 +361,29 @@ test "depth picks the most tokens a ms and probes deeper" {
     defer if (st) |*s| s.deinit(gpa);
     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+}
+
+test "a round's overhead is measured past the forward priced by streams plus draft rows" {
+    const gpa = std.testing.allocator;
+    var shared: Table = .{};
+    defer shared.deinit(gpa);
+    for (1..17) |w| try shared.put(gpa, @intCast(w), 10.0 + 2.0 * @as(f64, @floatFromInt(w)));
+    const empty: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .prior = &.{0.9}, .most_drafts = 1, .family_costs = &empty, .shared_costs = &shared, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = true, .batch_rows = 16 };
+    defer rule.deinit();
+    // by rows: 3 streams, 9 rows: the table at 9 is 28 ms, a 31 ms round has 3 ms over
+    try std.testing.expectEqual(@as(?f64, 28.0), rule.forwardMs(3, 9));
+    try rule.observeOverhead(3, 9, 31.0, false, 0.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), rule.overheadMs(3, false), 1e-12);
+    // apart, at 4 streams: the table at 4 streams (18 ms) plus 1 ms for each of the 5 other rows, 23 ms, so the same 31 ms round
+    // has 8 over; the table at the streams alone is the round of only their pending rows
+    rule.draft_row_ms = 1.0;
+    try std.testing.expectEqual(@as(?f64, 23.0), rule.forwardMs(4, 9));
+    try std.testing.expectEqual(@as(?f64, 18.0), rule.forwardMs(4, 4));
+    try rule.observeOverhead(4, 9, 31.0, false, 0.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 8.0), rule.overheadMs(4, false), 1e-12);
+    // a round with fewer rows than streams (a stream sat out) falls back to the table at its rows
+    try std.testing.expectEqual(@as(?f64, shared.get(2).?), rule.forwardMs(3, 2));
 }
 
 test "a shared round's drafts come out the same whichever depths its overhead was measured at" {

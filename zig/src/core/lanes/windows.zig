@@ -268,7 +268,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     const own = if (live) try lone_costs.prices(e, plans[0]) else untimed;
     const costs = if (explicit) &untimed else if (live) &own else &e.cfg.shared_costs;
     const overhead = if (explicit or live) 0 else e.rule.overheadMs(plans.len, anySampled(plans));
-    const counts = try alloc.allocate(a, fixed, probs, costs, overhead, @max(plans.len, e.cfg.batch_rows));
+    // A3: the shared table's forward priced by the streams' rows plus a draft row's ms (Model.draft_row_ms), only where the table is
+    const row_ms = if (explicit or live) 0.0 else e.rule.draft_row_ms;
+    const counts = try alloc.allocateDrafts(a, fixed, probs, costs, overhead, @max(plans.len, e.cfg.batch_rows), .{ .row_ms = row_ms, .streams = plans.len });
     const trial = if (live) lone_costs.probe(e, plans[0]) else null;
     if (trial) |count| {
         counts[0] = count;
