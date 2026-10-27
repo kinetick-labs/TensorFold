@@ -111,7 +111,7 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
     // each stream's head alone: its own pass, its own chain
     var alone_chains: [6]mtp.Chain = undefined;
     for (widths, 0..) |w, i| {
-        try ops.draft(&alone.drafts[i], nexts[i][0..w], rows[i], position, count, sm, confidence, &alone_chains[i]);
+        try ops.draft(&alone.drafts[i], nexts[i][0..w], rows[i], position, count, sm, confidence, &alone_chains[i], null);
     }
     // the same heads in one shared pass: one lane a stream
     var ds: [6]*mtp.Draft = undefined;
@@ -131,7 +131,7 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
         counts[i] = count;
         outs[i] = &chains[i];
     }
-    try ops.draftMany(ds[0..n], nexts_s[0..n], rows_s[0..n], counts[0..n], confidence, outs[0..n], positions[0..n], sms[0..n]);
+    try ops.draftMany(ds[0..n], nexts_s[0..n], rows_s[0..n], counts[0..n], confidence, outs[0..n], positions[0..n], sms[0..n], null);
     try stream.synchronize();
     for (widths, 0..) |_, i| {
         try check.expect(try sameLogits(gpu, &alone.drafts[i], &together.drafts[i]), "a shared head's logits equal its lone pass's", .{});

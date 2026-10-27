@@ -6,6 +6,7 @@ const core = @import("core");
 const embed = @import("cuda_embed.zig");
 const hc = @import("cuda_hc.zig");
 const ple_pool = @import("cuda_ple_pool.zig");
+const reader_mod = @import("cuda_ple_reader.zig");
 
 const golden: u64 = 0x9E3779B97F4A7C15;
 const mix1: u64 = 0xBF58476D1CE4E5B9;
@@ -345,6 +346,8 @@ pub const Ngram = struct {
     format: enum { mlx, nvfp4 } = .mlx,
     tables: [max_shards]core.nvfp4_rows.Table = undefined,
     pool: ?*ple_pool.Pool = null, // the gather's parked workers (null: every row on the caller's thread)
+    reader: ?*reader_mod.Reader = null, // TF_FLASHNEXT_GATHER_READ=pread: NVFP4 rows by positional reads through a row cache
+    ahead_thread: ?std.Thread = null, // the last prompt chunk's ids being hashed for the reader
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, model_dir: []const u8) !Ngram {
         const cfg = try readSpec(gpa, io, model_dir);
@@ -413,6 +416,7 @@ pub const Ngram = struct {
             }
         }
         g.pool = try ple_pool.Pool.create(gpa, io);
+        if (g.format == .nvfp4 and reader_mod.preadOn()) g.openReader(io) catch |err| std.debug.print("warning: flashnext: n-gram rows stay on the mapping (positional reads unavailable: {t})\n", .{err});
         if (@import("cuda_knobs.zig").gatherLockScales() and g.format == .nvfp4) g.lockScales(io);
         return g;
     }
@@ -434,7 +438,30 @@ pub const Ngram = struct {
         std.debug.print("info: flashnext: n-gram scale arrays locked in memory: {d:.2} GiB in {d:.1} s{s}\n", .{ @as(f64, @floatFromInt(total)) / (1 << 30), @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, if (failed) " (some mlock calls failed)" else "" });
     }
 
+    /// The positional reader over the shards' files: where each shard's codes and scales sit in them.
+    pub fn openReader(g: *Ngram, io: std.Io) !void {
+        const dh = g.hash.dh;
+        var paths: [max_shards][:0]const u8 = undefined;
+        var shards: [max_shards]reader_mod.Shard = undefined;
+        if (g.files.items.len > paths.len or dh % 16 != 0) return error.UnexpectedTensor;
+        for (g.files.items, 0..) |o, i| paths[i] = o.file.path;
+        for (g.tables[0..g.hash.shards], 0..) |t, s| {
+            const at = @intFromPtr(t.codes.ptr);
+            const fi = for (g.files.items, 0..) |o, i| {
+                const base = @intFromPtr(o.file.map.memory.ptr);
+                if (at >= base and at < base + o.file.map.memory.len) break i;
+            } else return error.UnexpectedTensor;
+            const base = @intFromPtr(g.files.items[fi].file.map.memory.ptr);
+            const scales_at = @intFromPtr(t.scales.ptr);
+            if (scales_at < base or scales_at + t.scales.len > base + g.files.items[fi].file.map.memory.len) return error.UnexpectedTensor;
+            shards[s] = .{ .file = @intCast(fi), .codes_at = at - base, .scales_at = scales_at - base };
+        }
+        g.reader = try reader_mod.Reader.create(g.gpa, io, paths[0..g.files.items.len], shards[0..g.hash.shards], g.hash.starts[0 .. g.hash.shards + 1], dh / 2, dh / 16, reader_mod.cacheSlots(), reader_mod.workers());
+    }
+
     pub fn deinit(g: *Ngram) void {
+        if (g.ahead_thread) |th| th.join();
+        if (g.reader) |r| r.destroy();
         if (g.pool) |p| p.destroy();
         for (g.files.items) |*o| o.close(g.gpa);
         g.files.deinit(g.gpa);
@@ -453,10 +480,62 @@ pub const Ngram = struct {
             const row = out[i * dh ..][0..dh];
             switch (g.format) {
                 .mlx => try embed.dequant(g.w[loc.shard], g.s[loc.shard], g.b[loc.shard], dh, loc.local, row),
-                .nvfp4 => try g.tables[loc.shard].gather(&.{loc.local}, row),
+                .nvfp4 => if (g.reader) |rd| {
+                    // the row's bytes from the cache or the file, dequantized as the mapped row is
+                    var raw: [reader_mod.max_row]u8 = undefined;
+                    // a read that fails leaves the row to the mapping
+                    rd.get(ids[i], &raw) catch return g.tables[loc.shard].gather(&.{loc.local}, row);
+                    const t = g.tables[loc.shard];
+                    const rc = t.width / 2;
+                    const one: core.nvfp4_rows.Table = .{ .codes = raw[0..rc], .scales = raw[rc..][0 .. t.width / 16], .rows = 1, .width = t.width, .global = t.global };
+                    try one.gather(&.{0}, row);
+                } else try g.tables[loc.shard].gather(&.{loc.local}, row),
             }
         }
     }
+
+    /// Reads, in the background, the rows of `tokens` (a prompt chunk) after `history` (n - 1 ids) into the reader's cache.
+    pub fn aheadChunk(g: *Ngram, history: []const i64, tokens: []const u32) void {
+        const rd = g.reader orelse return;
+        if (rd.want_workers == 0 or history.len != g.hash.n - 1 or tokens.len == 0) return;
+        if (g.ahead_thread) |th| th.join();
+        g.ahead_thread = null;
+        const job = g.gpa.create(AheadJob) catch return;
+        job.* = .{ .g = g, .tokens = g.gpa.dupe(u32, tokens) catch {
+            g.gpa.destroy(job);
+            return;
+        }, .hist = undefined };
+        @memcpy(job.hist[0..history.len], history);
+        g.ahead_thread = std.Thread.spawn(.{}, AheadJob.run, .{job}) catch {
+            g.gpa.free(job.tokens);
+            g.gpa.destroy(job);
+            return;
+        };
+    }
+
+    const AheadJob = struct {
+        g: *Ngram,
+        tokens: []u32,
+        hist: [max_n]i64,
+
+        fn run(job: *AheadJob) void {
+            const g = job.g;
+            defer {
+                g.gpa.free(job.tokens);
+                g.gpa.destroy(job);
+            }
+            const heads = g.hash.heads;
+            const ids = g.gpa.alloc(i64, job.tokens.len * heads) catch return;
+            defer g.gpa.free(ids);
+            const hist = job.hist[0 .. g.hash.n - 1];
+            for (job.tokens, 0..) |token, t| {
+                lastIds(g.hash, hist, token, ids[t * heads ..][0..heads]) catch return;
+                for (0..hist.len - 1) |i| hist[i] = hist[i + 1];
+                hist[hist.len - 1] = token;
+            }
+            g.reader.?.prefetch(ids);
+        }
+    };
 
     /// One call's rows split into `parts` equal ranges, part i filling [i * per, (i + 1) * per).
     const Split = struct {
@@ -512,6 +591,45 @@ pub const Ngram = struct {
             sumGroups(row, xs[t * (w / 32) ..][0 .. w / 32]);
         }
         @memcpy(history, hist[0..history.len]);
+    }
+};
+
+/// A decode round's drafted tokens as the head picks them: their rows are read while the head drafts the next ones.
+pub const Ahead = struct {
+    const max_lanes = 64;
+    g: *const Ngram,
+    hist: [max_lanes][max_n]i64 = undefined,
+    ids: [max_lanes * max_heads]i64 = undefined,
+    n: usize = 0,
+
+    /// Null unless TF_FLASHNEXT_DRAFT_AHEAD=1 and the table is read by positional reads.
+    pub fn init(g: *const Ngram) ?Ahead {
+        const rd = g.reader orelse return null;
+        if (!reader_mod.draftAhead() or rd.want_workers == 0) return null;
+        return .{ .g = g };
+    }
+
+    /// Lane `k`'s history (the n - 1 ids before its next token).
+    pub fn lane(a: *Ahead, k: usize, history: []const i64) void {
+        if (k < max_lanes and history.len == a.g.hash.n - 1) @memcpy(a.hist[k][0..history.len], history);
+    }
+
+    /// Lane `k`'s next token: its row ids join the batch `flush` sends.
+    pub fn push(a: *Ahead, k: usize, token: u32) void {
+        const heads = a.g.hash.heads;
+        if (k >= max_lanes) return;
+        if (a.n + heads > a.ids.len) a.flush();
+        const hist = a.hist[k][0 .. a.g.hash.n - 1];
+        lastIds(a.g.hash, hist, token, a.ids[a.n..][0..heads]) catch return;
+        a.n += heads;
+        for (0..hist.len - 1) |i| hist[i] = hist[i + 1];
+        hist[hist.len - 1] = token;
+    }
+
+    /// Asks the reader's threads for the rows pushed since the last flush.
+    pub fn flush(a: *Ahead) void {
+        if (a.n > 0) a.g.reader.?.prefetch(a.ids[0..a.n]);
+        a.n = 0;
     }
 };
 
@@ -599,6 +717,10 @@ pub fn rowsMany(g: *const Ngram, parts: []const Part) !void {
         if (Stat.calls % 100 == 0) {
             const f = 100.0 * 1e6;
             std.debug.print("gather detail: per call prep {d:.2} ms, pool run {d:.2} ms (slowest part {d:.2} ms, sum of parts {d:.2} ms), post {d:.2} ms; {d:.0} parts, {d:.0} items\n", .{ @as(f64, @floatFromInt(Stat.prep_ns)) / f, @as(f64, @floatFromInt(Stat.run_ns)) / f, @as(f64, @floatFromInt(Stat.max_sum)) / f, @as(f64, @floatFromInt(Stat.run_sum_parts)) / f, @as(f64, @floatFromInt(Stat.post_ns)) / f, @as(f64, @floatFromInt(Stat.parts_n)) / 100.0, @as(f64, @floatFromInt(Stat.items_n)) / 100.0 });
+            if (g.reader) |rd| {
+                const q = rd.take();
+                std.debug.print("gather rows: {d} cache hits ({d} after a wait), {d} read by the gather, {d} read ahead ({d} already there) of {d} asked, per 100 calls\n", .{ q.hits, q.waited, q.own, q.ahead, q.skipped, q.rows });
+            }
             Stat.prep_ns = 0;
             Stat.run_ns = 0;
             Stat.post_ns = 0;
@@ -651,4 +773,6 @@ test {
     _ = @import("cuda_ple_nvfp4_test.zig");
     _ = @import("cuda_ple_pool.zig");
     _ = @import("cuda_ple_pool_gather_test.zig");
+    _ = @import("cuda_ple_reader_test.zig");
+    _ = @import("cuda_prompt_chunks.zig");
 }

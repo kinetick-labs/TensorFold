@@ -6,7 +6,7 @@ const a = std.testing.allocator;
 const io = std.testing.io;
 const base = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
 
-fn fixture(dir: std.Io.Dir, include_scale: bool) !void {
+pub fn fixture(dir: std.Io.Dir, include_scale: bool) !void {
     const config =
         \\{"text_config":{"num_hidden_layers":2,"hidden_size":32,"vocab_size":100,"ple_layer_ids":[2],
         \\ "ngram_size":2,"heads_per_ngram":2,"ngram_vocab_size_base":13,"make_ngram_vocab_size_divisible_by":2,

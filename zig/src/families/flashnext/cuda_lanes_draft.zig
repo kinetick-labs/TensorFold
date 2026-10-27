@@ -3,6 +3,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const mtp = @import("cuda_mtp.zig");
 const mtp_ops = @import("cuda_mtp_ops.zig");
+const ple = @import("cuda_ple.zig");
 const be = lanes.backend;
 
 /// TF_FLASHNEXT_BATCH_HEADS=0 drafts a shared round's streams one at a time (the batched head gives the same drafts).
@@ -36,6 +37,9 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
     var outs: [mtp_ops.max_lanes]*mtp.Chain = undefined;
     var which: [mtp_ops.max_lanes]usize = undefined;
     var n: usize = 0;
+    // TF_FLASHNEXT_DRAFT_AHEAD=1: each token's n-gram rows are asked for as the head picks it
+    var ahead_buf = ple.Ahead.init(&self.engine.ngram);
+    const ahead: ?*ple.Ahead = if (ahead_buf) |*a| a else null;
     for (requests, 0..) |r, ri| {
         if (r.lanes != null) continue;
         if (mtp.isSampled(r.stream.sampling) and !sampledHeads()) continue;
@@ -60,6 +64,10 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
             nexts[n] = &firsts[n];
             rows[n] = d.prompt_last;
         }
+        if (ahead) |a| {
+            a.lane(n, l.seq.history[0..]);
+            a.push(n, nexts[n][nexts[n].len - 1]);
+        }
         ds[n] = d;
         positions[n] = r.position;
         sms[n] = r.stream.sampling;
@@ -71,7 +79,7 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
         // one greedy stream: it drafts alone below (its rollback is idempotent)
         return;
     }
-    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidence, outs[0..n], positions[0..n], sms[0..n]);
+    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidence, outs[0..n], positions[0..n], sms[0..n], ahead);
     for (which[0..n]) |ri| done[ri] = true;
 }
 

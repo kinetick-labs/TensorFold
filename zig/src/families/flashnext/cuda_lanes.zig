@@ -8,6 +8,9 @@ const weights = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
 const mtp_ops = @import("cuda_mtp_ops.zig");
 const lanes_draft = @import("cuda_lanes_draft.zig");
+const ple = @import("cuda_ple.zig");
+const ple_reader = @import("cuda_ple_reader.zig");
+const planStop = @import("cuda_prompt_chunks.zig").planStop;
 const round_costs = @import("cuda_round_costs.zig");
 const snap = @import("cuda_snap.zig");
 const ranks = @import("cuda_rank_engine.zig");
@@ -129,6 +132,8 @@ pub fn Namespace(comptime Tri: type) type {
             chain: mtp.Chain = .{},
             /// The prompt's next row while its pass runs a chunk a call; null once the prompt is in.
             filled: ?usize = 0,
+            /// The prompt row up to which the n-gram rows have been asked for ahead (TF_FLASHNEXT_WARM_AHEAD=1).
+            ahead_to: usize = 0,
         };
 
         const Ops = mtp.Ops(Tri);
@@ -302,16 +307,32 @@ pub fn Namespace(comptime Tri: type) type {
                 return l;
             }
 
+            /// The n-gram rows of the chunk after [at, stop) (and of this one, the first time) read in the background while this chunk runs.
+            fn warmNext(self: *Cuda, l: *Lane, ids: []const u32, at: usize, stop: usize) void {
+                const g = &self.engine.ngram;
+                const n1 = g.hash.n - 1;
+                if (g.reader == null or n1 != l.seq.history.len) return;
+                const to = if (stop < ids.len) planStop(self.engine.chunk, ids.len, stop, &.{}, ple_reader.prefillTail()) else stop;
+                const from = @max(l.ahead_to, at);
+                if (from >= to) return;
+                var hist: [ple.max_n]i64 = undefined;
+                if (from == at) {
+                    @memcpy(hist[0..n1], l.seq.history[0..]);
+                } else {
+                    if (from < n1) return;
+                    for (0..n1) |k| hist[k] = ids[from - n1 + k];
+                }
+                g.aheadChunk(hist[0..n1], ids[from..to]);
+                l.ahead_to = to;
+            }
+
             /// One prompt chunk, cut at the next cache mark; true once the last row's scores are in seq.logits.
             fn step(self: *Cuda, s: *lanes.Stream, l: *Lane) !bool {
                 const ids = s.prompt();
                 const at = l.filled orelse return true;
                 if (s.isCancelled()) return error.Cancelled;
-                var stop = @min(ids.len, at + self.engine.chunk);
-                for (s.reuse.marks) |m| if (m > at and m < stop) {
-                    stop = m;
-                    break;
-                };
+                const stop = planStop(self.engine.chunk, ids.len, at, s.reuse.marks, ple_reader.prefillTail());
+                if (ple_reader.warmAhead()) self.warmNext(l, ids, at, stop);
                 const last = stop == ids.len;
                 if (l.draft) |*d| {
                     try self.ops().prefillChunk(&l.seq, d, ids, at, stop);
@@ -501,13 +522,18 @@ pub fn Namespace(comptime Tri: type) type {
                 // the window's rows past the cache's room cannot run: fewer drafts there
                 const room = l.seq.cap - l.seq.fed - 1;
                 const count = @min(@min(r.depth, self.depth), room);
+                var ahead_buf = ple.Ahead.init(&self.engine.ngram);
+                const ahead: ?*ple.Ahead = if (ahead_buf) |*a| a else null;
+                if (ahead) |a| a.lane(0, l.seq.history[0..]);
                 if (r.rows) |path| {
                     for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                     if (r.follow.len < path.len) return error.PositionMismatch;
-                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                    if (ahead) |a| a.push(0, r.follow[path.len - 1]);
+                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidence, &l.chain, ahead);
                 } else {
                     const first = self.value(r.first orelse return error.NoFirstToken);
-                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                    if (ahead) |a| a.push(0, first);
+                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidence, &l.chain, ahead);
                 }
             }
         }

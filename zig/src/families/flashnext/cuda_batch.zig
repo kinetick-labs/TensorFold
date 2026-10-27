@@ -589,24 +589,33 @@ pub fn Pass(comptime Tri: type) type {
             for (self.m.layers, 0..) |*lw, layer| {
                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
                 if (layer == ple_layer) {
-                    const log_gather = thread != null and self.lanes.len > 0 and knobs.gatherLog();
+                    const log_gather = thread != null and knobs.gatherLog();
                     const t_join = if (log_gather) std.Io.Clock.awake.now(self.io).toNanoseconds() else 0;
                     if (thread) |th| th.join();
                     thread = null;
                     if (log_gather) {
                         const t_done = std.Io.Clock.awake.now(self.io).toNanoseconds();
-                        GatherStat.passes += 1;
-                        GatherStat.wait_ns += @intCast(t_done - t_join);
-                        GatherStat.gather_ns += @intCast(gather.ns);
-                        GatherStat.ahead_ns += @intCast(t_join - t0);
-                        GatherStat.rows += n;
-                        if (GatherStat.passes % 100 == 0) {
-                            const f = @as(f64, 1e6) * 100.0;
-                            std.debug.print("gather: {d} shared passes, per pass: {d:.1} rows, gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ GatherStat.passes, @as(f64, @floatFromInt(GatherStat.rows)) / 100.0, @as(f64, @floatFromInt(GatherStat.gather_ns)) / f, @as(f64, @floatFromInt(GatherStat.ahead_ns)) / f, @as(f64, @floatFromInt(GatherStat.wait_ns)) / f });
-                            GatherStat.wait_ns = 0;
-                            GatherStat.gather_ns = 0;
-                            GatherStat.ahead_ns = 0;
-                            GatherStat.rows = 0;
+                        // a prompt chunk is rare enough to log by itself
+                        if (self.lanes.len == 0) {
+                            std.debug.print("gather: prompt chunk of {d} rows at {d}: gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ n, pos0, @as(f64, @floatFromInt(gather.ns)) / 1e6, @as(f64, @floatFromInt(t_join - t0)) / 1e6, @as(f64, @floatFromInt(t_done - t_join)) / 1e6 });
+                            if (self.m.ngram.reader) |rd| {
+                                const q = rd.take();
+                                std.debug.print("gather: prompt chunk rows: {d} cache hits ({d} after a wait), {d} read by the gather, {d} read ahead ({d} already there) of {d} asked\n", .{ q.hits, q.waited, q.own, q.ahead, q.skipped, q.rows });
+                            }
+                        } else {
+                            GatherStat.passes += 1;
+                            GatherStat.wait_ns += @intCast(t_done - t_join);
+                            GatherStat.gather_ns += @intCast(gather.ns);
+                            GatherStat.ahead_ns += @intCast(t_join - t0);
+                            GatherStat.rows += n;
+                            if (GatherStat.passes % 100 == 0) {
+                                const f = @as(f64, 1e6) * 100.0;
+                                std.debug.print("gather: {d} shared passes, per pass: {d:.1} rows, gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ GatherStat.passes, @as(f64, @floatFromInt(GatherStat.rows)) / 100.0, @as(f64, @floatFromInt(GatherStat.gather_ns)) / f, @as(f64, @floatFromInt(GatherStat.ahead_ns)) / f, @as(f64, @floatFromInt(GatherStat.wait_ns)) / f });
+                                GatherStat.wait_ns = 0;
+                                GatherStat.gather_ns = 0;
+                                GatherStat.ahead_ns = 0;
+                                GatherStat.rows = 0;
+                            }
                         }
                     }
                     if (gather.failed) |err| return err;

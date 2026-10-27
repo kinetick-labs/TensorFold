@@ -9,6 +9,7 @@ const gdn = @import("cuda_gdn.zig");
 const mtp = @import("cuda_mtp.zig");
 const plan = @import("cuda_mtp_plan.zig");
 const hd = @import("cuda_host_draw.zig");
+const ple = @import("cuda_ple.zig");
 
 /// One group of lanes in the batched head's pass: the lanes' drafts, their rows and whether the head scores.
 const Group = struct {
@@ -242,9 +243,10 @@ pub fn Ops(comptime Tri: type) type {
         }
 
         /// Python decode.draft: absorb the kept rows, then chain up to `count` drafts, the first always kept.
-        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain, ahead: ?*ple.Ahead) !void {
             out.n = 0;
             try o.absorb(d, next, rows, count > 0);
+            if (ahead) |a| a.flush();
             var j: usize = 0;
             while (j < @min(count, max_chain)) : (j += 1) {
                 const got = try o.pick(d, position + j, sm);
@@ -253,12 +255,16 @@ pub fn Ops(comptime Tri: type) type {
                 out.tokens[out.n] = got.token;
                 out.probs[out.n] = got.prob;
                 out.n += 1;
+                if (ahead) |a| a.push(0, got.token);
                 if (low) break;
                 if (j + 1 < count) {
                     try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                    // asked once the head's step is on the stream: the reads run while it does
+                    if (ahead) |a| a.flush();
                     d.drafted += 1;
                 }
             }
+            if (ahead) |a| a.flush();
         }
 
         /// forwardHead over several drafts in one pass, a lane each: every row's ops and sums as a lone forwardHead's.
@@ -375,7 +381,7 @@ pub fn Ops(comptime Tri: type) type {
         /// draft over several drafts: kept rows in one pass, then a pass a step, each chaining as it would alone. A lane whose
         /// `sms` entry draws keyed samples takes the draw `pick` would at `positions[i]` + the step (its row downloaded and
         /// drawn on the host), the others their best column.
-        pub fn draftMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, confidence: f64, outs: []const *Chain, positions: []const u64, sms: []const ?Sampling) !void {
+        pub fn draftMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, confidence: f64, outs: []const *Chain, positions: []const u64, sms: []const ?Sampling, ahead: ?*ple.Ahead) !void {
             const h = o.h;
             const n_l = ds.len;
             for (ds, outs) |d, out| {
@@ -386,6 +392,7 @@ pub fn Ops(comptime Tri: type) type {
                 }
             }
             try o.forwardHeadMany(ds, nexts, rows, true);
+            if (ahead) |a| a.flush();
             var act: [max_lanes]usize = undefined;
             var n_act: usize = 0;
             for (counts, 0..) |c, i| if (c > 0) {
@@ -454,6 +461,7 @@ pub fn Ops(comptime Tri: type) type {
                     out.tokens[out.n] = got.token;
                     out.probs[out.n] = got.prob;
                     out.n += 1;
+                    if (ahead) |a| a.push(i, got.token);
                     if (low) continue;
                     if (j + 1 < @min(counts[i], max_chain)) {
                         step_ds[n_step] = ds[i];
@@ -469,6 +477,8 @@ pub fn Ops(comptime Tri: type) type {
                     try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);
                     for (step_ds[0..n_step]) |d| d.drafted += 1;
                 }
+                // asked once the step is on the stream: the reads run while it does
+                if (ahead) |a| a.flush();
                 n_act = next_act;
             }
             _ = n_l;
