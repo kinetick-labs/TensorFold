@@ -394,4 +394,147 @@ template __global__ void qmmf_kernel<BF16, 64, 64, 1, 4, 4, true, false, true>(c
 template __global__ void reduce_kernel<true>(const float* __restrict__, void* __restrict__, long long, int, float);
 template __global__ void reduce_kernel<false>(const float* __restrict__, void* __restrict__, long long, int, float);
 
+
+// ---- MXFP8 prompt rows on a 128 x 128 tile (relaxed): the block scale rides in the B fragment, one fp32 chain over K ----
+//
+// The exact kernels above add each 32-input group's mma sum to the accumulator with one fmaf per element. Here the
+// e4m3 code times its UE8M0 scale is formed exactly in bf16 (a power-of-two multiply), so a warp issues only mma
+// instructions over the whole of K. Rows are summed in the same order whatever the chunk holds (a row's bits do not
+// depend on M or on the tile it falls in), but they are not the exact kernels' bits; callers gate it (TF_FLASHNEXT_PROMPT_MX128).
+__device__ __forceinline__ uint32_t fp8pair_unit(uint32_t w, uint32_t unit) {
+    const uint32_t x = (w & 0xFFu) | ((w & 0xFF00u) << 8);
+    const uint32_t t = ((x & 0x007F007Fu) << 4) | ((x & 0x00800080u) << 8);
+    uint32_t r;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(unit), "r"(0x80008000u));
+    return r;
 }
+
+template <int BM, int BN, int WM, int WN, int STAGES, bool F32>
+__device__ __forceinline__ void prompt_mx_body(
+        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {
+    using T = Tile<MXFP8, BM, BN, WM, WN, STAGES>;
+    extern __shared__ __align__(128) unsigned char buf[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WN, wn = warp % WN;
+    const int KG = K / GS;
+    const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
+    const int m0 = at.x, n0 = at.y;
+
+    auto stage = [&](int s) { return buf + s * T::STAGE; };
+    auto load = [&](int s, int g) {
+        unsigned char* p = stage(s);
+        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
+            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
+            const int row = min(m0 + r, M - 1);
+            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
+                  m0 + r < M);
+        }
+        unsigned char* pw = p + T::X;
+        constexpr int TILE_BYTES = 64 * GS;
+        for (int c = tid; c < T::W / 16; c += T::THREADS) {
+            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+            if (n0 + t * 64 < npad) cp16(pw + c * 16, w + (static_cast<size_t>(n0 / 64 + t) * KG + g) * TILE_BYTES + off * 16);
+        }
+        unsigned char* ps = pw + T::W;
+        constexpr int PER = T::S / (BN / 64);
+        for (int c = tid; c < T::S / 16; c += T::THREADS) {
+            const int t = c / (PER / 16), off = c % (PER / 16);
+            if (n0 + t * 64 < npad) cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + t) * KG + g) * PER + off * 16);
+        }
+    };
+
+    float acc[T::MT][T::NT][4];
+#pragma unroll
+    for (int i = 0; i < T::MT; ++i)
+#pragma unroll
+        for (int j = 0; j < T::NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KG) load(s, s);
+        commit();
+    }
+    for (int g = 0; g < KG; ++g) {
+        wait<STAGES - 2>();
+        __syncthreads();
+        if (g + STAGES - 1 < KG) load((g + STAGES - 1) % STAGES, g + STAGES - 1);
+        commit();
+        const unsigned char* p = stage(g % STAGES);
+        const unsigned char* pw = p + T::X;
+        const uint8_t* ps = p + T::X + T::W;
+        uint4 wq[T::NT];
+        uint32_t sv[T::NT][2];
+#pragma unroll
+        for (int j = 0; j < T::NT; ++j) {
+            const int jj = wn * T::NT + j;
+            const int col = (jj & 7) * 8 + (lane >> 2);
+            wq[j] = reinterpret_cast<const uint4*>(pw)[jj * 32 + lane];
+            const uint32_t e2 = *reinterpret_cast<const uint16_t*>(ps + (jj >> 3) * 128 + col * 2);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t u = (((e2 >> (8 * h)) & 0xFFu) + 120u) << 7;  // 2^(e - 7), the 2^-120 of the shifted code folded in
+                sv[j][h] = u | (u << 16);
+            }
+        }
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt) {
+            uint32_t a[T::MT][4];
+#pragma unroll
+            for (int i = 0; i < T::MT; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                const int ch = kt * 2 + (lane >> 4);
+                ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+            }
+#pragma unroll
+            for (int j = 0; j < T::NT; ++j) {
+                const uint32_t word = comp(wq[j], kt);
+                const uint32_t unit = sv[j][kt >> 1];
+                const uint32_t b0 = fp8pair_unit(word & 0xFFFFu, unit);
+                const uint32_t b1 = fp8pair_unit(word >> 16, unit);
+#pragma unroll
+                for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
+            }
+        }
+    }
+    wait<0>();
+#pragma unroll
+    for (int i = 0; i < T::MT; ++i)
+#pragma unroll
+        for (int j = 0; j < T::NT; ++j) {
+            const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                if (row >= M) continue;
+                const float v0 = acc[i][j][2 * h] * scale, v1 = acc[i][j][2 * h + 1] * scale;
+                if (F32) {
+                    float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
+                    if (col < N) dst[0] = v0;
+                    if (col + 1 < N) dst[1] = v1;
+                } else {
+                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
+                    if (col + 1 < N && (N & 1) == 0)
+                        *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+                    else {
+                        if (col < N) dst[0] = __float2bfloat16_rn(v0);
+                        if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
+                    }
+                }
+            }
+        }
+}
+
+#define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32)                                                                    \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(                                                   \
+        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,     \
+        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {                      \
+        tf_qmmf::prompt_mx_body<BM, BN, WM, WN, ST, F32>(x, w, bs, scale, out, M, N, K, npad, ldx, group);                   \
+    }
+
+}  // namespace tf_qmmf
+
+// Names the Zig launcher loads (qmmf.zig Lane.prompt_mx): block rows x columns, warps, stages, bf16 or fp32 out.
+TF_PROMPT_MX(tf_qmmf_prompt_mx_bf16, 128, 128, 2, 4, 3, false)
+TF_PROMPT_MX(tf_qmmf_prompt_mx_f32, 128, 128, 2, 4, 3, true)

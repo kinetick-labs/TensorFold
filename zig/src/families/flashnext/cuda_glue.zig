@@ -33,6 +33,8 @@ const Fns = struct {
     wb_slices: cuda.Function,
     normalize: cuda.Function,
     dense_mix: cuda.Function,
+    normalize2: cuda.Function,
+    dense_mix2: cuda.Function,
     shared_swiglu: cuda.Function,
     shared_scatter: cuda.Function,
     down: cuda.Function,
@@ -114,6 +116,8 @@ pub const Glue = struct {
             .wb_slices = try g.hc.function("fn_hc_writeback_slices"),
             .normalize = try g.hc.function("fn_hc_normalize"),
             .dense_mix = try g.hc.function("fn_hc_dense_mix"),
+            .normalize2 = try g.hc.function("fn_hc_normalize2"),
+            .dense_mix2 = try g.hc.function("fn_hc_dense_mix2"),
             .shared_swiglu = try g.hc.function("fn_shared_swiglu"),
             .shared_scatter = try g.hc.function("fn_shared_scatter"),
             .down = try g.hc.function("fn_hc_down"),
@@ -300,6 +304,7 @@ pub const Glue = struct {
         args.add(eps);
         args.add(int(dims));
         args.add(int(streams));
+        if (dims % 256 == 0) return cuda.launch.launch(g.f.normalize2, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(streams) }, .block = .{ .x = 128 } }, s, &args);
         try cuda.launch.launch(g.f.normalize, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(streams) }, .block = .{ .x = 256 } }, s, &args);
     }
 
@@ -308,6 +313,7 @@ pub const Glue = struct {
         for ([_]u64{ up, norm, mixed, sums }) |v| args.add(v);
         args.add(int(dims));
         args.add(int(streams));
+        if (dims % 256 == 0) return cuda.launch.launch(g.f.dense_mix2, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(dims / 256) }, .block = .{ .x = 128 } }, s, &args);
         try cuda.launch.launch(g.f.dense_mix, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(dims / 32) }, .block = .{ .x = 32 } }, s, &args);
     }
 

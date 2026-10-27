@@ -472,6 +472,53 @@ extern "C" __global__ void fn_hc_dense_mix(const __nv_bfloat16* UP, const __nv_b
     }
 }
 
+// fn_hc_normalize with two columns a thread and every thread summing the stream's row sums itself (the same ordered
+// adds, so the same rinv): no shared exchange, 128 threads cover 256 columns.
+extern "C" __global__ void __launch_bounds__(128) fn_hc_normalize2(const __nv_bfloat16* __restrict__ H, const float* __restrict__ PSS,
+                                                                    const float* __restrict__ SCALE, __nv_bfloat16* __restrict__ OUT,
+                                                                    float eps, int D, int SS) {
+    const int r = blockIdx.x, stream = blockIdx.y, nc = D / 256;
+    float total = 0.0f;
+    for (int c = 0; c < nc; ++c) total = __fadd_rn(total, PSS[(static_cast<long long>(r) * nc + c) * SS + stream]);
+    const float rinv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(total, static_cast<float>(D)), eps)));
+    for (int d = 2 * threadIdx.x; d < D; d += 2 * blockDim.x) {
+        const int col = stream * D + d;
+        const long long at = static_cast<long long>(r) * SS * D + col;
+        const __nv_bfloat162 h = *reinterpret_cast<const __nv_bfloat162*>(H + at);
+        const float2 sc = *reinterpret_cast<const float2*>(SCALE + col);
+        *reinterpret_cast<__nv_bfloat162*>(OUT + at) =
+            __halves2bfloat162(__float2bfloat16_rn(__fmul_rn(__fmul_rn(bf(h.x), rinv), sc.x)),
+                               __float2bfloat16_rn(__fmul_rn(__fmul_rn(bf(h.y), rinv), sc.y)));
+    }
+}
+
+// fn_hc_dense_mix, two columns a thread and 256 columns a block (grid: rows x D / 256): the same per-column sums over
+// the streams in order and the same in-order sum of each group of 32 mixed values.
+extern "C" __global__ void __launch_bounds__(128) fn_hc_dense_mix2(const __nv_bfloat16* __restrict__ UP, const __nv_bfloat16* __restrict__ NORMED,
+                                                                    __nv_bfloat16* __restrict__ MIXED, float* __restrict__ XSM, int D, int SS) {
+    __shared__ float row[256];
+    const int r = blockIdx.x, t = threadIdx.x, d = blockIdx.y * 256 + 2 * t;
+    float total0 = 0.0f, total1 = 0.0f;
+    for (int stream = 0; stream < SS; ++stream) {
+        const long long at = (static_cast<long long>(r) * SS + stream) * D + d;
+        const __nv_bfloat162 u = *reinterpret_cast<const __nv_bfloat162*>(UP + at);
+        const __nv_bfloat162 n = *reinterpret_cast<const __nv_bfloat162*>(NORMED + at);
+        total0 = __fadd_rn(total0, rbf(__fmul_rn(bsig(bf(u.x)), bf(n.x))));
+        total1 = __fadd_rn(total1, rbf(__fmul_rn(bsig(bf(u.y)), bf(n.y))));
+    }
+    const float m0 = rbf(__fdiv_rn(total0, static_cast<float>(SS)));
+    const float m1 = rbf(__fdiv_rn(total1, static_cast<float>(SS)));
+    *reinterpret_cast<__nv_bfloat162*>(MIXED + static_cast<long long>(r) * D + d) = __halves2bfloat162(__float2bfloat16_rn(m0), __float2bfloat16_rn(m1));
+    row[2 * t] = m0;
+    row[2 * t + 1] = m1;
+    __syncthreads();
+    if (t < 8) {
+        float sum = 0.0f;
+        for (int i = 0; i < 32; ++i) sum = __fadd_rn(sum, row[t * 32 + i]);
+        XSM[static_cast<long long>(r) * (D / 32) + blockIdx.y * 8 + t] = sum;
+    }
+}
+
 // Shared expert uses its own BF16 projection outputs and rounding boundaries.
 extern "C" __global__ void fn_shared_swiglu(const __nv_bfloat16* GATE, const __nv_bfloat16* UP,
                                              __nv_bfloat16* ACT, int W) {

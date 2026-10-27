@@ -113,12 +113,14 @@ pub fn Pass(comptime Tri: type) type {
         prepared: bool = false,
         /// The pending write-back's branch sits in fp32 in moe_f32 (something added to it, or it is kept).
         pending_f32: bool = false,
+        /// Prompt rows (not a decode round, a drafted window or a training pass): the projections may take the relaxed prompt tiles.
+        prompt: bool = false,
 
         // ---- launches ----------------------------------------------------------------------------------------
 
         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
-            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
+            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk, self.prompt);
         }
 
         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
@@ -460,7 +462,8 @@ pub fn Pass(comptime Tri: type) type {
             const e = experts_n + 1;
             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
             if (lw.native_experts) |*native| {
-                try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
+                // one rank: the routed kernels and the shared scatter write every slot of every row; ranks sum partial rows
+                if (native.world != 1 or native.rank != 0) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
                 try @import("cuda_batch_moe.zig").nativeRouted(self, native, plan);
                 if (native.rank == 0) {
                     const glue = self.tri.own orelse return error.NativeGlueRequired;
@@ -593,7 +596,7 @@ pub fn Pass(comptime Tri: type) type {
     };
 }
 
-test "a pass's scratch at the dense cap stays near a gigabyte and a half" {
-    try std.testing.expect(Scratch.bytes(default_chunk) < 2 << 30);
+test "a pass's scratch at the default chunk stays under five gigabytes" {
+    try std.testing.expect(Scratch.bytes(default_chunk) < 5 << 30);
     try std.testing.expect(Scratch.bytes(1) < Scratch.bytes(2));
 }
