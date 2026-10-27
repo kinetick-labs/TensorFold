@@ -14,3 +14,21 @@ pub fn mx128MinN() usize {
     const v = std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") orelse return 1024;
     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024;
 }
+
+/// TF_FLASHNEXT_GATHER_EARLY=1: a shared pass gathers every stream's n-gram rows in one pool call (not one call a stream).
+pub fn gatherEarly() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_GATHER_EARLY") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// TF_FLASHNEXT_GATHER_LOG=1: the gather's and the PLE layer's join wait of shared passes, averaged over 100 passes.
+pub fn gatherLog() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_GATHER_LOG") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// TF_FLASHNEXT_GATHER_LOCK_SCALES=1: lock the n-gram table's scale arrays in memory at load (see Ngram.lockScales).
+pub fn gatherLockScales() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_GATHER_LOCK_SCALES") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}

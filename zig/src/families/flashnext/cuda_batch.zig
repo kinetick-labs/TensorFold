@@ -11,6 +11,7 @@ const parts = @import("cuda_batch_state.zig");
 const batch_lanes = @import("cuda_batch_lanes.zig");
 const tiles = @import("cuda_tiles.zig");
 const tk = @import("cuda_tile_kernels.zig");
+const knobs = @import("cuda_knobs.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -88,6 +89,15 @@ fn profile() bool {
     const v = std.c.getenv("TF_FLASHNEXT_PROFILE") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
+
+/// TF_FLASHNEXT_GATHER_LOG=1: what a shared pass waits for the n-gram gather at the PLE layer.
+const GatherStat = struct {
+    var passes: u64 = 0;
+    var wait_ns: u64 = 0;
+    var gather_ns: u64 = 0;
+    var ahead_ns: u64 = 0;
+    var rows: u64 = 0;
+};
 
 pub fn Pass(comptime Tri: type) type {
     return struct {
@@ -548,8 +558,26 @@ pub fn Pass(comptime Tri: type) type {
             for (self.m.layers, 0..) |*lw, layer| {
                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
                 if (layer == ple_layer) {
+                    const log_gather = thread != null and self.lanes.len > 0 and knobs.gatherLog();
+                    const t_join = if (log_gather) std.Io.Clock.awake.now(self.io).toNanoseconds() else 0;
                     if (thread) |th| th.join();
                     thread = null;
+                    if (log_gather) {
+                        const t_done = std.Io.Clock.awake.now(self.io).toNanoseconds();
+                        GatherStat.passes += 1;
+                        GatherStat.wait_ns += @intCast(t_done - t_join);
+                        GatherStat.gather_ns += @intCast(gather.ns);
+                        GatherStat.ahead_ns += @intCast(t_join - t0);
+                        GatherStat.rows += n;
+                        if (GatherStat.passes % 100 == 0) {
+                            const f = @as(f64, 1e6) * 100.0;
+                            std.debug.print("gather: {d} shared passes, per pass: {d:.1} rows, gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ GatherStat.passes, @as(f64, @floatFromInt(GatherStat.rows)) / 100.0, @as(f64, @floatFromInt(GatherStat.gather_ns)) / f, @as(f64, @floatFromInt(GatherStat.ahead_ns)) / f, @as(f64, @floatFromInt(GatherStat.wait_ns)) / f });
+                            GatherStat.wait_ns = 0;
+                            GatherStat.gather_ns = 0;
+                            GatherStat.ahead_ns = 0;
+                            GatherStat.rows = 0;
+                        }
+                    }
                     if (gather.failed) |err| return err;
                     if (profile()) std.debug.print("batch: {d} rows' n-gram rows gathered on the host in {d:.1} ms\n", .{ n, @as(f64, @floatFromInt(gather.ns)) / 1e6 });
                     try self.upload(s.ple_emb, std.mem.sliceAsBytes(emb));

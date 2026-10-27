@@ -413,7 +413,25 @@ pub const Ngram = struct {
             }
         }
         g.pool = try ple_pool.Pool.create(gpa, io);
+        if (@import("cuda_knobs.zig").gatherLockScales() and g.format == .nvfp4) g.lockScales(io);
         return g;
+    }
+
+    /// TF_FLASHNEXT_GATHER_LOCK_SCALES=1: the tables' scale arrays (3 to 4 GiB; a row's ten bytes sit on a page of their
+    /// own, apart from its codes) read in and locked, so a gathered row faults one page from disk, not two.
+    fn lockScales(g: *Ngram, io: std.Io) void {
+        if (@import("builtin").os.tag != .linux) return;
+        var total: usize = 0;
+        var failed = false;
+        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+        for (g.tables[0..g.hash.shards]) |t| {
+            const addr = @intFromPtr(t.scales.ptr);
+            const lo = addr & ~@as(usize, 4095);
+            const len = (addr + t.scales.len + 4095 - lo) & ~@as(usize, 4095);
+            const rc = std.os.linux.syscall2(.mlock, lo, len);
+            if (std.os.linux.errno(rc) != .SUCCESS) failed = true else total += len;
+        }
+        std.debug.print("info: flashnext: n-gram scale arrays locked in memory: {d:.2} GiB in {d:.1} s{s}\n", .{ @as(f64, @floatFromInt(total)) / (1 << 30), @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, if (failed) " (some mlock calls failed)" else "" });
     }
 
     pub fn deinit(g: *Ngram) void {
@@ -450,7 +468,14 @@ pub const Ngram = struct {
         fn part(ctx: *const anyopaque, i: usize) anyerror!void {
             const s: *const Split = @ptrCast(@alignCast(ctx));
             const lo = @min(s.ids.len, i * s.per);
+            const t0 = if (Stat.on) Stat.now() else 0;
             try s.g.fill(s.ids, s.out, lo, @min(s.ids.len, lo + s.per));
+            if (Stat.on) {
+                const d = Stat.now() - t0;
+                _ = Stat.part_sum.fetchAdd(d, .monotonic);
+                var m = Stat.part_max.load(.monotonic);
+                while (d > m) m = Stat.part_max.cmpxchgWeak(m, d, .monotonic, .monotonic) orelse break;
+            }
         }
     };
 
@@ -489,6 +514,114 @@ pub const Ngram = struct {
         @memcpy(history, hist[0..history.len]);
     }
 };
+
+/// TF_FLASHNEXT_GATHER_LOG=1: where the time of a shared gather goes.
+const Stat = struct {
+    const on_flag = struct {
+        var v: ?bool = null;
+    };
+    var on: bool = false;
+    var calls: u64 = 0;
+    var prep_ns: u64 = 0;
+    var run_ns: u64 = 0;
+    var post_ns: u64 = 0;
+    var parts_n: u64 = 0;
+    var items_n: u64 = 0;
+    var part_sum = std.atomic.Value(u64).init(0);
+    var part_max = std.atomic.Value(u64).init(0);
+    var max_sum: u64 = 0;
+    var run_sum_parts: u64 = 0;
+    fn now() u64 {
+        var t: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
+        return @as(u64, @intCast(t.sec)) * 1_000_000_000 + @as(u64, @intCast(t.nsec));
+    }
+};
+
+/// One stream's rows in a shared gather: its history (moved past the rows), tokens, and their slices of out and xs.
+pub const Part = struct { history: []i64, tokens: []const u32, out: []u16, xs: []f32 };
+
+/// `Ngram.rows` over several streams' rows in one pool call. Rows lie one after another in the caller's buffers; each
+/// stream's ids come from its own history, so every row's bits are the per-stream call's.
+pub fn rowsMany(g: *const Ngram, parts: []const Part) !void {
+    const heads = g.hash.heads;
+    const w = g.width();
+    var total: usize = 0;
+    for (parts) |q| {
+        if (q.history.len != g.hash.n - 1 or q.out.len != q.tokens.len * w or q.xs.len != q.out.len / 32) return error.UnexpectedTensor;
+        total += q.tokens.len;
+    }
+    const items = total * heads;
+    const ids = try g.gpa.alloc(i64, items);
+    defer g.gpa.free(ids);
+    Stat.on = @import("cuda_knobs.zig").gatherLog();
+    const ts0 = if (Stat.on) Stat.now() else 0;
+    var hists: [64][max_n]i64 = undefined;
+    if (parts.len > hists.len) return error.UnexpectedTensor;
+    var at: usize = 0;
+    for (parts, 0..) |q, k| {
+        const hist = &hists[k];
+        @memcpy(hist[0..q.history.len], q.history);
+        for (q.tokens) |token| {
+            try lastIds(g.hash, hist[0..q.history.len], @intCast(token), ids[at * heads ..][0..heads]);
+            for (0..q.history.len - 1) |i| hist[i] = hist[i + 1];
+            hist[q.history.len - 1] = token;
+            at += 1;
+        }
+    }
+    // the parts' outputs are consecutive in the caller's buffer (row0 on): one fill covers them all
+    const first = parts[0].out;
+    var out = first;
+    out.len = total * w;
+    for (parts[1..], 0..) |q, k| if (q.out.ptr != parts[k].out.ptr + parts[k].out.len) return error.UnexpectedTensor;
+    const n_threads = @min(ple_pool.max_parts, items / 4);
+    const ts1 = if (Stat.on) Stat.now() else 0;
+    if (Stat.on) {
+        Stat.part_sum.store(0, .monotonic);
+        Stat.part_max.store(0, .monotonic);
+    }
+    if (n_threads <= 1 or g.pool == null) {
+        try g.fill(ids, out, 0, items);
+    } else {
+        const split: Ngram.Split = .{ .g = g, .ids = ids, .out = out, .per = (items + n_threads - 1) / n_threads };
+        try g.pool.?.run(n_threads, .{ .ctx = &split, .run = Ngram.Split.part });
+    }
+    const ts2 = if (Stat.on) Stat.now() else 0;
+    defer if (Stat.on) {
+        Stat.calls += 1;
+        Stat.prep_ns += ts1 - ts0;
+        Stat.run_ns += ts2 - ts1;
+        Stat.post_ns += Stat.now() - ts2;
+        Stat.parts_n += n_threads;
+        Stat.items_n += items;
+        Stat.max_sum += Stat.part_max.load(.monotonic);
+        Stat.run_sum_parts += Stat.part_sum.load(.monotonic);
+        if (Stat.calls % 100 == 0) {
+            const f = 100.0 * 1e6;
+            std.debug.print("gather detail: per call prep {d:.2} ms, pool run {d:.2} ms (slowest part {d:.2} ms, sum of parts {d:.2} ms), post {d:.2} ms; {d:.0} parts, {d:.0} items\n", .{ @as(f64, @floatFromInt(Stat.prep_ns)) / f, @as(f64, @floatFromInt(Stat.run_ns)) / f, @as(f64, @floatFromInt(Stat.max_sum)) / f, @as(f64, @floatFromInt(Stat.run_sum_parts)) / f, @as(f64, @floatFromInt(Stat.post_ns)) / f, @as(f64, @floatFromInt(Stat.parts_n)) / 100.0, @as(f64, @floatFromInt(Stat.items_n)) / 100.0 });
+            Stat.prep_ns = 0;
+            Stat.run_ns = 0;
+            Stat.post_ns = 0;
+            Stat.parts_n = 0;
+            Stat.items_n = 0;
+            Stat.max_sum = 0;
+            Stat.run_sum_parts = 0;
+        }
+    };
+    for (parts) |q| {
+        for (0..q.tokens.len) |t| {
+            const row = q.out[t * w ..][0..w];
+            if (g.format == .mlx and g.scale != 1) {
+                for (row) |*v| {
+                    const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                    v.* = toBf16(f * g.scale);
+                }
+            }
+            sumGroups(row, q.xs[t * (w / 32) ..][0 .. w / 32]);
+        }
+    }
+    for (parts, 0..) |q, k| @memcpy(q.history, hists[k][0..q.history.len]);
+}
 
 test "a fresh window hashes token 7 into sixteen rows" {
     const h = try Hash.init(.{

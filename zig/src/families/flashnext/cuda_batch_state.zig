@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const gdn = @import("cuda_gdn.zig");
 const ple = @import("cuda_ple.zig");
+const knobs = @import("cuda_knobs.zig");
 const wt = @import("cuda_prompt_wt.zig");
 const tk = @import("cuda_tile_kernels.zig");
 const load = @import("cuda_prompt_load.zig");
@@ -581,6 +582,18 @@ pub const Gather = struct {
         defer g.ns = std.Io.Clock.awake.now(g.io).toNanoseconds() - t0;
         if (g.lanes.len == 0) {
             g.ngram.rows(g.history, g.ids, g.emb, g.xs) catch |err| {
+                g.failed = err;
+            };
+            return;
+        }
+        if (knobs.gatherEarly() and g.lanes.len <= 64) {
+            var parts: [64]ple.Part = undefined;
+            var at: usize = 0;
+            for (g.lanes, 0..) |l, k| {
+                parts[k] = .{ .history = l.seq.history[0..], .tokens = g.ids[at..][0..l.rows], .out = g.emb[at * dims ..][0 .. l.rows * dims], .xs = g.xs[at * (dims / 32) ..][0 .. l.rows * (dims / 32)] };
+                at += l.rows;
+            }
+            ple.rowsMany(g.ngram, parts[0..g.lanes.len]) catch |err| {
                 g.failed = err;
             };
             return;
