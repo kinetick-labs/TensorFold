@@ -1,8 +1,10 @@
 //! Prompt rows on tiles keeping #952's bits: the dense matmul (qmm.cu's arithmetic), the read-out and the experts.
+const std = @import("std");
 const cuda = @import("cuda");
 const wt = @import("cuda_prompt_wt.zig");
 const parts = @import("cuda_batch_state.zig");
 const tk = @import("cuda_tile_kernels.zig");
+const knobs = @import("cuda_knobs.zig");
 
 const dims = wt.dims;
 const streams = wt.streams;
@@ -88,8 +90,77 @@ pub fn readout(tri: anytype, k: *const Kernels, stream: cuda.Stream, s: *Scratch
     try tri.hcMixH(s.proj, h, rinv, hc_w.scale.ptr, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4, n, dims, streams);
 }
 
+/// Whether the fused native read-out (readoutNative) takes these weights: bf16 lane views of the shapes it is written for.
+pub fn nativeFused(hc_w: HcW) bool {
+    const down = hc_w.down.native orelse return false;
+    const up = hc_w.up.native orelse return false;
+    return down.mode == .bf16 and up.mode == .bf16 and down.scale == 1.0 and up.scale == 1.0 and streams == 4 and dims % 64 == 0 and
+        down.k == wide and down.n == hc_w.n_down and down.n <= 336 and down.n % 2 == 0 and up.k == low and low == 320 and up.n == wide;
+}
+
+fn pickTile(comptime mts: []const usize, name: [:0]const u8, default: usize) usize {
+    const want = knobs.hc2Tile(name);
+    for (mts, 0..) |mt, i| if (mt == want) return i;
+    for (mts, 0..) |mt, i| if (mt == default) return i;
+    return 0;
+}
+
+/// The down tile's rows (16 * mt) for `n` rows: its CTAs (two column tiles a row tile) run one a SM, so take the tile whose
+/// waves cost least (waves x mt), the taller tile on a tie. TF_FLASHNEXT_HC2_DN fixes it.
+fn pickDown(n: usize) usize {
+    const sms = 48;
+    const want = knobs.hc2Tile("TF_FLASHNEXT_HC2_DN");
+    for (tk.hcn_down_mt, 0..) |mt, i| if (mt == want) return i;
+    var best: usize = 0;
+    var best_cost: usize = std.math.maxInt(usize);
+    for (tk.hcn_down_mt, 0..) |mt, i| {
+        const cost = cdiv(cdiv(n, 16 * mt) * 2, sms) * mt;
+        if (cost <= best_cost) {
+            best = i;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
+/// Rows [r0, r0 + n)'s native read-out in three launches (nativeFused weights): the down projection over the streams normed in
+/// shared memory, fn_hc_reduce_act, the up projection with its mix: the five-launch chain's bytes, no normed rows in memory.
+pub fn readoutNative(tri: anytype, k: *const Kernels, stream: cuda.Stream, s: *Scratch, hc_w: HcW, r0: usize, n: usize) !void {
+    const down = hc_w.down.native.?;
+    const up = hc_w.up.native.?;
+    const h = s.h + r0 * wide * 2;
+    const pss = s.pss + r0 * pss_n * 4;
+    const act = s.act + r0 * low * 2;
+    const xs_act = s.xs_act + r0 * (low / 32) * 4;
+    const inj_ptr = if (hc_w.has_inj == 1) s.inj + r0 * streams * 2 else act;
+    const nc = dims / 256;
+    const di = pickDown(n);
+    const bm_d = 16 * tk.hcn_down_mt[di];
+    var a: cuda.Args = .{};
+    for ([_]u64{ h, pss, hc_w.scale.ptr, down.codes, s.hc_part }) |v| a.add(v);
+    for ([_]usize{ n, down.n, down.k, cuda.qmmf.splitK(down.n, down.k), dims, nc, streams }) |v| a.add(cint(v));
+    a.add(eps);
+    try cuda.launch.launch(k.tiles.hcn_down[di], .{ .grid = .{ .x = @intCast(cdiv(n, bm_d) * 2) }, .block = .{ .x = 224 }, .shared = tk.hcnDownSmem(tk.hcn_down_mt[di]) }, stream, &a);
+    try tri.hcReduceAct(s.hc_part, act, xs_act, inj_ptr, 1, n, streams, low, hc_w.n_down, hc_w.has_inj);
+    const ui = pickTile(&tk.hcn_up_mt, "TF_FLASHNEXT_HC2_UP", 3);
+    const bm_u = 16 * tk.hcn_up_mt[ui];
+    var b: cuda.Args = .{};
+    for ([_]u64{ act, up.codes, h, pss, hc_w.scale.ptr, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4 }) |v| b.add(v);
+    for ([_]usize{ n, dims, nc }) |v| b.add(cint(v));
+    b.add(eps);
+    try cuda.launch.launch(k.tiles.hcn_up[ui], .{ .grid = .{ .x = @intCast(cdiv(n, bm_u) * (dims / 32)) }, .block = .{ .x = 256 }, .shared = tk.hcnUpSmem(tk.hcn_up_mt[ui]) }, stream, &b);
+}
+
 /// The grouped experts on flashnext_fexp.cu's 64-pair tiles (expert_rows' bits), wn column blocks a CTA.
 pub fn experts(stream: cuda.Stream, f: cuda.Function, wn: usize, x: u64, x_stride: usize, slot_n: usize, w: u64, kg: usize, nb: usize, plan: cuda.grouped.Plan, out: u64, n: usize, items: usize) !void {
     var a = cuda.experts.Affine4Experts.argsOf(x, x_stride, slot_n, w, kg, nb, plan, out, n);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(items * cdiv(nb, wn)) }, .block = .{ .x = 256 }, .shared = tk.fexp_smem }, stream, &a);
+}
+
+test "the fused read-out's down tile is the one whose waves over the SMs cost least" {
+    // measured on a GB10 (48 SMs): 3072 rows 16 * 4 rows a CTA, 2048 rows 16 * 3, 1536 rows 16 * 4, 1024 rows 16 * 3
+    try std.testing.expectEqual(@as(usize, 4), tk.hcn_down_mt[pickDown(3072)]);
+    try std.testing.expectEqual(@as(usize, 3), tk.hcn_down_mt[pickDown(2048)]);
+    try std.testing.expectEqual(@as(usize, 4), tk.hcn_down_mt[pickDown(1536)]);
+    try std.testing.expectEqual(@as(usize, 3), tk.hcn_down_mt[pickDown(1024)]);
 }

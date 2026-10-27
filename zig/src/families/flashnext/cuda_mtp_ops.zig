@@ -40,6 +40,7 @@ const conv_bytes = mtp.conv_bytes;
 const proj_bytes = mtp.proj_bytes;
 const fc_sk = mtp.fc_sk;
 const piece_rows = mtp.piece_rows;
+const knobs = @import("cuda_knobs.zig");
 const pss_n = mtp.pss_n;
 /// Streams one batched head pass drafts for at most.
 pub const max_lanes: usize = 16;
@@ -118,7 +119,7 @@ pub fn Ops(comptime Tri: type) type {
             const last = stop == ids.len;
             try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr });
             const head_to = @min(stop, ids.len - 1);
-            if (head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);
+            if (head_to > at) try o.forwardHeadPieces(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false, knobs.headPiece());
             if (last) d.prompt_last = d.streams.ptr + (stop - 1 - at) * wide * 2;
         }
 
@@ -135,14 +136,21 @@ pub fn Ops(comptime Tri: type) type {
 
         /// The head over `next.len` rows of streams `rows`: cache at d.len, last row in d.out, scores in d.dlogits.
         pub fn forwardHead(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool) !void {
+            return o.forwardHeadPieces(d, next, rows, scores, piece_rows);
+        }
+
+        /// forwardHead taking at most `piece_req` rows a pass (the engine's chunk's half at most).
+        pub fn forwardHeadPieces(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool, piece_req: usize) !void {
             const e = o.e;
+            // never past half the engine's chunk: the pass's scratch is the chunk's and must not grow for the head
+            const piece_max = @min(piece_req, @max(piece_rows, e.chunk / 2));
             const tri = o.tri;
             const h = o.h;
             if (next.len == 0) return;
             if (d.len + next.len > d.cap) return error.PromptTooLong;
-            const want = @max(@as(usize, 32), 2 * @min(next.len, piece_rows));
+            const want = @max(@as(usize, 32), 2 * @min(next.len, piece_max));
             const s = try e.reserve(want);
-            const piece = @max(@as(usize, 1), @min(piece_rows, s.cap / 2));
+            const piece = @max(@as(usize, 1), @min(piece_max, s.cap / 2));
             // the engine's block scores (the passes share one stream), for rows past 2,048 keys of the head's cache
             const score_rows = try e.reserveScores(d.cap, piece);
             var p: batch.Pass(Tri) = .{

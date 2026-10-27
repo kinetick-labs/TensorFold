@@ -86,6 +86,15 @@ __device__ __forceinline__ void hc_writeback(const __nv_bfloat16* H, __nv_bfloat
             acc = __fmaf_rn(Y[at * D + d], WTS[at], acc);
         }
         branch = rbf(acc);
+    } else if constexpr (MODE == 3) {
+        // MODE 2 with the last slot's fp32 row read from BR (the shared expert's output, never copied into Y)
+        float acc = 0.0f;
+        for (int k = 0; k <= TOPK; ++k) {
+            const long long at = static_cast<long long>(r) * SLOTS + k;
+            const float yv = k == TOPK ? BR[static_cast<long long>(r) * D + d] : Y[at * D + d];
+            acc = __fmaf_rn(yv, WTS[at], acc);
+        }
+        branch = rbf(acc);
     }
     const int warp = threadIdx.x >> 5;
     for (int s = 0; s < S; ++s) {
@@ -114,6 +123,13 @@ extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_moe(const __nv
                                                                       const __nv_bfloat16* INJ, const float* Y,
                                                                       const float* WTS, int D, int S, int TOPK, int SLOTS) {
     hc_writeback<2>(H, HOUT, PSS, nullptr, INJ, Y, WTS, 0, D, S, TOPK, SLOTS, 1);
+}
+
+extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_moe_sh(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* PSS,
+                                                                         const __nv_bfloat16* INJ, const float* Y,
+                                                                         const float* WTS, const float* SHARED, int D, int S, int TOPK,
+                                                                         int SLOTS) {
+    hc_writeback<3>(H, HOUT, PSS, SHARED, INJ, Y, WTS, 0, D, S, TOPK, SLOTS, 1);
 }
 
 extern "C" __global__ void __launch_bounds__(256) fn_hc_writeback_slices(const __nv_bfloat16* H, __nv_bfloat16* HOUT, float* PSS,

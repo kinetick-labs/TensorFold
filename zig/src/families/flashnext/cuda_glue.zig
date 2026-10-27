@@ -30,6 +30,7 @@ fn cdiv(a: usize, b: usize) usize {
 const Fns = struct {
     wb0: cuda.Function,
     wb_moe: cuda.Function,
+    wb_moe_sh: cuda.Function,
     wb_slices: cuda.Function,
     normalize: cuda.Function,
     dense_mix: cuda.Function,
@@ -113,6 +114,7 @@ pub const Glue = struct {
         g.f = .{
             .wb0 = try g.hc.function("fn_hc_writeback0"),
             .wb_moe = try g.hc.function("fn_hc_writeback_moe"),
+            .wb_moe_sh = try g.hc.function("fn_hc_writeback_moe_sh"),
             .wb_slices = try g.hc.function("fn_hc_writeback_slices"),
             .normalize = try g.hc.function("fn_hc_normalize"),
             .dense_mix = try g.hc.function("fn_hc_dense_mix"),
@@ -408,6 +410,12 @@ pub const Glue = struct {
                 ptrs(&a, &.{ h, hout, pss, inj, y, wts });
                 ints(&a, &.{ dims, streams, topk, slots });
                 try go(g.f.wb_moe, s, grid, 256, 0, &a);
+            },
+            3 => {
+                // mode 2 with the shared expert's fp32 output (`branch`) as the last slot
+                ptrs(&a, &.{ h, hout, pss, inj, y, wts, branch });
+                ints(&a, &.{ dims, streams, topk, slots });
+                try go(g.f.wb_moe_sh, s, grid, 256, 0, &a);
             },
             4 => {
                 ptrs(&a, &.{ h, hout, pss, branch, inj });

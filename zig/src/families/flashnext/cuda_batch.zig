@@ -125,6 +125,8 @@ pub fn Pass(comptime Tri: type) type {
         pending_f32: bool = false,
         /// Prompt rows (not a decode round, a drafted window or a training pass): the projections may take the relaxed prompt tiles.
         prompt: bool = false,
+        /// The pending MoE write-back reads the shared expert's output from s.shared_out (never scattered into y's last slot).
+        shared_direct: bool = false,
 
         // ---- launches ----------------------------------------------------------------------------------------
 
@@ -206,6 +208,11 @@ pub fn Pass(comptime Tri: type) type {
             }
             const y = s.y + r0 * slots * dims * 4;
             const wts = s.wts + r0 * slots * 4;
+            if (self.shared_direct) {
+                self.shared_direct = false;
+                try self.tri.hcWriteback(h, h, pss, s.shared_out + r0 * dims * 4, "*fp32", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 3, 10, 11, 1);
+                return;
+            }
             try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
         }
 
@@ -230,6 +237,7 @@ pub fn Pass(comptime Tri: type) type {
             const xs_act = s.xs_act + r0 * (low / 32) * 4;
             if (hc_w.down.native) |down| {
                 const up = hc_w.up.native orelse return error.UnexpectedTensor;
+                if (self.prompt and n >= knobs.hc2MinRows() and knobs.promptHc2() and tiles.nativeFused(hc_w) and std.meta.eql(keep, HcKeep{})) return tiles.readoutNative(self.tri, self.k, self.stream, self.s, hc_w, r0, n);
                 try self.tri.hcNormalize(h, pss, hc_w.scale.ptr, norm, eps, n, dims, streams);
                 try self.k.native_lane.matmulF32(self.stream, norm, wide, n, down, s.hc_part, s.native_part);
                 const inj_ptr = if (hc_w.has_inj == 1) inj else act;
@@ -512,7 +520,10 @@ pub fn Pass(comptime Tri: type) type {
                     try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
                     try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
                     try self.k.native_lane.matmulF32(self.stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
-                    try glue.sharedScatter(self.stream, s.shared_out, s.y, n, dims, slots);
+                    // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
+                    if (self.prompt and knobs.sharedDirect() and (self.hooks.logits == .none or self.hooks.streams != 0) and self.hooks.moe_add == null and self.m.pocket == null and keep.moe_branch == 0 and native.world == 1) {
+                        self.shared_direct = true;
+                    } else try glue.sharedScatter(self.stream, s.shared_out, s.y, n, dims, slots);
                 }
                 if (native.world != 1) {
                     const collective = self.m.collective orelse return error.TensorParallelUnavailable;
@@ -572,6 +583,7 @@ pub fn Pass(comptime Tri: type) type {
             self.pos0 = pos0;
             self.pending = null;
             self.pending_f32 = false;
+            self.shared_direct = false;
             // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
             if (!self.prepared) try s.ready();
             const emb = s.hostEmb(n);

@@ -32,3 +32,38 @@ pub fn gatherLockScales() bool {
     const v = std.c.getenv("TF_FLASHNEXT_GATHER_LOCK_SCALES") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
+
+/// TF_FLASHNEXT_PROMPT_HC2=1: the native hyper-connection read-out of prompt passes (TF_FLASHNEXT_HC2_MIN rows or more) runs on two fused
+/// kernels (flashnext_hcf.cu hcn: the norm formed in the down tile and in the up epilogue, the up rows mixed in place)
+/// instead of five launches; every byte of its outputs is the five-launch chain's.
+pub fn promptHc2() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_PROMPT_HC2") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// TF_FLASHNEXT_HC2_DN / TF_FLASHNEXT_HC2_UP: the CTA row tile (16 * N rows) of those two kernels; 0: the default.
+pub fn hc2Tile(name: [:0]const u8) usize {
+    const v = std.c.getenv(name) orelse return 0;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+}
+
+/// TF_FLASHNEXT_HC2_MIN: the fewest rows of a prompt pass that take the fused read-out (default 768; its CTAs need rows to fill the GPU).
+pub fn hc2MinRows() usize {
+    const v = std.c.getenv("TF_FLASHNEXT_HC2_MIN") orelse return 768;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 768;
+}
+
+/// TF_FLASHNEXT_HEAD_PIECE: the rows a prompt chunk's MTP head pass takes at most (default 256, the decode rounds' piece).
+/// From 1024 rows the head's experts take the shared-memory row tiles (the decode kernel's bits) and read each weight once.
+pub fn headPiece() usize {
+    const v = std.c.getenv("TF_FLASHNEXT_HEAD_PIECE") orelse return 256;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 256;
+    return if (n == 0) 256 else n;
+}
+
+/// TF_FLASHNEXT_PROMPT_SHARED_DIRECT=1: a prompt pass's MoE write-back reads the shared expert's fp32 output in place instead of
+/// a copy of it in y's last slot (the same value in the same fused-multiply-add order; one launch and 62 MB per layer less).
+pub fn sharedDirect() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_PROMPT_SHARED_DIRECT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}

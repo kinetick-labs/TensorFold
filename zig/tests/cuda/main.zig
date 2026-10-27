@@ -89,6 +89,7 @@ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
 const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
 const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
 const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
+const flashnext_hc_fuse_tests = @import("flashnext_hc_fuse_tests.zig");
 const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
 const flashnext_kv8_tests = @import("flashnext_kv8_tests.zig");
 const flashnext_cand_tests = @import("flashnext_cand_tests.zig");
@@ -189,6 +190,7 @@ const usage =
     \\  fp8-experts <dir>         grouped block-FP8 experts against recorded fixture bytes
     \\  nvfp4-experts <dir>       grouped NVFP4 experts against recorded fixture bytes
     \\  nvfp4-experts-tile [ROWS[,ROWS] [EXPERTS [time]]]  the prompt expert tile against the decode kernel, byte for byte, and its time (synthetic)
+    \\  hc-fuse                   the fused native hyper-connection read-out against the five-launch chain: bytes, then times
     \\  projection-f32            FP32 projection outputs against FP64, rounding and row/reduction invariance
     \\  mxfp8                     MXFP8 strided projections against FP64 and row-count invariance
     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
@@ -304,6 +306,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-nvfp4-tp")) return flashnext_nvfp4_tp_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-dense-hc")) return flashnext_dense_hc_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-hc")) return flashnext_hc_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "hc-fuse")) return flashnext_hc_fuse_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-attn")) return flashnext_attn_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-kv8")) return flashnext_kv8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-cand")) return flashnext_cand_tests.run(gpu);
