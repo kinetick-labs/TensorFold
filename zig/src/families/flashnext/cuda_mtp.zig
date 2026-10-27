@@ -33,6 +33,64 @@ pub const max_chain: usize = max_rows - 1;
 pub const default_depth: usize = 6;
 /// The live recipe's --mtp-confidence (Python's CONFIDENCE default is 0.7).
 pub const default_confidence: f64 = 0.6;
+/// The served hybrid's per-draft floor above `product_streams` live streams (the old recipe engine's wide_confidence).
+pub const wide_confidence: f64 = 0.5;
+
+/// A chain's stop rule from a `confidence` value: c > 0, each later draft only at or above c; c < 0, a later draft j only while
+/// p1 * ... * pj >= -c (the running product: it keeps going on confident heads and stops early on lukewarm ones, whatever the
+/// depth); 0, every draft to the depth. The first draft is always proposed. Drafts only: the kept tokens are the target's either way.
+pub const Stop = struct {
+    c: f64,
+    product: f64 = 1.0,
+
+    /// Whether draft j (0-based) with probability `p` is proposed, and whether the chain may go on.
+    pub fn take(s: *Stop, j: usize, p: f64) struct { propose: bool, more: bool } {
+        if (s.c > 0) {
+            const low = p < s.c;
+            if (low and j > 0) return .{ .propose = false, .more = false };
+            return .{ .propose = true, .more = !low };
+        }
+        if (s.c < 0) {
+            s.product *= p;
+            // the first draft always goes; below the line it ends the chain (no later product can reach it)
+            if (s.product < -s.c) return .{ .propose = j == 0, .more = false };
+        }
+        return .{ .propose = true, .more = true };
+    }
+};
+
+/// The stop rule for a step drafting `drafting` streams together: a running product (c < 0) only up to `product_streams` of them,
+/// the per-draft `wide_confidence` above.
+pub fn confidenceFor(c: f64, drafting: usize, product_streams: usize) f64 {
+    if (c >= 0) return c;
+    return if (drafting <= product_streams) c else wide_confidence;
+}
+
+test "the product rule serves up to product_streams streams, the per-draft floor above" {
+    try std.testing.expectEqual(@as(f64, 0.6), confidenceFor(0.6, 9, 5));
+    try std.testing.expectEqual(@as(f64, -0.4), confidenceFor(-0.4, 1, 5));
+    try std.testing.expectEqual(@as(f64, -0.4), confidenceFor(-0.4, 5, 5));
+    try std.testing.expectEqual(wide_confidence, confidenceFor(-0.4, 6, 5));
+    try std.testing.expectEqual(wide_confidence, confidenceFor(-0.4, 3, 2));
+    try std.testing.expectEqual(@as(f64, 0), confidenceFor(0, 9, 1));
+}
+
+test "the stop rules: per draft, running product, none" {
+    var a: Stop = .{ .c = 0.7 };
+    try std.testing.expect(a.take(0, 0.5).propose and !a.take(0, 0.5).more);
+    try std.testing.expect(!a.take(1, 0.5).propose);
+    var low: Stop = .{ .c = -0.4 };
+    const first = low.take(0, 0.3); // a weak first draft: proposed, and the chain ends there
+    try std.testing.expect(first.propose and !first.more);
+    var b: Stop = .{ .c = -0.4 };
+    try std.testing.expect(b.take(0, 0.9).more); // 0.9
+    try std.testing.expect(b.take(1, 0.8).propose); // 0.72
+    try std.testing.expect(b.take(2, 0.6).propose); // 0.432
+    try std.testing.expect(!b.take(3, 0.9).propose); // 0.389
+    var c: Stop = .{ .c = 0 };
+    try std.testing.expect(c.take(5, 0.01).propose);
+}
+
 /// A verify window's rows at most: the pending token and a chain, or a copied continuation.
 pub const max_rows: usize = 16;
 /// qmm.split_for(2560, 2560): fc_embedding and fc_hidden sum K in four slices, in order.

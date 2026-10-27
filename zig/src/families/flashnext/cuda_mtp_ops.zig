@@ -256,15 +256,16 @@ pub fn Ops(comptime Tri: type) type {
             try o.absorb(d, next, rows, count > 0);
             if (ahead) |a| a.flush();
             var j: usize = 0;
+            var stop: mtp.Stop = .{ .c = confidence };
             while (j < @min(count, max_chain)) : (j += 1) {
                 const got = try o.pick(d, position + j, sm);
-                const low = confidence > 0 and got.prob < confidence;
-                if (low and j > 0) break;
+                const t = stop.take(j, got.prob);
+                if (!t.propose) break;
                 out.tokens[out.n] = got.token;
                 out.probs[out.n] = got.prob;
                 out.n += 1;
                 if (ahead) |a| a.push(0, got.token);
-                if (low) break;
+                if (!t.more) break;
                 if (j + 1 < count) {
                     try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
                     // asked once the head's step is on the stream: the reads run while it does
@@ -408,6 +409,7 @@ pub fn Ops(comptime Tri: type) type {
                 n_act += 1;
             };
             var j: usize = 0;
+            var stops: [max_lanes]mtp.Stop = @splat(.{ .c = confidence });
             var best_host: [max_lanes * 4]f32 = undefined;
             var step_ds: [max_lanes]*Draft = undefined;
             var step_next: [max_lanes][1]u32 = undefined;
@@ -464,13 +466,13 @@ pub fn Ops(comptime Tri: type) type {
                         }
                     }
                     const out = outs[i];
-                    const low = confidence > 0 and got.prob < confidence;
-                    if (low and j > 0) continue;
+                    const t = stops[i].take(j, got.prob);
+                    if (!t.propose) continue;
                     out.tokens[out.n] = got.token;
                     out.probs[out.n] = got.prob;
                     out.n += 1;
                     if (ahead) |a| a.push(i, got.token);
-                    if (low) continue;
+                    if (!t.more) continue;
                     if (j + 1 < @min(counts[i], max_chain)) {
                         step_ds[n_step] = ds[i];
                         step_next[n_step] = .{got.token};

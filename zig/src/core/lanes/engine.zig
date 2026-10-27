@@ -317,6 +317,36 @@ pub const Engine = struct {
         if (e.backend.round_observer != null) e.backend.observed(paths);
     }
 
+    /// TF_FLASHNEXT_COPY_LOG=1: every 400 verified windows, the windows, rows and kept drafts by plan kind since the last line.
+    fn copyLog(p: Plan, rows: usize, kept: usize) void {
+        const st = struct {
+            var on: i8 = -1;
+            var n: [6]u64 = @splat(0);
+            var r: [6]u64 = @splat(0);
+            var k: [6]u64 = @splat(0);
+            var full: [6]u64 = @splat(0);
+            var calls: u64 = 0;
+        };
+        if (st.on < 0) st.on = if (std.c.getenv("TF_FLASHNEXT_COPY_LOG")) |v| @intFromBool(v[0] == '1') else 0;
+        if (st.on == 0) return;
+        const i = @intFromEnum(p.kind);
+        st.n[i] += 1;
+        st.r[i] += rows;
+        st.k[i] += kept;
+        if (rows > 1 and kept == rows - 1) st.full[i] += 1;
+        st.calls += 1;
+        if (st.calls % 400 != 0) return;
+        std.debug.print("COPYLOG", .{});
+        for (0..6) |j| {
+            if (st.n[j] > 0) std.debug.print(" {s}: win={d} rows={d} kept={d} full={d};", .{ @tagName(@as(win.Kind, @enumFromInt(j))), st.n[j], st.r[j], st.k[j], st.full[j] });
+        }
+        std.debug.print("\n", .{});
+        st.n = @splat(0);
+        st.r = @splat(0);
+        st.k = @splat(0);
+        st.full = @splat(0);
+    }
+
     /// Commit the target-sampled path (after the thinking budget's cut), each token with its path row's logprob row.
     fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, rows_lp: []const LogRow, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
         const a = e.arena.allocator();
@@ -333,6 +363,7 @@ pub const Engine = struct {
             for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
             try committed.append(a, sampled[path[path.len - 1]]);
             if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
+            copyLog(p, rows, path.len - 1);
             if (rows > 1) {
                 const kept = path.len - 1;
                 e.drafted += rows - 1;
