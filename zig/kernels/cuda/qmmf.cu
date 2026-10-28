@@ -418,7 +418,12 @@ template __global__ void reduce_kernel<true>(const float* __restrict__, void* __
 template __global__ void reduce_kernel<false>(const float* __restrict__, void* __restrict__, long long, int, float);
 
 
-// MXFP8 prompt rows, 128 x 128 (relaxed): code times UE8M0 scale is exact in bf16, so a warp issues only mma over K.
+// ---- MXFP8 prompt rows on a 128 x 128 tile (relaxed): the block scale rides in the B fragment, one fp32 chain over K ----
+//
+// The exact kernels above add each 32-input group's mma sum to the accumulator with one fmaf per element. Here the
+// e4m3 code times its UE8M0 scale is formed exactly in bf16 (a power-of-two multiply), so a warp issues only mma
+// instructions over the whole of K. Rows are summed in the same order whatever the chunk holds (a row's bits do not
+// depend on M or on the tile it falls in), but they are not the exact kernels' bits; callers gate it (TF_FLASHNEXT_PROMPT_MX128).
 __device__ __forceinline__ uint32_t fp8pair_unit(uint32_t w, uint32_t unit) {
     const uint32_t x = (w & 0xFFu) | ((w & 0xFF00u) << 8);
     const uint32_t t = ((x & 0x007F007Fu) << 4) | ((x & 0x00800080u) << 8);
@@ -427,7 +432,6 @@ __device__ __forceinline__ uint32_t fp8pair_unit(uint32_t w, uint32_t unit) {
     return r;
 }
 
-// A row keeps its order whatever M or the tile, but not the exact kernels' bits: the caller gates it (PROMPT_MX128).
 template <int BM, int BN, int WM, int WN, int STAGES, bool F32>
 __device__ __forceinline__ void prompt_mx_body(
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
@@ -545,8 +549,8 @@ __device__ __forceinline__ void prompt_mx_body(
         }
 }
 
-#define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32)                                                                    \
-    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(                                                   \
+#define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32, MINB)                                                              \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32, MINB) NAME(                                             \
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,     \
         float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {                      \
         tf_qmmf::prompt_mx_body<BM, BN, WM, WN, ST, F32>(x, w, bs, scale, out, M, N, K, npad, ldx, group);                   \
@@ -555,5 +559,9 @@ __device__ __forceinline__ void prompt_mx_body(
 }  // namespace tf_qmmf
 
 // Names the Zig launcher loads (qmmf.zig Lane.prompt_mx): block rows x columns, warps, stages, bf16 or fp32 out.
-TF_PROMPT_MX(tf_qmmf_prompt_mx_bf16, 128, 128, 2, 4, 3, false)
-TF_PROMPT_MX(tf_qmmf_prompt_mx_f32, 128, 128, 2, 4, 3, true)
+TF_PROMPT_MX(tf_qmmf_prompt_mx_bf16, 128, 128, 2, 4, 3, false, 1)
+TF_PROMPT_MX(tf_qmmf_prompt_mx_f32, 128, 128, 2, 4, 3, true, 1)
+// The same tile and arithmetic with two stages and two blocks an SM (TF_FLASHNEXT_PROMPT_GEMM2=1): one block output stores and
+// pipeline fill overlap the other K loop (61 -> 76 TF on the 2560 x 16512 projection, same bits).
+TF_PROMPT_MX(tf_qmmf_prompt_mx2_bf16, 128, 128, 2, 4, 2, false, 2)
+TF_PROMPT_MX(tf_qmmf_prompt_mx2_f32, 128, 128, 2, 4, 2, true, 2)
