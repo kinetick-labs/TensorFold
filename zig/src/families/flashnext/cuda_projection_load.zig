@@ -1,8 +1,10 @@
 //! Projection loading preserves dense BF16 bits and MXFP8 codes/scales; affine layouts keep their existing packer.
 const std = @import("std");
 const cuda = @import("cuda");
+const core = @import("core");
 const wt = @import("cuda_prompt_wt.zig");
 const projection = @import("cuda_projection.zig");
+const fp8 = core.quant.fp8;
 
 pub const Micro = struct {
     n: usize,
@@ -64,7 +66,41 @@ pub fn readStitched(a: std.mem.Allocator, store: anytype, prefix: []const u8, na
     return .{ .n = n, .k = k, .codes = codes, .scales = scales };
 }
 
+/// TF_FLASHNEXT_MXFP8=0 keeps the widened path: an e4m3 plane is expanded to bf16 on the host and served dense
+/// instead of as stored codes. Both give the same numbers — an e4m3 code times a power of two is exact in bf16
+/// (three mantissa bits against seven) — so the switch measures the native lane's bytes and speed, not its
+/// arithmetic, and it is what an A/B arm of that lane is built from.
+pub fn mxLane() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_MXFP8") orelse return true;
+    return !(std.mem.eql(u8, std.mem.span(v), "0") or std.ascii.eqlIgnoreCase(std.mem.span(v), "false"));
+}
+
+/// `value`'s codes and group-32 UE8M0 scales as bf16 rows, `2^(scale - 127)` a group.
+pub fn widen(a: std.mem.Allocator, value: Micro) ![]u8 {
+    const count = try std.math.mul(usize, value.n, value.k);
+    const out = try a.alloc(u8, try std.math.mul(usize, count, 2));
+    errdefer a.free(out);
+    const groups = value.k / 32;
+    for (0..value.n) |row| {
+        for (0..value.k) |col| {
+            const code = value.codes[row * value.k + col];
+            const e = value.scales[row * groups + col / 32];
+            // e4m3 (fp8.e4m3's own reading, NaN for 0x7f/0xff) times the group's power of two, in f32 and then
+            // bf16's top half: no rounding happens, the product fits both exactly.
+            const x: f64 = fp8.e4m3(code) * std.math.pow(f64, 2, @as(f64, @floatFromInt(e)) - 127);
+            const bits: u32 = @bitCast(@as(f32, @floatCast(x)));
+            std.mem.writeInt(u16, out[(row * value.k + col) * 2 ..][0..2], @truncate(bits >> 16), .little);
+        }
+    }
+    return out;
+}
+
 fn uploadMicro(a: std.mem.Allocator, d: *const cuda.Driver, value: Micro) !wt.Q4 {
+    if (!mxLane()) {
+        const wide = try widen(a, value);
+        defer a.free(wide);
+        return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ value.n, value.k, 1, 1, 1 }, .bytes = wide });
+    }
     return projection.mxfp8(a, d, .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ value.n, value.k, 1, 1, 1 }, .bytes = value.codes }, .{ .dtype = .u8, .rank = 2, .shape = .{ value.n, value.k / 32, 1, 1, 1 }, .bytes = value.scales });
 }
 

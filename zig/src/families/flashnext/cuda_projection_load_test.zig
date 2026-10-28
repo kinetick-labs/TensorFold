@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("core");
 const source = @import("cuda_projection_load.zig");
 const Tensor = core.safetensors.Tensor;
+const fp8 = core.quant.fp8;
 
 const Fake = struct {
     scratch: [1024]u8 = undefined,
@@ -48,6 +49,38 @@ test "MXFP8 fusion owns each shard plane and preserves exact output row order" {
 
 test "MXFP8 fusion cleans every partial allocation on failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, trial, .{});
+}
+
+fn fromBf16(h: u16) f32 {
+    return @bitCast(@as(u32, h) << 16);
+}
+
+test "the widened plane holds each code times its group's power of two, exactly" {
+    const a = std.testing.allocator;
+    const n: usize = 4;
+    const k: usize = 64; // two groups a row
+    const codes = try a.alloc(u8, n * k);
+    defer a.free(codes);
+    const scales = try a.alloc(u8, n * (k / 32));
+    defer a.free(scales);
+    for (codes, 0..) |*c, i| c.* = @truncate(i); // every e4m3 code once
+    for (scales, 0..) |*s, i| s.* = @truncate(96 + i * 8); // 2^-31 ... 2^25, a shipped checkpoint's range
+    const value = source.Micro{ .n = n, .k = k, .codes = codes, .scales = scales };
+    const wide = try source.widen(a, value);
+    defer a.free(wide);
+    for (0..n) |row| {
+        for (0..k) |col| {
+            const code = codes[row * k + col];
+            const e = scales[row * (k / 32) + col / 32];
+            const want: f64 = fp8.e4m3(code) * std.math.pow(f64, 2, @as(f64, @floatFromInt(e)) - 127);
+            const got = fromBf16(std.mem.readInt(u16, wide[(row * k + col) * 2 ..][0..2], .little));
+            if (std.math.isNan(want)) {
+                try std.testing.expect(std.math.isNan(got)); // e4m3's 0x7f/0xff stay NaN
+                continue;
+            }
+            try std.testing.expectEqual(@as(f32, @floatCast(want)), got);
+        }
+    }
 }
 
 test "MXFP8 source refuses incompatible shapes, dtypes, extents and missing scales" {
