@@ -30,7 +30,7 @@ tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --vision
 tensorfold serve TensorFold/GLM-5.3-Flash-MLX-4bit-MTP --vision
 ```
 
-GLM-5.3-Flash image input is currently MLX-only. CUDA uses the same flag with `--backend cuda` for supported Qwen checkpoints; their vision tower must use floating-point weights.
+GLM-5.3-Flash image input is currently MLX-only. CUDA uses the same flag with `--backend cuda` for supported Qwen checkpoints; their vision tower must use floating-point weights, except that ModelOpt's MXFP8 and NVFP4 vision linears (nvidia/Qwen3.8-Flash-Next-FP4-Local) are decoded to bf16 at load, so the tower runs in bf16 as ever.
 
 On a small CUDA card the resident tower and its 4 GiB workspace reserve take a large part of the startup budget. `--vision-offload` (with `--vision`, CUDA only) keeps the tower in host RAM, copies it to the GPU only while an image is encoded, and reserves 2.25 GiB instead. On one RTX 4090 with the Qwen3.8-27B EXL3 3.50bpw pack and DFlash2, the largest window with `--vision` went from 11,922 to 38,686 tokens; a 4,096-token image peaked about 1.3 GB above idle. Each image request pays the copy of the roughly 0.9 GiB tower to the GPU and back.
 MLX also reads per-module quantized tower weights when the checkpoint declares their format.
