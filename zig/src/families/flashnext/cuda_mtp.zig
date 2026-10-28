@@ -128,6 +128,49 @@ pub fn maskRow(row: []u16, bits: []const u32) void {
 
 /// The keyed draw over one bf16 score row, column j being token ids[j] (or j), as lanes.sampling.choose draws.
 pub fn drawRow(gpa: std.mem.Allocator, row: []const u16, ids: ?[]const u32, position: u64, sm: ?Sampling) !u32 {
+    return drawRowWith(gpa, row, ids, position, sm, false);
+}
+
+/// Inserts column `col` (score `v`) into the `held` best so far, best first, an equal score ranking below the earlier column.
+fn insertTop(top_v: []f32, top_c: []usize, held: *usize, v: f32, col: usize) void {
+    const k = top_v.len;
+    if (held.* == k and !(v > top_v[k - 1])) return;
+    var at: usize = if (held.* < k) held.* else k - 1;
+    if (held.* < k) held.* += 1;
+    while (at > 0 and v > top_v[at - 1]) : (at -= 1) {
+        top_v[at] = top_v[at - 1];
+        top_c[at] = top_c[at - 1];
+    }
+    top_v[at] = v;
+    top_c[at] = col;
+}
+
+/// The k best columns of `row`, best first (`top_v`, `top_c` of length k), by one pass over the row.
+fn scanTop(row: []const u16, top_v: []f32, top_c: []usize) void {
+    var held: usize = 0;
+    for (row, 0..) |b, col| insertTop(top_v, top_c, &held, promote(b), col);
+}
+
+/// scanTop with sixteen columns tested at once against the k-th best so far: a column that does not beat it is skipped by
+/// insertTop too (a NaN beats nothing in either), so the held columns, their order and their scores are scanTop's bit for bit.
+fn scanTopWide(row: []const u16, top_v: []f32, top_c: []usize) void {
+    const lanes_n = 16;
+    const k = top_v.len;
+    var held: usize = 0;
+    var col: usize = 0;
+    while (col < row.len and held < k) : (col += 1) insertTop(top_v, top_c, &held, promote(row[col]), col);
+    while (col + lanes_n <= row.len) : (col += lanes_n) {
+        const w: @Vector(lanes_n, u16) = row[col..][0..lanes_n].*;
+        const f: @Vector(lanes_n, f32) = @bitCast(@as(@Vector(lanes_n, u32), w) << @splat(16));
+        const thr: @Vector(lanes_n, f32) = @splat(top_v[k - 1]);
+        if (!@reduce(.Or, f > thr)) continue;
+        for (row[col..][0..lanes_n], col..) |b, c| insertTop(top_v, top_c, &held, promote(b), c);
+    }
+    while (col < row.len) : (col += 1) insertTop(top_v, top_c, &held, promote(row[col]), col);
+}
+
+/// drawRow, the k best columns found by scanTopWide when `wide` (the same draw, found faster).
+pub fn drawRowWith(gpa: std.mem.Allocator, row: []const u16, ids: ?[]const u32, position: u64, sm: ?Sampling, wide_scan: bool) !u32 {
     const id = struct {
         fn of(map: ?[]const u32, col: usize) u64 {
             return if (map) |m| m[col] else col;
@@ -152,19 +195,7 @@ pub fn drawRow(gpa: std.mem.Allocator, row: []const u16, ids: ?[]const u32, posi
         defer gpa.free(top_v);
         const top_c = try gpa.alloc(usize, k);
         defer gpa.free(top_c);
-        var held: usize = 0;
-        for (row, 0..) |b, col| {
-            const v = promote(b);
-            if (held == k and !(v > top_v[k - 1])) continue;
-            var at: usize = if (held < k) held else k - 1;
-            if (held < k) held += 1;
-            while (at > 0 and v > top_v[at - 1]) : (at -= 1) {
-                top_v[at] = top_v[at - 1];
-                top_c[at] = top_c[at - 1];
-            }
-            top_v[at] = v;
-            top_c[at] = col;
-        }
+        if (wide_scan) scanTopWide(row, top_v, top_c) else scanTop(row, top_v, top_c);
         for (vals, keys, top_v, top_c) |*v, *key, tv, c| {
             v.* = tv;
             key.* = id(ids, c);
@@ -178,7 +209,12 @@ pub fn drawRow(gpa: std.mem.Allocator, row: []const u16, ids: ?[]const u32, posi
 /// column. The lone head step (Ops.pick) and the batched one (Ops.draftMany) both draw through here, so a stream's drafts
 /// do not depend on whether it drafted alone.
 pub fn drawPick(gpa: std.mem.Allocator, row: []const u16, ids: []const u32, lse: f32, position: u64, sm: ?Sampling) !Pick {
-    const tok = try drawRow(gpa, row, ids, position, sm);
+    return drawPickWith(gpa, row, ids, lse, position, sm, false);
+}
+
+/// drawPick over drawRowWith.
+pub fn drawPickWith(gpa: std.mem.Allocator, row: []const u16, ids: []const u32, lse: f32, position: u64, sm: ?Sampling, wide_scan: bool) !Pick {
+    const tok = try drawRowWith(gpa, row, ids, position, sm, wide_scan);
     const col = std.sort.binarySearch(u32, ids, tok, struct {
         fn order(t: u32, x: u32) std.math.Order {
             return std.math.order(t, x);
@@ -213,8 +249,9 @@ pub fn candidateCount(sm: ?Sampling, n: usize) ?usize {
     return s.top_k;
 }
 
-/// Rows one launch of fn_row_cand serves at most (a window's rows, or the lanes of a batched head step).
-pub const cand_slots: usize = 16;
+/// Rows of scratch for fn_row_cand's outputs: a shared pass's windows side by side (up to 32 of 16 rows would not fit; a pass is
+/// 64 rows at most), or the lanes of a batched head step.
+pub const cand_slots: usize = 64;
 /// Device scratch for fn_row_cand's outputs: vals [cand_slots, cand_max] f32, cols [cand_slots, cand_max] i32, flags [cand_slots] i32.
 pub const cand_bytes: usize = 2 * cand_slots * cand_max * 4 + cand_slots * 4;
 
@@ -224,6 +261,11 @@ pub const Cands = struct {
     cols: [cand_slots * cand_max]i32 = undefined,
     flags: [cand_slots]i32 = undefined,
 };
+
+comptime {
+    // the device scratch and its host copy are one layout: a single download fills a Cands
+    std.debug.assert(@sizeOf(Cands) == cand_bytes);
+}
 
 /// A bf16 score's 16-bit sort key (fn_row_cand's): larger scores larger keys, +0 and -0 one key (NaN has none).
 pub fn candidateKey(bits: u16) u16 {
@@ -453,6 +495,10 @@ pub const Draft = @import("cuda_mtp_draft.zig").Draft;
 pub const Ops = @import("cuda_mtp_ops.zig").Ops;
 pub const check = @import("cuda_mtp_check.zig").check;
 
+test {
+    _ = @import("cuda_host_draw.zig");
+}
+
 test "the draft vocabulary is 79,591 sorted ids under the vocabulary" {
     const ids = try draftIds(std.testing.allocator);
     defer std.testing.allocator.free(ids);
@@ -599,6 +645,29 @@ test "a keyed draw over the candidates is the draw over the whole row, and a pic
     try std.testing.expectEqual(@as(?usize, null), candidateCount(.{ .seed = 1, .top_k = 65 }, 900));
     try std.testing.expectEqual(@as(?usize, null), candidateCount(.{ .seed = 1, .top_k = 20 }, 20));
     try std.testing.expectEqual(@as(?usize, 20), candidateCount(.{ .seed = 1, .top_k = 20 }, 21));
+}
+
+test "the wide scan holds the columns, order and scores of the plain scan, ties and NaNs included" {
+    var prng = std.Random.DefaultPrng.init(404);
+    var row: [1100]u16 = undefined;
+    for ([_]u8{ 1, 2, 5, 40, 200 }) |levels| for ([_]usize{ 1, 2, 3, 20, 31, 64, 300 }) |k| for ([_]usize{ 1, 15, 16, 17, 64, 333, 1100 }) |n| {
+        tiedRow(&prng, row[0..n], levels);
+        for ([_]bool{ false, true }) |with_nan| {
+            if (with_nan and n > 40) row[n / 2] = 0x7fc0 + prng.random().uintLessThan(u16, 8);
+            var a_v: [300]f32 = undefined;
+            var a_c: [300]usize = undefined;
+            var b_v: [300]f32 = undefined;
+            var b_c: [300]usize = undefined;
+            const kk = @min(k, n);
+            @memset(a_v[0..kk], 0);
+            @memset(b_v[0..kk], 0);
+            scanTop(row[0..n], a_v[0..kk], a_c[0..kk]);
+            scanTopWide(row[0..n], b_v[0..kk], b_c[0..kk]);
+            const held = @min(kk, n);
+            try std.testing.expectEqualSlices(usize, a_c[0..held], b_c[0..held]);
+            for (a_v[0..held], b_v[0..held]) |x, y| try std.testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
+        }
+    };
 }
 
 test "a masked row draws only allowed tokens, greedy the best of them" {

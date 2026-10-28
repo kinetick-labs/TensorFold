@@ -11,6 +11,14 @@ const mtp = flash.mtp;
 const Rig = rig.Rig;
 
 fn tied(r: *Rig, row: []u16, levels: u8) void {
+    if (levels == 0) {
+        // a realistic row: scores around a few units wide, bf16 (the top of the row has few ties)
+        for (row) |*v| {
+            const g = r.rng.floatNorm(f32) * 3.0 - 1.0;
+            v.* = @truncate(@as(u32, @bitCast(g)) >> 16);
+        }
+        return;
+    }
     const specials = [_]u16{ 0x0000, 0x8000, 0x7f80, 0xff80, 0x3f80, 0xbf80 };
     for (row) |*v| {
         const x = r.rng.int(u16);
@@ -70,6 +78,43 @@ fn rows(r: *Rig, mod: cuda.Module, n: usize, count: usize, levels: u8, bad: usiz
     }
 }
 
+const Timespec = extern struct { sec: i64, nsec: i64 };
+extern "c" fn clock_gettime(clk: c_int, ts: *Timespec) c_int;
+
+fn nowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(1, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Microseconds a launch of fn_row_cand takes (back to back on one stream) for `rows_n` rows of `n` scores.
+fn bench(r: *Rig, mod: cuda.Module, n: usize, rows_n: usize, count: usize, levels: u8) !void {
+    const f = try mod.function("fn_row_cand");
+    const host = try r.a.alloc(u16, rows_n * n);
+    for (0..rows_n) |i| tied(r, host[i * n ..][0..n], levels);
+    const scores = try r.dev(std.mem.sliceAsBytes(host));
+    const vals = try r.out(rows_n * mtp.cand_max * 4);
+    const cols = try r.out(rows_n * mtp.cand_max * 4);
+    const flags = try r.out(rows_n * 4);
+    var a: cuda.Args = .{};
+    a.add(scores);
+    a.add(@as(c_int, @intCast(n)));
+    a.add(@as(c_longlong, @intCast(n)));
+    a.add(@as(c_int, @intCast(count)));
+    a.add(@as(c_int, @intCast(mtp.cand_max)));
+    a.add(vals);
+    a.add(cols);
+    a.add(flags);
+    const reps = 500;
+    for (0..20) |_| try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows_n) }, .block = .{ .x = 1024 } }, r.s, &a);
+    try r.s.synchronize();
+    const t0 = nowNs();
+    for (0..reps) |_| try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows_n) }, .block = .{ .x = 1024 } }, r.s, &a);
+    try r.s.synchronize();
+    const us = @as(f64, @floatFromInt(nowNs() - t0)) / 1000.0 / reps;
+    std.debug.print("PERF fn_row_cand n={d} rows={d} count={d} levels={d}: {d:.1} us a launch\n", .{ n, rows_n, count, levels, us });
+}
+
 pub fn run(gpu: check.Gpu) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
     defer arena.deinit();
@@ -79,9 +124,18 @@ pub fn run(gpu: check.Gpu) !void {
     var mod = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_mtp);
     defer mod.unload();
     // the draft head's width (79,591), the vocabulary's (248,320), and short rows; many ties through almost none
-    for ([_]usize{ 70, 1500, 79_591, 248_320 }) |n| for ([_]usize{ 1, 2, 20, 33, 64 }) |count| for ([_]u8{ 1, 3, 40, 200 }) |levels| try rows(&r, mod, n, count, levels, 99);
+    for ([_]usize{ 70, 1500, 79_591, 248_320 }) |n| for ([_]usize{ 1, 2, 20, 33, 64 }) |count| for ([_]u8{ 0, 1, 3, 40, 200 }) |levels| try rows(&r, mod, n, count, levels, 99);
     // a NaN row among clean ones: flagged, the others unaffected
+    try rows(&r, mod, 79_591, 20, 0, 2);
     try rows(&r, mod, 79_591, 20, 40, 2);
+    try rows(&r, mod, 248_320, 20, 0, 4);
     try rows(&r, mod, 248_320, 20, 40, 4);
+    for ([_]u8{ 0, 3 }) |levels| {
+        try bench(&r, mod, 248_320, 1, 20, levels);
+        try bench(&r, mod, 248_320, 5, 20, levels);
+        try bench(&r, mod, 248_320, 16, 20, levels);
+        try bench(&r, mod, 79_591, 1, 20, levels);
+        try bench(&r, mod, 79_591, 5, 20, levels);
+    }
     check.pass("flashnext-cand: fn_row_cand's candidates are topCandidates' set for rows of 70 to 248,320 scores, 1 to 64 candidates and ties from every score equal to almost none; a NaN row is flagged", .{});
 }

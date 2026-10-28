@@ -8,6 +8,7 @@ const prompt = @import("cuda_prompt.zig");
 const gdn = @import("cuda_gdn.zig");
 const mtp = @import("cuda_mtp.zig");
 const plan = @import("cuda_mtp_plan.zig");
+const hd = @import("cuda_host_draw.zig");
 
 /// One group of lanes in the batched head's pass: the lanes' drafts, their rows and whether the head scores.
 const Group = struct {
@@ -66,6 +67,12 @@ fn download(stream: cuda.Stream, dst: []u8, src: u64) !void {
     try d.check(d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
 }
 
+/// A copy to the host with no wait: the caller has synchronised the stream and queued nothing since.
+fn copyIdle(stream: cuda.Stream, dst: []u8, src: u64) !void {
+    const d = stream.d;
+    try d.check(d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
+}
+
 /// An owner can mirror main-model mutations to a peer without exposing device pointers on the control wire.
 pub const Main = struct {
     ptr: *anyopaque,
@@ -95,10 +102,10 @@ pub fn Ops(comptime Tri: type) type {
 
         /// Slots [0, n) of the head's candidate scratch (filled by Head.cand) on the host.
         fn candidates(o: Self, n: usize, c: *mtp.Cands) !void {
+            // scratch slots [0, n) are all that is read, but scratch and Cands are one layout: one wait, one copy
+            _ = n;
             const base = (o.h.cand_buf orelse return error.NoCandidates).ptr;
-            try download(o.stream(), std.mem.sliceAsBytes(c.vals[0 .. n * mtp.cand_max]), base);
-            try download(o.stream(), std.mem.sliceAsBytes(c.cols[0 .. n * mtp.cand_max]), base + mtp.cand_slots * mtp.cand_max * 4);
-            try download(o.stream(), std.mem.sliceAsBytes(c.flags[0..n]), base + 2 * mtp.cand_slots * mtp.cand_max * 4);
+            try download(o.stream(), std.mem.asBytes(c), base);
         }
 
         /// Prompt rows [at, stop): the pass with its streams kept, then the head over each row with a known next token.
@@ -225,6 +232,11 @@ pub fn Ops(comptime Tri: type) type {
                 if (c.flags[0] == 0) return mtp.drawPickCandidates(o.e.gpa, c.vals[0..count], c.cols[0..count], h.ids, lse, position, sm);
             };
             const row = d.host[0..n];
+            if (hd.threads() > 0) {
+                // the stream is idle after the best's download: the row follows it with no second wait
+                try copyIdle(o.stream(), std.mem.sliceAsBytes(row), d.dlogits.ptr);
+                return mtp.drawPickWith(o.e.gpa, row, h.ids, lse, position, sm, true);
+            }
             try download(o.stream(), std.mem.sliceAsBytes(row), d.dlogits.ptr);
             return mtp.drawPick(o.e.gpa, row, h.ids, lse, position, sm);
         }
@@ -402,6 +414,22 @@ pub fn Ops(comptime Tri: type) type {
                 };
                 try download(o.stream(), std.mem.sliceAsBytes(best_host[0 .. n_act * 4]), ds[0].best.ptr);
                 if (any_cand) try o.candidates(n_act, &cands);
+                // the sampled lanes' rows side by side (TF_FLASHNEXT_HOST_DRAW_THREADS): downloaded while the stream is idle, then
+                // drawn by drawPickWith on the host's threads, each lane's draw the one `pick` makes
+                var jobs: [max_lanes]hd.Job = undefined;
+                var job_of: [max_lanes]?usize = @splat(null);
+                var n_jobs: usize = 0;
+                if (hd.threads() > 0) {
+                    for (act[0..n_act], 0..) |i, r| {
+                        if (!mtp.isSampled(sms[i]) or (cand_k[r] > 0 and cands.flags[r] == 0) or !hd.fits(sms[i], h.ids.len)) continue;
+                        const row = ds[i].host[0..h.ids.len];
+                        try copyIdle(o.stream(), std.mem.sliceAsBytes(row), ds[i].dlogits.ptr);
+                        jobs[n_jobs] = .{ .row = row, .ids = h.ids, .lse = best_host[r * 4 + 1], .position = positions[i] + j, .sm = sms[i], .pick = true };
+                        job_of[r] = n_jobs;
+                        n_jobs += 1;
+                    }
+                    try hd.run(o.e.io, jobs[0..n_jobs]);
+                }
                 var next_act: usize = 0;
                 var n_step: usize = 0;
                 for (act[0..n_act], 0..) |i, r| {
@@ -409,7 +437,9 @@ pub fn Ops(comptime Tri: type) type {
                     const lse = best_host[r * 4 + 1];
                     const col: usize = @intCast(@as(i32, @bitCast(best_host[r * 4 + 2])));
                     var got: Pick = .{ .token = h.ids[col], .prob = @exp(@as(f64, top) - @as(f64, lse)) };
-                    if (mtp.isSampled(sms[i])) {
+                    if (job_of[r]) |jb| {
+                        got = .{ .token = jobs[jb].token, .prob = jobs[jb].prob };
+                    } else if (mtp.isSampled(sms[i])) {
                         if (cand_k[r] > 0 and cands.flags[r] == 0) {
                             const at = r * mtp.cand_max;
                             got = try mtp.drawPickCandidates(o.e.gpa, cands.vals[at..][0..cand_k[r]], cands.cols[at..][0..cand_k[r]], h.ids, lse, positions[i] + j, sms[i]);
@@ -530,6 +560,81 @@ pub fn Ops(comptime Tri: type) type {
                 const row = rows[r * vocab ..][0..vocab];
                 if (words > 0) maskRow(row, masks[r * words ..][0..words]);
                 t.* = try drawRow(o.e.gpa, row, null, d.fed0 + 1 + r, sm);
+            }
+        }
+
+        /// `draws` for several windows of one shared pass (`ds[i]` with `sms[i]`, `masks[i]`, results in `outs[i]`): all the device work
+        /// is queued first (the greedy windows' bests; with TF_FLASHNEXT_SAMPLE_CAND=1 each sampled window's rows' top_k candidates,
+        /// in their own scratch slots), then one wait and one copy a window; the whole rows of the others are drawn side by side on
+        /// the host's threads (TF_FLASHNEXT_HOST_DRAW_THREADS), each row by drawRowWith or drawCandidates from the scores `draws`
+        /// reads, so the tokens are `draws`'.
+        pub fn drawsMany(o: Self, ds: []const *Draft, sms: []const ?Sampling, masks: []const []const u32, outs: []const []u32) !void {
+            const st = o.stream();
+            const cand_on = mtp.candidatesOn();
+            if ((!cand_on and hd.threads() == 0) or ds.len > 32) {
+                for (ds, sms, masks, outs) |d, sm, mk, out| try o.draws(d, sm, mk, out);
+                return;
+            }
+            var slot_at: [32]usize = undefined;
+            var slot_k: [32]usize = @splat(0);
+            var slots: usize = 0;
+            for (ds, sms, masks, 0..) |d, sm, mk, i| {
+                if (!mtp.isSampled(sm) and mk.len == 0) {
+                    try o.h.best(st, d.logits.ptr, vocab, vocab, d.rows, d.best.ptr);
+                } else if (cand_on and mk.len == 0) if (mtp.candidateCount(sm, vocab)) |count| {
+                    if (slots + d.rows > mtp.cand_slots) continue;
+                    try o.h.cand(st, d.logits.ptr, vocab, vocab, d.rows, count, slots);
+                    slot_at[i] = slots;
+                    slot_k[i] = count;
+                    slots += d.rows;
+                };
+            }
+            try st.synchronize();
+            var cands: mtp.Cands = undefined;
+            if (slots > 0) try copyIdle(st, std.mem.asBytes(&cands), (o.h.cand_buf orelse return error.NoCandidates).ptr);
+            var jobs: [32 * max_rows]hd.Job = undefined;
+            var n_jobs: usize = 0;
+            var by_job: [32]bool = @splat(false);
+            for (ds, sms, masks, outs, 0..) |d, sm, mk, out, i| {
+                const n = d.rows;
+                if (!mtp.isSampled(sm) and mk.len == 0) {
+                    try copyIdle(st, std.mem.sliceAsBytes(d.best_host[0 .. 4 * n]), d.best.ptr);
+                    for (out[0..n], 0..) |*t, r| t.* = @intCast(@as(i32, @bitCast(d.best_host[4 * r + 2])));
+                    continue;
+                }
+                if (slot_k[i] > 0 and std.mem.allEqual(i32, cands.flags[slot_at[i]..][0..n], 0)) {
+                    const count = slot_k[i];
+                    for (out[0..n], 0..) |*t, r| {
+                        const at = (slot_at[i] + r) * mtp.cand_max;
+                        t.* = try mtp.drawCandidates(o.e.gpa, cands.vals[at..][0..count], cands.cols[at..][0..count], null, d.fed0 + 1 + r, sm);
+                    }
+                    continue;
+                }
+                const rows = d.host[0 .. n * vocab];
+                try copyIdle(st, std.mem.sliceAsBytes(rows), d.logits.ptr);
+                const words = mk.len / n;
+                by_job[i] = hd.threads() > 0 and hd.fits(sm, vocab);
+                for (0..n) |r| {
+                    const row = rows[r * vocab ..][0..vocab];
+                    const mask = if (words > 0) mk[r * words ..][0..words] else &[_]u32{};
+                    if (by_job[i]) {
+                        jobs[n_jobs] = .{ .row = row, .mask = mask, .position = d.fed0 + 1 + r, .sm = sm };
+                        n_jobs += 1;
+                    } else {
+                        if (words > 0) maskRow(row, mask);
+                        out[r] = try drawRow(o.e.gpa, row, null, d.fed0 + 1 + r, sm);
+                    }
+                }
+            }
+            try hd.run(o.e.io, jobs[0..n_jobs]);
+            // the tokens back in their windows, in the order the jobs were made
+            var at: usize = 0;
+            for (ds, outs, by_job[0..ds.len]) |d, out, jobbed| {
+                if (!jobbed) continue;
+                for (out[0..d.rows]) |*t| {
+                    t.* = jobs[at].token;
+                    at += 1;
+                }
             }
         }
 
