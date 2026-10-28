@@ -21,6 +21,31 @@ pub const log_row_k: usize = nk * dk * 4;
 pub const log_row_v: usize = value_dim * 4;
 pub const log_row_gb: usize = nv * 2 * 4;
 
+/// One lane of a shared round's DeltaNet layer for the lane-batched kernels (fn_gdn_front_lanes ...; flashnext_batch.cu's FnGdnLane).
+pub const Lane = extern struct {
+    proj: u64,
+    conv: u64,
+    proj_save: u64,
+    hist_save: u64,
+    qn: u64,
+    log_k: u64,
+    log_v: u64,
+    log_gb: u64,
+    state_in: u64,
+    state_out: u64,
+    ys: u64,
+    rows: c_int,
+    np: c_int,
+};
+
+/// The lanes of a shared round passed by value (FnGdnLanes).
+pub const lanes_max = 8;
+pub const Lanes = extern struct {
+    lane: [lanes_max]Lane,
+    count: c_int,
+    max_rows: c_int,
+};
+
 const symbol: [:0]const u8 = "flashnext_gdn_chain";
 
 fn toBf16(v: f32) u16 {

@@ -28,6 +28,11 @@ pub const Kernels = struct {
     chain_late: cuda.Function,
     /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
     conv_roll: cuda.Function,
+    /// The three launches a lane-batched shared round takes a DeltaNet layer (TF_FLASHNEXT_GDN_LANES): front with the projection
+    /// copy, the late chain, the history copy with the window shift, each for every lane.
+    front_lanes: cuda.Function,
+    chain_lanes: cuda.Function,
+    shift_lanes: cuda.Function,
     chain_tpr: cuda.Function,
     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
     gdn_fused: cuda.Function,
@@ -78,6 +83,9 @@ pub const Kernels = struct {
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
         k.chain_late = try k.batch.function("fn_gdn_rows_late");
         k.conv_roll = try k.batch.function("fn_conv_roll");
+        k.front_lanes = try k.batch.function("fn_gdn_front_lanes");
+        k.chain_lanes = try k.batch.function("fn_gdn_rows_late_lanes");
+        k.shift_lanes = try k.batch.function("fn_shift_window_lanes");
         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
         k.gdn_fused = try k.batch.function("fn_gdn_fused");

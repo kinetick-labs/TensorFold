@@ -275,6 +275,8 @@ pub const Scratch = struct {
     host: ?cuda.HostBuffer = null,
     /// The uploads from `host` and the event recorded after a pass's last one: the next pass waits before writing it.
     staging: ?Staging(Uploads) = null,
+    /// The shared expert's second stream and its fork and join events, made on first use (cuda_batch_side.zig).
+    side: ?@import("cuda_batch_side.zig").Side = null,
 
     fn add(s: *Scratch, gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !u64 {
         var b = try cuda.DeviceBuffer.alloc(d, @max(len, 256));
@@ -431,6 +433,8 @@ pub const Scratch = struct {
     }
 
     pub fn free(s: *Scratch, gpa: std.mem.Allocator) void {
+        // the stream drains first: its kernels read and write buffers freed below
+        if (s.side) |*sd| sd.deinit();
         if (s.staging) |*g| {
             // no queued upload may still read `host`; a wait that fails has lost the context, and its copies with it
             g.ready() catch {};
