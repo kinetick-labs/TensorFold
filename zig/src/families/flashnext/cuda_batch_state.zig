@@ -49,7 +49,7 @@ pub const pocket_stride: usize = 128;
 /// Prompt rows one fused attention launch takes (their selections staged att_rows at a time).
 pub const fused_rows: usize = 1024;
 /// Rows a pass holds at most unless asked for more.
-pub const default_chunk: usize = 1536;
+pub const default_chunk: usize = 3072;
 /// The most rows TF_FLASHNEXT_CHUNK may ask for (the largest measured pass; its scratch is about 13 GiB more).
 pub const max_chunk: usize = 16384;
 const ratio = wt.index_ratio;

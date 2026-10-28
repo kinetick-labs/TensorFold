@@ -115,6 +115,8 @@ pub const reduce_symbols = [2][:0]const u8{
     "_ZN7tf_qmmf13reduce_kernelILb1EEEvPKfPvxif",
 };
 const row_tiles = [_]u32{ 16, 32, 64 };
+/// The prompt tile's dynamic shared bytes: 3 stages of 128 rows (16 KiB), 128 weight columns (8 KiB) and their scales.
+const prompt_mx_shared: u32 = 3 * ((128 * 128 + 128 * group + 128 * 2 + 127) / 128 * 128);
 
 /// What a call writes: bf16 rows, or the fp32 sums unrounded (a tensor-parallel rank's partial rows).
 pub const Out = enum { bf16, f32 };
@@ -131,8 +133,12 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
     return set;
 }
 
+/// Narrowest MXFP8 projection (columns) the 128 x 128 prompt tile takes in a prompt pass, by width alone; 0: none.
+pub var prompt_mx_min_n: usize = 1024;
+
 pub const Lane = struct {
     mod: Module,
+    prompt_mx: [2]Function = undefined, // by Out: the relaxed MXFP8 prompt tile (a lane built by hand never launches it)
     fns: [modes.len][7]Function, // per mode: lane16, lane16c, lane32, lane32c, lane64, lane64c, fused
     f32_fns: [modes.len][7]Function,
     reduce: [2]Function, // by Out
@@ -152,6 +158,11 @@ pub const Lane = struct {
             .half = undefined,
             .clusters = capability_major >= 9,
         };
+        // the image carries both prompt tiles; a module without them fails here rather than at a launch
+        for (&l.prompt_mx, [_][:0]const u8{ "tf_qmmf_prompt_mx_bf16", "tf_qmmf_prompt_mx_f32" }) |*f, name| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(prompt_mx_shared);
+        }
         inline for (modes, 0..) |mode, mi| {
             l.fns[mi] = try loadTiles(mod, mode, false);
             l.f32_fns[mi] = try loadTiles(mod, mode, true);
@@ -184,6 +195,30 @@ pub const Lane = struct {
     /// Preserve FP32 outputs for a later residual or tensor-rank sum.
     pub fn matmulF32(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, part: u64) !void {
         return l.matmulOut(s, x, ldx, m, w, y, .f32, part);
+    }
+
+    /// matmulOut for a prompt pass's rows: an MXFP8 weight of prompt_mx_min_n columns or more takes the relaxed tile.
+    pub fn matmulPrompt(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+        if (prompt_mx_min_n == 0 or w.mode != .mxfp8 or w.n < prompt_mx_min_n) return l.matmulOut(s, x, ldx, m, w, y, out, part);
+        const rows_t = (m + 127) / 128;
+        const band = @max(1, @min(rows_t, (12 << 20) / (128 * @as(usize, w.k) * 2)));
+        var args: launch_.Args = .{};
+        args.add(x);
+        args.add(w.codes);
+        args.add(w.scales);
+        args.add(w.scale);
+        args.add(y);
+        args.add(@as(i32, @intCast(m)));
+        args.add(@as(i32, @intCast(w.n)));
+        args.add(@as(i32, @intCast(w.k)));
+        args.add(@as(i32, @intCast(w.npad)));
+        args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
+        args.add(@as(i32, @intCast(band)));
+        try launch_.launch(l.prompt_mx[@backingInt(out)], .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + 127) / 128)), .y = 1, .z = 1 },
+            .block = .{ .x = 256, .y = 1, .z = 1 },
+            .shared = prompt_mx_shared,
+        }, s, &args);
     }
 
     /// matmul() writing y as `out` says: bf16, or fp32.

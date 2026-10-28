@@ -9,6 +9,7 @@ const load = @import("cuda_prompt_load.zig");
 pub const batch = @import("cuda_batch.zig");
 const fb = @import("cuda_fn_back.zig");
 const pocket = @import("cuda_pocket.zig");
+const knobs = @import("cuda_knobs.zig");
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
 const attn_n = weights.attn_n;
@@ -153,6 +154,7 @@ pub const Engine = struct {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
         // refused before anything loads: a bad TF_FLASHNEXT_CHUNK leaves no module or buffer behind
+        cuda.qmmf.prompt_mx_min_n = knobs.mx128MinN();
         const chunk = try chunkRows();
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
@@ -398,6 +400,7 @@ pub const Engine = struct {
             .m = if (seq.untaught) e.shipped() else e.model(),
             .seq = seq.view(scores),
             .hooks = hooks,
+            .prompt = hooks.logits != .all and hooks.keep == null and hooks.moe_add == null,
         };
         var at: usize = 0;
         while (at < ids.len) {
@@ -409,7 +412,8 @@ pub const Engine = struct {
             try p.chunk(ids[at..][0..n], seq.fed + at, if (last and hooks.logits != .none) seq.logits else null);
             at += n;
         }
-        if (hooks.logits == .none) try e.complete();
+        // a drain a chunk starves the GPU while the host rebuilds the next one's launches (and its n-gram gather)
+        if (hooks.logits == .none and (e.collective != null or knobs.chunkSync())) try e.complete();
         seq.fed += ids.len;
     }
     /// A stream's window in a shared pass and the pass over several (cuda_prompt_windows.zig).
@@ -587,13 +591,7 @@ pub fn chunkRows() !usize {
     return parseChunk(if (std.c.getenv("TF_FLASHNEXT_CHUNK")) |v| std.mem.span(v) else null);
 }
 
-test "TF_FLASHNEXT_CHUNK takes 1 to the largest measured pass and refuses the rest" {
-    try std.testing.expectEqual(batch.default_chunk, try parseChunk(null));
-    try std.testing.expectEqual(@as(usize, 4096), try parseChunk("4096"));
-    try std.testing.expectEqual(batch.max_chunk, try parseChunk("16384"));
-    for ([_][]const u8{ "0", "16385", "-1", "4k", "" }) |bad| try std.testing.expectError(error.BadChunk, parseChunk(bad));
-}
-
 test {
     _ = @import("cuda_sequence_completion_test.zig");
+    _ = @import("cuda_chunk_test.zig");
 }

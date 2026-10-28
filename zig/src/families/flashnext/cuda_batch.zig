@@ -129,13 +129,15 @@ pub fn Pass(comptime Tri: type) type {
         pending_f32: bool = false,
         /// This layer's out projection leaves part's other slices alone; its writeback adds the zero slice once.
         zero_slices: bool = false,
+        /// Prompt rows (not a decode round, a window or a training pass): the projections may take the relaxed tiles.
+        prompt: bool = false,
 
         // ---- launches ----------------------------------------------------------------------------------------
 
         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
             if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk)) |one| return one;
-            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
+            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk, self.prompt);
         }
 
         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
@@ -736,8 +738,8 @@ pub fn Pass(comptime Tri: type) type {
     };
 }
 
-test "a pass's scratch at the dense cap stays near a gigabyte and a half" {
+test "a pass's scratch at the default chunk stays under five gigabytes" {
     _ = @import("cuda_paging_batch_test.zig");
-    try std.testing.expect(Scratch.bytes(default_chunk) < 2 << 30);
+    try std.testing.expect(Scratch.bytes(default_chunk) < 5 << 30);
     try std.testing.expect(Scratch.bytes(1) < Scratch.bytes(2));
 }

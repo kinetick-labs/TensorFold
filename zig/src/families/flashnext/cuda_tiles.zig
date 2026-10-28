@@ -32,17 +32,16 @@ fn sweepOf(m: usize, bm: usize, k: usize) usize {
 }
 
 /// x [m, k] times w: the native lane, the 16-row lane tile, or from 64 rows the prompt tile (folded with K slices).
-pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize) !usize {
+pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize, prompt: bool) !usize {
     if (w.native) |native| {
         if (sk == 1) {
-            try k.native_lane.matmul(stream, x, w.k, m, native, out, native_part);
+            if (prompt) try k.native_lane.matmulPrompt(stream, x, w.k, m, native, out, .bf16, native_part) else try k.native_lane.matmul(stream, x, w.k, m, native, out, native_part);
             return 1;
         }
         // Legacy callers consume SK slices; the native lane has already reduced its own shape-driven slices.
-        try k.native_lane.matmulF32(stream, x, w.k, m, native, part, native_part);
-        const bytes = m * w.n * 4;
-        if (sk > 1) try stream.d.check(stream.d.api.cuMemsetD8Async(part + bytes, 0, bytes * (sk - 1), stream.handle), "cuMemsetD8Async");
-        return sk;
+        if (prompt) try k.native_lane.matmulPrompt(stream, x, w.k, m, native, part, .f32, native_part) else try k.native_lane.matmulF32(stream, x, w.k, m, native, part, native_part);
+        // slice 0 holds the whole sum (the native lane reduces its own slices): callers sum one slice, no zero fill
+        return 1;
     }
     // from 64 rows the prompt tile (flashnext_fact.cu), bit for bit the 16-row lane tile
     const big = m >= 64;
