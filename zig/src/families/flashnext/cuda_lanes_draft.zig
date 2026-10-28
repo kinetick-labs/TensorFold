@@ -71,7 +71,7 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
         // one greedy stream: it drafts alone below (its rollback is idempotent)
         return;
     }
-    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidence, outs[0..n], positions[0..n], sms[0..n]);
+    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidenceNow(requests.len), outs[0..n], positions[0..n], sms[0..n]);
     for (which[0..n]) |ri| done[ri] = true;
 }
 

@@ -68,6 +68,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
         own.depth = @max(1, @min(mtp.max_chain, F.envUsize("TF_FLASHNEXT_DRAFTS", mtp.default_depth)));
         if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
+        own.product_streams = F.envUsize("TF_FLASHNEXT_PRODUCT_STREAMS", 2);
     }
     errdefer if (own.head) |h| h.deinit();
     const window = @min(o.context + mtp.max_rows, prompt.max_tokens);

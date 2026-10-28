@@ -144,6 +144,9 @@ pub fn Namespace(comptime Tri: type) type {
             head: ?*mtp.Head = null,
             depth: usize = mtp.default_depth,
             confidence: f64 = mtp.default_confidence,
+            /// With a running-product confidence (< 0): the streams drafting together up to which it applies, the per-draft
+            /// mtp.wide_confidence above (TF_FLASHNEXT_PRODUCT_STREAMS, default 2: the old recipe engine's served hybrid)
+            product_streams: usize = 2,
             /// A captured Triton set (TENSORFOLD_CUDA_KERNELS) for comparison, else null: our own glue.
             set: ?cuda.aot.Set = null,
             glue: Glue,
@@ -225,6 +228,11 @@ pub fn Namespace(comptime Tri: type) type {
                     // a shared round's greedy streams draft in one head pass a step (lanes_draft.batched)
                     .draft_streams = drafting and lanes_draft.batchHeads(),
                 };
+            }
+
+            /// The stop rule for a step drafting `drafting` streams together (mtp.confidenceFor).
+            pub fn confidenceNow(self: *const Cuda, drafting: usize) f64 {
+                return mtp.confidenceFor(self.confidence, drafting, self.product_streams);
             }
 
             fn take(self: *Cuda, token: u32) u64 {
@@ -508,10 +516,10 @@ pub fn Namespace(comptime Tri: type) type {
                 if (r.rows) |path| {
                     for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                     if (r.follow.len < path.len) return error.PositionMismatch;
-                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidenceNow(requests.len), &l.chain);
                 } else {
                     const first = self.value(r.first orelse return error.NoFirstToken);
-                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidenceNow(requests.len), &l.chain);
                 }
             }
         }
