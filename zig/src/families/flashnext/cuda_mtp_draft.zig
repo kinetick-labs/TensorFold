@@ -29,6 +29,20 @@ const max_rows = mtp.max_rows;
 const conv_bytes = mtp.conv_bytes;
 const proj_bytes = mtp.proj_bytes;
 
+/// TF_FLASHNEXT_KEEP_LATE=1: a window kept in part does not replay its kept rows on the DeltaNet states. The rows' k, v and
+/// gates (the front's, as the verify pass computed them) wait in the lane's log, and the next window's chain takes them first, in
+/// the same pass over the states (cuda_gdn's fn_gdn_rows_late); a window kept whole settles on its end states and empties the log.
+pub fn lateOn() bool {
+    if (Draft.late_force) |on| return on;
+    const v = std.c.getenv("TF_FLASHNEXT_KEEP_LATE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// Rows a lane's log holds (a window's rows go after the waiting ones) and the most that may wait after a rollback (a window's widest).
+pub const late_cap: usize = 2 * max_rows;
+pub const late_max_rows: usize = max_rows;
+const late_layer_bytes: usize = late_cap * (gdn.log_row_k + gdn.log_row_v + gdn.log_row_gb);
+
 /// One draft and its temperature-1 probability under the head.
 pub const Pick = struct { token: u32, prob: f64 };
 
@@ -77,6 +91,12 @@ pub const Draft = struct {
     /// A window ran with the states written to `spare` and is not yet kept or rolled back.
     open: bool = false,
     keep: batch.Keep = .{},
+    /// With TF_FLASHNEXT_KEEP_LATE: the DeltaNet layers' logs, and the rows waiting in them for the states (also in `keep.pend`).
+    log: ?cuda.DeviceBuffer = null,
+    pend: usize = 0,
+    /// The sequence's conv windows' addresses on the device (fn_conv_roll), and the first's they were made for.
+    conv_table: ?cuda.DeviceBuffer = null,
+    conv_first: u64 = 0,
     history: [2]i64 = .{ 0, 0 },
     unused_history: [2]i64 = .{ 0, 0 },
     fed0: usize = 0,
@@ -86,8 +106,11 @@ pub const Draft = struct {
     host: []u16,
     best_host: [max_rows * 4]f32 = undefined,
 
-    const hist_at: usize = 0;
-    const proj_at: usize = hist_at + linear_n * conv_bytes;
+    pub const late_max = late_max_rows;
+    /// A test's choice for the Drafts it makes next (null: the environment's).
+    pub var late_force: ?bool = null;
+    pub const hist_at: usize = 0;
+    pub const proj_at: usize = hist_at + linear_n * conv_bytes;
     pub const tail_at: usize = proj_at + linear_n * max_rows * proj_bytes;
     /// The window's n-gram rows (the pass's ple_nrow), saved for a rollback to shift the kept ones into the tail.
     pub const nrow_at: usize = tail_at + ple_tail_n * wide * 2;
@@ -95,7 +118,7 @@ pub const Draft = struct {
 
     /// Device bytes `init(cap, draft_n, rows)` allocates.
     pub fn bytes(cap: usize, draft_n: usize, rows: usize) usize {
-        return cap * (2 * prompt.kv_row_bytes + index_dim * 2) + prompt.pooledBytes(cap) + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + max_rows * 16 + saved_bytes + linear_n * state_n * 4;
+        return cap * (2 * prompt.kv_row_bytes + index_dim * 2) + prompt.pooledBytes(cap) + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + max_rows * 16 + saved_bytes + linear_n * state_n * 4 + (if (lateOn()) linear_n * late_layer_bytes else 0);
     }
 
     /// A head cache of `cap` entries; `rows` the widest prompt chunk whose streams it keeps.
@@ -124,6 +147,8 @@ pub const Draft = struct {
         var made: usize = 0;
         errdefer for (d.spare[0..made]) |*b| b.free();
         while (made < linear_n) : (made += 1) d.spare[made] = try cuda.DeviceBuffer.alloc(driver, state_n * 4);
+        if (lateOn()) d.log = try cuda.DeviceBuffer.alloc(driver, linear_n * late_layer_bytes);
+        errdefer if (d.log) |*b| b.free();
         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
         errdefer gpa.free(d.host);
         errdefer cuda.completion.drain(driver, stream, "Flash Next draft fills did not drain before rollback");
@@ -140,6 +165,11 @@ pub const Draft = struct {
             if (!wt.linearLayer(layer)) continue;
             lk.hist = d.saved.ptr + hist_at + li * conv_bytes;
             lk.proj = d.saved.ptr + proj_at + li * max_rows * proj_bytes;
+            if (d.log) |b| {
+                lk.log_k = b.ptr + li * late_layer_bytes;
+                lk.log_v = lk.log_k + late_cap * gdn.log_row_k;
+                lk.log_gb = lk.log_v + late_cap * gdn.log_row_v;
+            }
             li += 1;
         }
         d.aim();
@@ -195,12 +225,16 @@ pub const Draft = struct {
         for (seq.state, &d.spare) |*a, *b| std.mem.swap(cuda.DeviceBuffer, a, b);
         d.aim();
         d.open = false;
+        // the end states took the waiting rows in
+        d.pend = 0;
     }
 
     pub fn deinit(d: *Draft) void {
         if (d.stream) |stream| cuda.completion.drain(stream.d, stream, "Flash Next draft work did not drain before release");
         d.gpa.free(d.host);
         for (&d.spare) |*b| b.free();
+        if (d.log) |*b| b.free();
+        if (d.conv_table) |*b| b.free();
         d.saved.free();
         d.best.free();
         d.dlogits.free();

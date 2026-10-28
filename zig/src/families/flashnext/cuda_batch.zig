@@ -261,8 +261,13 @@ pub fn Pass(comptime Tri: type) type {
                 try self.copy(keep.hist, self.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
             }
             // every row's conv, norms and gates, the recurrence, then the gated norm: the one-block chain's bits
-            const fused = self.lanes.len == 0 and n >= 64 and gdn_fused.on();
-            if (fused) {
+            const fused = self.lanes.len == 0 and n >= 64 and gdn_fused.on() and keep.log_k == 0;
+            if (keep.log_k != 0 and self.lanes.len == 0) {
+                // the window's rows go after the rows its log holds, which the chain takes first (TF_FLASHNEXT_KEEP_LATE)
+                const np: usize = if (self.hooks.keep) |kp| kp.pend else 0;
+                try self.gdnFrontLogged(lw, keep, np, s.proj, self.seq.conv[li].ptr, n, s.gq);
+                try self.gdnChainLate(s.gq, keep, np, self.seq.state[li].ptr, keep.state_out, n, s.ys);
+            } else if (fused) {
                 // the three in one kernel a value head: the same per-row op sequences, no fp32 rows through memory
                 const st = self.seq.state[li].ptr;
                 const in: gdn_fused.In = .{ .proj = s.proj, .conv = self.seq.conv[li].ptr, .cw = lw.cw.ptr, .a_log = lw.a_log.ptr, .dt = lw.dt.ptr, .state = st, .state_out = if (keep.state_out != 0) keep.state_out else st, .norm = lw.norm.ptr };
@@ -281,8 +286,14 @@ pub fn Pass(comptime Tri: type) type {
                     const gb = row0 * gdn.nv * 2 * 4;
                     try self.copy(lk.proj, proj, l.rows * gdn.proj_width * 2);
                     try self.copy(lk.hist, l.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
-                    try self.gdnFront(lw, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
-                    try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
+                    if (lk.log_k != 0) {
+                        const np: usize = if (l.keep) |kp| kp.pend else 0;
+                        try self.gdnFrontLogged(lw, lk, np, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk);
+                        try self.gdnChainLate(s.gq + qk, lk, np, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
+                    } else {
+                        try self.gdnFront(lw, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
+                        try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
+                    }
                     // the lane's conv window moves on now: the gated norm below reads none of it
                     try self.shiftWindow(l.seq.conv[li].ptr, proj, gdn.proj_width, l.rows, gdn.taps - 1, gdn.conv_dim);
                     row0 += l.rows;
@@ -306,6 +317,26 @@ pub fn Pass(comptime Tri: type) type {
             f.add(gv);
             f.add(ggb);
             try cuda.launch.launch(self.k.front, .{ .grid = .{ .x = @intCast(rows), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, self.stream, &f);
+        }
+
+        /// fn_gdn_front over `rows` rows whose k, v and gates go to the layer's log after its first `np` rows, q to `qn`.
+        fn gdnFrontLogged(self: *Self, lw: *const Layer, lk: LayerKeep, np: usize, proj: u64, conv: u64, rows: usize, qn: u64) !void {
+            try self.gdnFront(lw, proj, conv, rows, qn, lk.log_k + np * gdn.log_row_k, lk.log_v + np * gdn.log_row_v, lk.log_gb + np * gdn.log_row_gb);
+        }
+
+        /// fn_gdn_rows_late over `rows` rows (q from `qn`) after the log's first `np`, from `state` to `state_out` (0: in place).
+        fn gdnChainLate(self: *Self, qn: u64, lk: LayerKeep, np: usize, state: u64, state_out: u64, rows: usize, ys: u64) !void {
+            var a: cuda.Args = .{};
+            a.add(qn);
+            a.add(lk.log_k);
+            a.add(lk.log_v);
+            a.add(lk.log_gb);
+            a.add(state);
+            a.add(if (state_out != 0) state_out else state);
+            a.add(cint(rows));
+            a.add(ys);
+            a.add(cint(np));
+            try cuda.launch.launch(self.k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
         }
 
         /// fn_gdn_rows over `rows` rows from `state`, in place or (state_out) to fn_gdn_rows_to's; readouts into ys.

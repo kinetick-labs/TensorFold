@@ -98,6 +98,7 @@ pub fn Ops(comptime Tri: type) type {
             if (stop > d.cap or stop <= at or stop - at > d.rows_cap) return error.PromptTooLong;
             if (seq.fed != at or d.len != at or d.drafted != 0) return error.PositionMismatch;
             d.media = if (seq.media) |*m| m.view() else null;
+            try o.flushLate(seq, d);
             const last = stop == ids.len;
             try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr });
             const head_to = @min(stop, ids.len - 1);
@@ -426,6 +427,9 @@ pub fn Ops(comptime Tri: type) type {
             d.history = seq.history;
             @memcpy(d.ids[0..n], ids);
             const keeps = n > 1;
+            // a window nobody rolls back chains in place: the rows still waiting for the states are taken first
+            if (!keeps) try o.flushLate(seq, d);
+            d.keep.pend = @intCast(d.pend);
             if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
             try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr });
             if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);
@@ -451,6 +455,8 @@ pub fn Ops(comptime Tri: type) type {
                 d.history = seq.history;
                 @memcpy(d.ids[0..n], ids);
                 const keeps = n > 1;
+                if (!keeps) try o.flushLate(seq, d);
+                d.keep.pend = @intCast(d.pend);
                 if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
                 w.* = .{ .seq = seq, .ids = ids, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .logits = d.logits.ptr };
             }
@@ -501,9 +507,13 @@ pub fn Ops(comptime Tri: type) type {
             seq.history = hist;
             try copyAsync(st, seq.tail.ptr, d.saved.ptr + Draft.tail_at, ple_tail_n * wide * 2);
             try shift(k, st, seq.tail.ptr, d.saved.ptr + Draft.nrow_at, wide, keep, ple_tail_n, wide);
+            // TF_FLASHNEXT_KEEP_LATE: the conv windows move on, the states do not: the kept rows are already in the log, after the
+            // rows waiting there, and the next window's chain takes them (or flushLate, when too many would wait)
+            const late = d.log != null;
+            if (late) try o.convRoll(seq, d, keep);
             var li: usize = 0;
             for (e.layers[0..e.n_layers], 0..) |*lw, layer| {
-                if (!lw.linear) continue;
+                if (!lw.linear or late) continue;
                 defer li += 1;
                 // the sequence's state is still the window's start (the pass wrote its end state to the spare)
                 const lk = d.keep.layers[layer];
@@ -532,6 +542,58 @@ pub fn Ops(comptime Tri: type) type {
             }
             d.rows = keep;
             d.open = false;
+            if (late) {
+                d.pend += keep;
+                d.keep.pend = @intCast(d.pend);
+                if (d.pend > Draft.late_max) try o.flushLate(seq, d);
+            }
+        }
+
+        /// Every DeltaNet layer's conv window moved to the history before the window and on past its first `keep` rows, in one launch
+        /// (a copy of the saved history and fn_shift_window over the saved projection rows, layer by layer, in the replaying rollback).
+        fn convRoll(o: Self, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
+            const e = o.e;
+            const first = seq.conv[0].ptr;
+            if (d.conv_table == null or d.conv_first != first) {
+                var ptrs: [linear_n]u64 = undefined;
+                for (&ptrs, seq.conv[0..linear_n]) |*p, b| p.* = b.ptr;
+                if (d.conv_table) |*t| t.free();
+                d.conv_table = try cuda.DeviceBuffer.fromHost(e.driver, std.mem.sliceAsBytes(&ptrs));
+                d.conv_first = first;
+            }
+            var a: cuda.Args = .{};
+            a.add(d.conv_table.?.ptr);
+            a.add(d.saved.ptr + Draft.hist_at);
+            a.add(@as(c_longlong, @intCast(conv_bytes / 2)));
+            a.add(d.saved.ptr + Draft.proj_at);
+            a.add(@as(c_longlong, @intCast(max_rows * gdn.proj_width)));
+            a.add(@as(c_longlong, @intCast(gdn.proj_width)));
+            a.add(cint(keep));
+            a.add(cint(gdn.taps - 1));
+            a.add(cint(gdn.conv_dim));
+            try cuda.launch.launch(e.batch_k.conv_roll, .{ .grid = .{ .x = @intCast((gdn.conv_dim + 255) / 256), .y = linear_n }, .block = .{ .x = 256 } }, o.stream(), &a);
+        }
+
+        /// The rows waiting in the draft's log taken by the sequence's DeltaNet states, in place (fn_gdn_rows_late with no rows).
+        pub fn flushLate(o: Self, seq: *prompt.Seq, d: *Draft) !void {
+            if (d.pend == 0) return;
+            if (d.log == null or o.main != null or d.open) return error.CannotRewind;
+            const e = o.e;
+            const st = o.stream();
+            var li: usize = 0;
+            for (e.layers[0..e.n_layers], 0..) |*lw, layer| {
+                if (!lw.linear) continue;
+                defer li += 1;
+                const lk = d.keep.layers[layer];
+                var a: cuda.Args = .{};
+                for ([_]u64{ 0, lk.log_k, lk.log_v, lk.log_gb, seq.state[li].ptr, seq.state[li].ptr }) |p| a.add(p);
+                a.add(cint(0));
+                a.add(@as(u64, 0));
+                a.add(cint(d.pend));
+                try cuda.launch.launch(e.batch_k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, st, &a);
+            }
+            d.pend = 0;
+            d.keep.pend = 0;
         }
 
         fn shift(k: *const batch.Kernels, st: cuda.Stream, win: u64, rows_ptr: u64, stride: usize, n: usize, taps: usize, c: usize) !void {

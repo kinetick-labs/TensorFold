@@ -24,6 +24,10 @@ pub const Kernels = struct {
     front: cuda.Function,
     chain: cuda.Function,
     chain_to: cuda.Function,
+    /// fn_gdn_rows_to after the rows a log holds (TF_FLASHNEXT_KEEP_LATE).
+    chain_late: cuda.Function,
+    /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
+    conv_roll: cuda.Function,
     chain_tpr: cuda.Function,
     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
     gdn_fused: cuda.Function,
@@ -72,6 +76,8 @@ pub const Kernels = struct {
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
+        k.chain_late = try k.batch.function("fn_gdn_rows_late");
+        k.conv_roll = try k.batch.function("fn_conv_roll");
         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
         k.gdn_fused = try k.batch.function("fn_gdn_fused");

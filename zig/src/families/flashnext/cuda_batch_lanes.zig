@@ -27,6 +27,9 @@ pub fn rollbackOnly(k: *const Keep) bool {
         rest.proj = 0;
         rest.hist = 0;
         rest.state_out = 0;
+        rest.log_k = 0;
+        rest.log_v = 0;
+        rest.log_gb = 0;
         if (!std.meta.eql(rest, LayerKeep{})) return false;
     }
     return true;
