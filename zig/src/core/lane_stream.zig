@@ -74,6 +74,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .images = r.images,
         .media = r.media, // our mia engine's --vision-helper rows (Stream.media, 224a74c0)
         .key = r.cache_key,
+        .hold_eos = r.hold_eos and r.structure == null and r.logprobs == null, // forced rows would leave the grammar
     }) catch {
         freeProposer(h, job);
         recalls.release(job);

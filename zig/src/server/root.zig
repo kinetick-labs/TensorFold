@@ -259,6 +259,9 @@ test {
     _ = @import("cortheon/research.zig");
     _ = @import("cortheon/program.zig");
     _ = @import("recall_routes.zig");
+    _ = @import("compute_turns.zig");
+    _ = @import("compute_segments.zig");
+    _ = @import("compute_lane_http_test.zig");
     // the benchmark command's serve child runs under POSIX signals and waits; Windows refuses the command
     if (comptime @import("builtin").os.tag != .windows) {
         _ = @import("benchmark_suite.zig");

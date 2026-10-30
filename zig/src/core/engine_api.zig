@@ -16,7 +16,7 @@ pub const EmbeddingBatch = lanes.embedding.Batch;
 pub const embedding_vector = @import("embedding_vector.zig");
 pub const load_ledger = @import("load_ledger.zig");
 pub const kv_ledger = @import("kv_ledger.zig");
-
+pub const hold = @import("engine_hold.zig");
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
 
@@ -95,6 +95,7 @@ pub const Request = struct {
     images: []const Image = &.{},
     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
     cache_key: []const u32 = &.{},
+    hold_eos: bool = false, // at an EOS the stream holds for hold.resumeHeld (a built-in tool's result), not finishing
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -245,6 +246,7 @@ pub const Info = struct {
     ledger: ?Ledger = null,
     /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
     media: bool = false,
+    compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
 
     pub const Capability = @import("engine_capabilities.zig").Capability;
 
@@ -455,6 +457,7 @@ pub const Engine = struct {
         refusal: ?*const fn (ctx: *anyopaque, request: *const Request, out: []u8) ?[]const u8 = null,
         /// A reference WAV file's codec rows in `gpa`, on the speech engine's own thread; null: it encodes no voices.
         encode_voice: ?*const fn (ctx: *anyopaque, gpa: Allocator, wav: []const u8) EncodeVoiceError![][10]i32 = null,
+        resume_held: ?*const fn (ctx: *anyopaque, id: Id, r: hold.Resume) void = null, // engine_hold.zig
     };
 
     pub fn info(e: Engine) Info {
@@ -541,30 +544,9 @@ pub const Engine = struct {
     }
 };
 
-/// A backend's own driver for a lone greedy stream (the GPU round), which LaneHost runs while the stream is alone.
-pub const Lone = struct {
-    ctx: *anyopaque,
-    sampled: bool = false, // it drives sampled streams too
-    plain: bool = false, // it drives streams with drafts off too
-    logprobs: bool = false, // it gives each token its logprob row too
-    structures: bool = false, // it masks each window's rows by the stream's grammar too
-    images: bool = true, // it takes image requests too (false: they stay in the lane core)
-    // thinking budgets above this and loop guards: it hands the stream over before a forced close (0: never)
-    min_budget: u32 = 0,
-    resumes: bool = false, // it takes the lane core's stream back between rounds (LoneHooks.resumed); else only opens
-    /// Prefills (or resumes) `s` and decodes it until it finishes (false) or `hooks.yield` hands it to the lane core.
-    run: *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: LoneHooks) anyerror!bool,
-};
-
-/// What a lone driver tells the host between rounds: tokens landed; and asks: hand the stream over now?
-pub const LoneHooks = struct {
-    ctx: *anyopaque,
-    committed: *const fn (ctx: *anyopaque) void,
-    yield: *const fn (ctx: *anyopaque) bool,
-    resumed: bool = false, // the stream comes from the lane core between rounds: no prompt pass, its drafts the core's
-    // After a completed nonfinal prompt call, true transfers the unfinished pass to the shared fill queue.
-    prefill_yield: ?*const fn (ctx: *anyopaque) bool = null,
-};
+/// A backend's own driver for a lone greedy stream and its hooks between rounds (engine_lone.zig).
+pub const Lone = @import("engine_lone.zig").Lone;
+pub const LoneHooks = @import("engine_lone.zig").LoneHooks;
 
 /// The lane core served to the HTTP threads (lane_host.zig).
 pub const LaneHost = @import("lane_host.zig").LaneHost;
