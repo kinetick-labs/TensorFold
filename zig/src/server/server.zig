@@ -175,6 +175,8 @@ pub const Server = struct {
     keepalive: ?*api.keepalive.Keepalive = null,
     /// The idle-unload manager (--idle-unload); null when off. Its thread parks the engine; a wake reloads it.
     idle_manager: ?*idle_unload.Manager = null,
+    /// The compute lane's sandboxes when the engine serves it (Info.compute); null: code_interpreter is refused.
+    compute: ?api.hold.compute_lane.Pool = null,
     preparing: std.atomic.Value(i64) = .init(0),
     speech_inflight: std.atomic.Value(u32) = .init(0),
     arena: std.heap.ArenaAllocator,
@@ -222,6 +224,7 @@ pub const Server = struct {
             if (config.cortheon) return error.CortheonRequiresTextGeneration;
             return srv;
         }
+        if (srv.info.compute) |c| srv.compute = try @import("compute_turns.zig").open(srv, c);
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {

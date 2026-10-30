@@ -10,6 +10,7 @@ const fill = @import("lane_host_fill.zig");
 const admit = @import("lane_host_admit.zig");
 const recalls = @import("lane_host_recall.zig");
 const ends = @import("lane_host_end.zig");
+const holds = @import("lane_host_hold.zig");
 const rows_host = @import("lane_host_rows.zig");
 const pressure = @import("lane_host_pressure.zig");
 const load = @import("lane_host_load.zig");
@@ -46,6 +47,7 @@ pub const LaneHost = struct {
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
     cancels: std.ArrayList(Id) = .empty,
+    resumes: std.ArrayList(holds.Pending) = .empty, // results for held replies (lane_host_hold.zig)
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
@@ -144,6 +146,7 @@ pub const LaneHost = struct {
         h.admitted.deinit(h.gpa);
         h.filling.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
+        holds.close(h);
         h.decoded.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
         h.pieces.deinit(h.gpa);
@@ -170,6 +173,7 @@ pub const LaneHost = struct {
         .info = infoFn,
         .submit = submitFn,
         .cancel = cancelFn,
+        .resume_held = holds.resumeFn,
         .status = status.read,
         .memory = memoryFn,
         .keepalive = keepaliveFn,
@@ -522,6 +526,7 @@ pub const LaneHost = struct {
             var activity = @import("lane_activity.zig").Activity.enter(h.activity);
             defer activity.end();
             ends.takeCancels(h);
+            holds.take(h);
             pressure.step(h);
             rows_host.answer(h);
             scoring.answer(h);
@@ -546,7 +551,7 @@ pub const LaneHost = struct {
                 ends.closeAll(h);
                 continue;
             }
-            if (h.core.activeCount() == 0) {
+            if (lanes.hold.runnableCount(h.core.live.items) == 0) {
                 if (h.filling.items.len > 0) {
                     h.unlock();
                     continue;
