@@ -3,7 +3,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
-const sandbox = @import("compute_sandbox.zig");
+pub const sandbox = @import("compute_sandbox.zig");
+pub const runner = @import("compute_runner.zig");
 const log = std.log.scoped(.compute_lane);
 
 pub const Config = struct {

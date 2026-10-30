@@ -424,7 +424,7 @@ pub const Engine = struct {
         }
         const landed = try s.commit(e.gpa, committed.items, committed_rows);
         const got = committed.items[0..landed];
-        if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
+        if ((s.finished or s.held) and got.len < path.len) path = path[0 .. got.len + @intFromBool(s.finished)]; // held: EOS row reruns
         const keep = path.len;
         s.cache_len += keep;
         s.pending = committed.items[keep - 1];

@@ -67,6 +67,9 @@ pub const Generation = struct {
     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
+    hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
+    held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
+    skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -98,6 +101,7 @@ pub const Generation = struct {
             landed += 1;
             if (g.eos(t)) {
                 g.reason = "stop";
+                g.held = g.hold;
             } else if (try g.stopHit()) {
                 g.reason = "stop";
                 g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
@@ -183,7 +187,7 @@ pub const Generation = struct {
     }
 
     /// Waits for the engine's own end, so the request it holds may be freed.
-    fn drain(g: *Generation) void {
+    pub fn drain(g: *Generation) void {
         const m = g.box;
         m.mutex.lockUncancelable(m.io);
         defer m.mutex.unlock(m.io);
@@ -248,15 +252,55 @@ pub const Generation = struct {
                     return error.Cancelled;
                 }) g.wrote_ns = now;
             }
-            const tokens = chunk orelse continue;
+            const tokens = try g.skipInserted(chunk orelse continue);
             if (g.reason == null) try g.commit(tokens);
+            if (g.held) return;
         }
+    }
+
+    /// Drops the inserted result that opens a resumed segment; a different token there fails the reply.
+    fn skipInserted(g: *Generation, tokens: []u32) Failure![]u32 {
+        const n = @min(tokens.len, g.skip.len);
+        if (!std.mem.eql(u32, tokens[0..n], g.skip[0..n])) {
+            log.line("error: {s}: the engine's tokens after a tool result are not the result it was given", .{g.reply_id});
+            g.cancel();
+            return error.Failed;
+        }
+        g.skip = g.skip[n..];
+        return tokens[n..];
+    }
+
+    /// A reply's text as `finish` reads it: stops, MiniMax calls as DSML, a call closed at its EOS, the think split.
+    pub const Read = struct { text: []const u8, close: []const u8, content: []const u8, reasoning: ?[]const u8 };
+
+    /// `raw`, the decoded `content_tokens`, as the client reads it: every format but Kimi's native reader.
+    pub fn readText(g: *const Generation, raw: []const u8, content_tokens: []const u32) Failure!Read {
+        const a = g.a;
+        const raw_visible = g.stops.visible(raw, false);
+        const visible = try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools); // MiniMax-M3's calls as DSML
+        // closed before the think split, so a call ending an unclosed think block is the answer
+        const close = try g.closeCall(visible);
+        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
+        var r: Read = .{ .text = text, .close = close, .content = text, .reasoning = null };
+        if (g.thinking) {
+            const original_close = try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id);
+            const close_at = try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, original_close);
+            const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
+            r.reasoning = nonEmpty(reply_text.pyStrip(split.reasoning));
+            r.content = split.answer;
+        } else if (g.srv.info.capability(.reasoning)) {
+            const h = reply_text.parseHarmony(text);
+            r.content = h.content;
+            r.reasoning = h.reasoning;
+        }
+        r.content = try tool_lfm2.dsml(a, r.content, g.tools, true);
+        return r;
     }
 
     pub fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, reasons: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
         const a = g.a;
         const m = g.box;
-        if (!g.engine_done) g.drain();
+        if (!g.engine_done and !g.held) g.drain();
         const natural: []const u8 = g.reason orelse switch (m.reason) {
             .stop => "stop",
             .length => "length",
@@ -272,29 +316,8 @@ pub const Generation = struct {
         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
         const raw = try g.srv.text.decode(a, content_tokens);
         const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
-        const raw_visible = g.stops.visible(raw, false);
-        const visible = if (native) |n| n.content else try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools);
-        // closed before the think split, so a call ending an unclosed think block is the answer
-        const close = if (native != null) "" else try g.closeCall(visible);
-        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
-        var content: []const u8 = text;
-        var reasoning: ?[]const u8 = null;
-        if (native) |n| {
-            const r = reply_text.pyStrip(n.reasoning);
-            reasoning = if (r.len > 0) r else null;
-        } else if (g.thinking) {
-            const original_close = try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id);
-            const close_at = try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, original_close);
-            const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
-            const r = reply_text.pyStrip(split.reasoning);
-            reasoning = if (r.len > 0) r else null;
-            content = split.answer;
-        } else if (g.srv.info.capability(.reasoning)) {
-            const h = reply_text.parseHarmony(text);
-            content = h.content;
-            reasoning = h.reasoning;
-        }
-        if (native == null) content = try tool_lfm2.dsml(a, content, g.tools, true);
+        const read: Read = if (native) |n| .{ .text = n.content, .close = "", .content = n.content, .reasoning = nonEmpty(reply_text.pyStrip(n.reasoning)) } else try g.readText(raw, content_tokens);
+        const text, const close, const content, const reasoning = .{ read.text, read.close, read.content, read.reasoning };
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
@@ -396,3 +419,7 @@ pub const Generation = struct {
         return reply;
     }
 };
+
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len > 0) s else null;
+}

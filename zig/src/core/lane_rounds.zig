@@ -160,7 +160,7 @@ fn round(h: *LaneHost, rd: Rounds) bool {
         did = true;
         runFinals(h);
     }
-    if (h.core.activeCount() > 0) {
+    if (lanes.hold.runnableCount(h.core.live.items) > 0) {
         did = true;
         const lt = @import("lane_trace.zig");
         var traced = if (h.trace) |t| lt.Event.round(t, h.core.live.items.len) else undefined;
@@ -275,6 +275,7 @@ pub fn run(h: *LaneHost, rd: Rounds) void {
         var activity = @import("lane_activity.zig").Activity.enter(h.activity);
         defer activity.end();
         ends.takeCancels(h);
+        @import("lane_host_hold.zig").take(h);
         pressure.step(h);
         rows_host.answer(h);
         @import("lane_host_score.zig").answer(h);

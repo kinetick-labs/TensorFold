@@ -36,6 +36,7 @@ pub const shared_drafts = @import("shared_drafts.zig");
 pub const row_cost = @import("row_cost.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
+pub const hold = @import("hold.zig");
 pub const fake = @import("fake.zig");
 pub const shared_head_cost_check = @import("shared_head_cost_check.zig");
 pub const shared_draft_check = @import("shared_draft_check.zig");
@@ -69,6 +70,7 @@ test {
     _ = @import("long_loop_test.zig");
     _ = @import("loop_stop_test.zig");
     _ = @import("handover_test.zig");
+    _ = @import("hold_test.zig");
     _ = @import("open_first_test.zig");
     _ = @import("open_trace_test.zig");
     _ = @import("recorder_test.zig");

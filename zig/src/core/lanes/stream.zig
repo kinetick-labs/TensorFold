@@ -11,6 +11,7 @@ const Penalties = @import("sampling.zig").Penalties;
 const State = @import("depth.zig").State;
 const Row = @import("logprob.zig").Row;
 const long_loop = @import("long_loop.zig");
+const short_loop = @import("short_loop.zig");
 
 pub const Reason = enum {
     none,
@@ -26,31 +27,10 @@ pub const Reason = enum {
 
 pub const Mode = enum { pipe, drain, verify, exit };
 
-pub const loop_max_period: usize = 8;
-pub const loop_min_run: usize = 256;
-pub const loop_warm_in: usize = 64;
-
-/// Return the shortest exact cycle at the end of a combined token prefix.
-fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
-    if (n < loop_min_run + 1) return null;
-    for (1..loop_max_period + 1) |period| {
-        if (n < loop_min_run + period) break;
-        if (n - loop_min_run - period < loop_warm_in) break;
-        var matches = true;
-        for (1..loop_min_run + 1) |k| {
-            const right = n - k;
-            const left = right - period;
-            const right_token = if (right < head.len) head[right] else tail[right - head.len];
-            const left_token = if (left < head.len) head[left] else tail[left - head.len];
-            if (right_token != left_token) {
-                matches = false;
-                break;
-            }
-        }
-        if (matches) return @intCast(period);
-    }
-    return null;
-}
+pub const loop_max_period = short_loop.loop_max_period;
+pub const loop_min_run = short_loop.loop_min_run;
+pub const loop_warm_in = short_loop.loop_warm_in;
+pub const detectLoop = short_loop.detectLoop;
 
 /// Return the first token index in a candidate batch that would fire the guard.
 pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
@@ -58,14 +38,9 @@ pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
     for (tokens, 0..) |token, i| {
         if (@as(i64, token) == s.think_end) return null;
         const n = s.emitted().len + i + 1;
-        if (cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
+        if (short_loop.cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
     }
     return null;
-}
-
-/// Return the detected period at the end of committed tokens, or null.
-pub fn detectLoop(emitted: []const u32) ?u32 {
-    return cycleAt(emitted, &.{}, emitted.len);
 }
 
 /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
@@ -148,6 +123,7 @@ pub const Spec = struct {
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     media: ?*const Media = null, // helper/tower rows for a media engine; such a prompt is neither kept nor resumed
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
+    hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
 };
 
 /// Images and video frames for a prompt: replaced rows, [n, 3] rotary positions, decode delta, bf16 features.
@@ -272,6 +248,8 @@ pub const Stream = struct {
     grammar_round: @import("grammar_time.zig").Round = .{},
     gpu_seconds: ?f64 = null, // a timed backend's passes this stream ran in (TF_Q27_PROFILE); null: untimed
     paused: bool = false,
+    hold_eos: bool = false,
+    held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
@@ -321,6 +299,7 @@ pub const Stream = struct {
             .images = spec.images,
             .media = spec.media,
             .key = spec.key,
+            .hold_eos = spec.hold_eos,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
@@ -528,7 +507,11 @@ pub const Stream = struct {
             }
             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
-            if (s.isEos(t) or s.stopped()) {
+            if (s.isEos(t) and s.hold_eos) {
+                s.held = true;
+                s.paused = true;
+                break;
+            } else if (s.isEos(t) or s.stopped()) {
                 s.finished = true;
                 s.reason = .stop;
             } else if (fire) |period| {

@@ -58,6 +58,8 @@ pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(a);
     if (comptime @import("builtin").os.tag != .windows) if (argv.len == 2 and std.mem.eql(u8, argv[1], pdf_worker.arg)) pdf_worker.serve();
+    // the compute lane's sandbox: this binary re-run to confine itself, then exec the interpreter (never returns)
+    if (@import("builtin").os.tag == .linux and argv.len >= 2 and std.mem.eql(u8, argv[1], "__compute_sandbox")) api.hold.compute_lane.sandbox.main(argv[2..]);
     // These commands must work without a model, driver, GPU or checkout.
     if (argv.len == 2 and std.mem.eql(u8, argv[1], "--version")) {
         try std.Io.File.stdout().writeStreamingAll(io, "tensorfold-native " ++ @import("build_options").version ++ "\n");
