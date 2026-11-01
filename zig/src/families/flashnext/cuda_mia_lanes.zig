@@ -310,7 +310,18 @@ pub fn Lanes(comptime E: type) type {
             try self.agree(null); // the ranks only meet before the slices' collectives
             const l = self.lanes.get(s) orelse return error.UnknownStream;
             const f = &(l.fill orelse return error.NotFilling);
-            const done = self.e.fillStep(f.fl, self.sliceLayers(s)) catch |err| return self.lost("a prompt's fill", err);
+            const layers = self.sliceLayers(s);
+            const done = self.e.fillStep(f.fl, layers) catch |err| switch (err) {
+                // another prompt's chunk holds the buffers: run its layers in this turn, this prompt waits
+                error.PromptBuffersBusy => {
+                    if (comptime @hasDecl(E, "fillLend")) {
+                        self.e.fillLend(layers) catch |e2| return self.lost("a lent prompt slice", e2);
+                        return false;
+                    }
+                    return self.lost("a prompt's fill", err);
+                },
+                else => return self.lost("a prompt's fill", err),
+            };
             if (!done) return false;
             if (!f.final) {
                 const m: u32 = @intCast(f.fl.prompt.len);
