@@ -644,6 +644,8 @@ test "a granted hold stays only while its stream's expected drafts pay for the v
     out = .{ 4, 4, 2, 3 };
     try rule.payHolds(&whos, false, &out);
     try std.testing.expectEqualSlices(i64, &.{ 0, 0, 2, 0 }, &out); // a probe after a grant of none keeps its hold
+}
+
 var seen_why: []const u8 = "";
 var seen_asked: i64 = 0;
 var seen_cost: ?f64 = null;
