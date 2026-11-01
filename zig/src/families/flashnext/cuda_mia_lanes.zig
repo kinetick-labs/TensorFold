@@ -214,6 +214,7 @@ pub fn Lanes(comptime E: type) type {
                 .keep = keepFn,
                 .draft = draftFn,
                 .tree = heldFn,
+                .held = heldTokensFn,
                 .release = releaseFn,
             };
         }
@@ -783,6 +784,15 @@ pub fn Lanes(comptime E: type) type {
             };
             if (self.next == 0) return error.NoFirstToken;
             return self.next - 1;
+        }
+
+        /// Structured output: the stream's held drafts as host tokens in window order (the grammar walks them),
+        /// past the head's chain repeating its last draft as prepareVerify fills those rows.
+        fn heldTokensFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+            const self = of(ptr);
+            const l = self.lanes.get(s) orelse return error.UnknownStream;
+            const pending = s.pending orelse return error.NoPendingToken;
+            for (out, 0..) |*d, j| d.* = if (j < l.held_n) l.held[j] else if (l.held_n > 0) l.held[l.held_n - 1] else pending;
         }
 
         /// Structured output: a grammar stream's last prompt row on the host (a failure leaves none: the first
