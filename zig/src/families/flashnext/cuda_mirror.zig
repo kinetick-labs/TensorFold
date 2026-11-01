@@ -995,7 +995,7 @@ pub const Leader = struct {
 
     /// One slice of a stream's prompt (the inner backend's `prefill_step`): rank 1 hears the stream's spec on its
     /// first slice (the pass's admission and agreements), then only the key, and runs its own slice.
-    fn prefillStepFn(p: *anyopaque, s: *Stream) anyerror!bool {
+    fn prefillStepFn(p: *anyopaque, s: *Stream, max_rows: u32) anyerror!bool {
         const self = of(p);
         const key = keyOf(s);
         if (!self.open.contains(key)) {
@@ -1006,7 +1006,7 @@ pub const Leader = struct {
         }
         self.arm(0);
         defer self.disarm();
-        return self.inner.vtable.prefill_step.?(self.inner.ptr, s);
+        return self.inner.vtable.prefill_step.?(self.inner.ptr, s, max_rows);
     }
 
     fn prefillFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -1235,11 +1235,11 @@ pub const Follower = struct {
             .prefill => |p| try b.prefill(try self.mirror(p)),
             .prefill_begin => |p| {
                 const f = b.vtable.prefill_step orelse return error.NoFills;
-                _ = try f(b.ptr, try self.mirror(p));
+                _ = try f(b.ptr, try self.mirror(p), 0); // our engine slices by layers; rows uncapped
             },
             .prefill_step => |key| {
                 const f = b.vtable.prefill_step orelse return error.NoFills;
-                _ = try f(b.ptr, try self.stream(key));
+                _ = try f(b.ptr, try self.stream(key), 0);
             },
             .first => |f| _ = try b.first(try self.stream(f.key), f.position),
             .queue => |q| _ = try b.queue(try self.stream(q.key), q.feed, q.position),
