@@ -113,6 +113,8 @@ pub fn Lanes(comptime E: type) type {
             fill: ?Filling = null,
             /// the first token's handle of a burst's prompt (firstFn gives it once; else the last one taken)
             first: ?u64 = null,
+            /// structured output: the prompt's last row (bf16 logits), kept for the first masked draw
+            first_row: ?[]u16 = null,
         };
 
         /// A prompt filling in slices: the engine's fill of the segment in progress (up to the next mark, or to
@@ -205,6 +207,7 @@ pub fn Lanes(comptime E: type) type {
                 .prefill = prefillFn,
                 .prefill_step = if (stepped) prefillStepFn else null,
                 .first = firstFn,
+                .first_masked = if (@hasDecl(E, "readLastRow")) firstMaskedFn else null,
                 .queue = queueFn,
                 .read = readFn,
                 .verify = verifyFn,
@@ -325,6 +328,7 @@ pub fn Lanes(comptime E: type) type {
                 self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
                 return false;
             }
+            self.keepFirstRow(s, l);
             _ = self.take(f.fl.first);
             self.e.fillFree(f.fl);
             if (f.owned) self.e.freeSnapshot(f.cur.?);
@@ -452,6 +456,7 @@ pub fn Lanes(comptime E: type) type {
                 if (err == error.MediaRefused) return err;
                 return self.lost("a prompt's prefill", err);
             };
+            self.keepFirstRow(s, l);
             _ = self.take(first);
         }
 
@@ -753,6 +758,8 @@ pub fn Lanes(comptime E: type) type {
                 k.broken = true;
             };
             _ = self.lanes.remove(s);
+            if (l.first_row) |r| self.gpa.free(r);
+            l.first_row = null;
             self.stopFill(l);
             self.reserved -= l.reserved;
             self.forget(l);
@@ -776,6 +783,38 @@ pub fn Lanes(comptime E: type) type {
             };
             if (self.next == 0) return error.NoFirstToken;
             return self.next - 1;
+        }
+
+        /// Structured output: a grammar stream's last prompt row on the host (a failure leaves none: the first
+        /// masked draw then refuses rather than draw outside the grammar).
+        fn keepFirstRow(self: *Self, s: *lanes.Stream, l: *Lane) void {
+            if (comptime !@hasDecl(E, "readLastRow")) return;
+            if (s.grammar == null) return;
+            if (l.first_row) |r| self.gpa.free(r);
+            l.first_row = null;
+            const row = self.gpa.alloc(u16, self.e.g.head_n) catch return;
+            self.e.readLastRow(row) catch {
+                self.gpa.free(row);
+                return;
+            };
+            l.first_row = row;
+        }
+
+        /// The first token drawn among `mask`'s allowed tokens from the prompt's last row (keepFirstRow's copy).
+        fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+            const self = of(ptr);
+            if (position != s.prompt_len) return error.PositionMismatch;
+            const l = self.lanes.get(s) orelse return error.UnknownStream;
+            const row = l.first_row orelse return error.FirstRowNotKept;
+            defer {
+                self.gpa.free(row);
+                l.first_row = null;
+            }
+            l.first = null;
+            const hd = @import("cuda_mia_mask.zig");
+            hd.maskRow(row, mask);
+            const smp: ?lanes.Sampling = if (s.sampling) |x| (if (x.temperature > 0) x else null) else null;
+            return self.take(try hd.drawRow(self.gpa, row, null, position, smp));
         }
 
         fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -819,7 +858,10 @@ pub fn Lanes(comptime E: type) type {
             self.round += 1;
             for (windows, out, ls[0..n], 0..) |w, o, l, i| {
                 const rows = w.rows();
-                e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows]) catch |err| return self.lost("a window's draws", err);
+                if (w.masks.len > 0) {
+                    if (comptime !@hasDecl(E, "sampleWindowMasked")) return error.StructuresUnsupported;
+                    e.sampleWindowMasked(i, w.stream.sampling, w.masks, o.sampled[0..rows]) catch |err| return self.lost("a window's masked draws", err);
+                } else e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows]) catch |err| return self.lost("a window's draws", err);
                 @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
                 if (watch) {
                     const spec = rows - 1;
