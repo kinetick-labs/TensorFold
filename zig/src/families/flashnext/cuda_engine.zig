@@ -1777,6 +1777,44 @@ pub const Engine = struct {
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
     }
 
+    /// Structured output: the last prompt row's logits (bf16, head_n wide) on the host, before the next prompt
+    /// or round overwrites them (the lanes keep it for the first masked draw).
+    pub fn readLastRow(e: *Engine, out: []u16) !void {
+        if (e.world > 1) return error.StructuresOneRank;
+        if (out.len != e.g.head_n) return error.BadRowWidth;
+        try e.read(e.last_logits, std.mem.sliceAsBytes(out));
+    }
+
+    /// Structured output: window i's rows drawn on the host among each row's allowed tokens (`masks`: rows x
+    /// words of bits, lanes/grammar.zig), with the stream's keyed draw. A screened round's head is redone in
+    /// full first: a masked argmax can land anywhere in the vocabulary.
+    pub fn sampleWindowMasked(e: *Engine, i: usize, s: ?lanes.Sampling, masks: []const u32, out: []u32) !void {
+        if (i >= e.round_n) return error.NoSuchWindow;
+        if (e.world > 1) return error.StructuresOneRank;
+        const sg = e.round_segs[i];
+        const rows = sg.a1 - sg.a0;
+        if (rows == 0 or masks.len % rows != 0 or out.len < rows) return error.BadMaskRows;
+        const smp: ?lanes.Sampling = if (s) |x| (if (x.temperature > 0) x else null) else null;
+        const total = e.round_segs[e.round_n - 1].a1;
+        sg.seq.greedy = smp == null;
+        if (e.round_screened) {
+            try e.f.headMm(e.buf.b.mixed, e.g.hidden, e.buf.b.logits, total);
+            e.round_screened = false;
+            e.full_redone += 1;
+        }
+        const V = e.g.head_n;
+        const host = try e.gpa.alloc(u16, rows * V);
+        defer e.gpa.free(host);
+        try e.read(e.buf.b.logits + sg.a0 * V * 2, std.mem.sliceAsBytes(host));
+        const words = masks.len / rows;
+        const hd = @import("cuda_mia_mask.zig");
+        for (0..rows) |r| {
+            const row = host[r * V ..][0..V];
+            hd.maskRow(row, masks[r * words ..][0..words]);
+            out[r] = try hd.drawRow(e.gpa, row, null, sg.seq.st.pos + 1 + r, smp);
+        }
+    }
+
     /// TF_FLASHNEXT_SPEC_SAMPLE: window `sg`'s rows (tokens `toks`) drawn by speculative sampling: row r's draw is
     /// the draft toks[r + 1] when kept (its head distribution held at seq.spec_q[r]), the residual's draw at the
     /// first refusal, the plain keyed draw on a row without a head draft. Every emitted token follows the target's
