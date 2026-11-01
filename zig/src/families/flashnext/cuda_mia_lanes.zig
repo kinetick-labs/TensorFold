@@ -308,7 +308,15 @@ pub fn Lanes(comptime E: type) type {
             // the first slice: no lane yet (or one whose fill has not begun), so prefillBeginFn's admission makes
             // it and starts the first segment; a later slice finds the lane with its fill in progress
             const begun = self.lanes.get(s);
-            if (begun == null or begun.?.fill == null) try prefillBeginFn(ptr, s);
+            if (begun == null or begun.?.fill == null) {
+                // another prompt holds the prompt buffers mid-chunk: step it first; this prompt begins only once
+                // they are free, so its admission and fillBegin never run inside another prompt's chunk
+                if (self.e.pfill != null) {
+                    if (try self.stepHolder(self.sliceLayers(s))) |_| {}
+                    return false;
+                }
+                try prefillBeginFn(ptr, s);
+            }
             try self.agree(null); // the ranks only meet before the slices' collectives
             const l = self.lanes.get(s) orelse return error.UnknownStream;
             if (l.lent_done) {
@@ -321,19 +329,26 @@ pub fn Lanes(comptime E: type) type {
                 // another prompt's chunk holds the buffers: step that prompt in this turn (its own next slice
                 // reports a completion), this prompt waits; same calls in the same order for the holder
                 error.PromptBuffersBusy => {
-                    var it = self.lanes.iterator();
-                    while (it.next()) |kv| {
-                        const hl = kv.value_ptr.*;
-                        const hf = &(hl.fill orelse continue);
-                        if (@intFromPtr(hf.fl) != @intFromPtr(self.e.pfill)) continue;
-                        const hs: *lanes.Stream = @constCast(kv.key_ptr.*);
-                        if (try self.stepFill(hs, hl, hf, layers, true)) hl.lent_done = true;
-                        return false;
-                    }
-                    return self.lost("a prompt's fill", err);
+                    if (try self.stepHolder(layers) == null) return self.lost("a prompt's fill", err);
+                    return false;
                 },
                 else => return err,
             };
+        }
+
+        /// A slice of the prompt whose chunk holds the prompt buffers, in another stream's turn (its own next
+        /// slice reports a completion); null when no lane's fill holds them.
+        fn stepHolder(self: *Self, layers: usize) anyerror!?void {
+            var it = self.lanes.iterator();
+            while (it.next()) |kv| {
+                const hl = kv.value_ptr.*;
+                const hf = &(hl.fill orelse continue);
+                if (@intFromPtr(hf.fl) != @intFromPtr(self.e.pfill)) continue;
+                const hs: *lanes.Stream = @constCast(kv.key_ptr.*);
+                if (try self.stepFill(hs, hl, hf, layers, true)) hl.lent_done = true;
+                return {};
+            }
+            return null;
         }
 
         /// One slice of `s`'s fill; `lent`: run in another stream's turn, so a completion keeps its first token
