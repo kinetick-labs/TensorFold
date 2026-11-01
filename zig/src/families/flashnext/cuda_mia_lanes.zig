@@ -163,6 +163,9 @@ pub fn Lanes(comptime E: type) type {
         /// prompts fill in slices between rounds (prefill_begin / prefill_step), `fill_layers` layers a step
         sliced: bool = false,
         fill_layers: usize = 8,
+        /// TF_FLASHNEXT_FILL_PERIOD_MS: busy slices' layers, adapted so a decode round comes about every period
+        busy_now: usize = 0,
+        busy_last_ns: i96 = 0,
         lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
         /// the last verify's lanes whose windows wait for their commits: committed before the next forward
         opened: std.ArrayList(*Lane) = .empty,
@@ -390,6 +393,26 @@ pub fn Lanes(comptime E: type) type {
         /// (TF_FLASHNEXT_FILL_LAYERS_BUSY, default 1) while another stream is decoding, so a long prompt hands the
         /// GPU back to the decode rounds every layer (~40 ms at 4,096 rows) instead of every 8 (~300 ms).
         /// Same calls in the same order, so the same bits; only where the rounds fall between them changes.
+        /// Busy slices' layers: `busy` fixed, or with TF_FLASHNEXT_FILL_PERIOD_MS one more layer while the time
+        /// between two busy slices (a slice and the decode round after it) stays under the period, one less over it,
+        /// in [busy, alone]. Only where rounds fall between the layers changes, not the calls, so not the bits.
+        fn busyLayers(self: *Self, busy: usize, alone: usize) usize {
+            if (comptime !@hasField(E, "io")) return busy;
+            const v = std.c.getenv("TF_FLASHNEXT_FILL_PERIOD_MS") orelse return busy;
+            const period_ms = std.fmt.parseInt(i64, std.mem.span(v), 10) catch return busy;
+            if (period_ms <= 0) return busy;
+            const now: i96 = std.Io.Clock.awake.now(self.e.io).toNanoseconds();
+            defer self.busy_last_ns = now;
+            if (self.busy_now < busy) self.busy_now = busy;
+            const dt = now - self.busy_last_ns;
+            const target: i96 = @as(i96, period_ms) * std.time.ns_per_ms;
+            if (self.busy_last_ns != 0 and dt < 4 * target) {
+                if (dt * 10 < target * 9 and self.busy_now < @max(alone, busy)) self.busy_now += 1;
+                if (dt * 10 > target * 11 and self.busy_now > busy) self.busy_now -= 1;
+            }
+            return self.busy_now;
+        }
+
         fn sliceLayers(self: *Self, s: *const lanes.Stream) usize {
             const Env = struct {
                 fn num(name: [:0]const u8, d: usize) usize {
@@ -400,7 +423,8 @@ pub fn Lanes(comptime E: type) type {
             const alone = Env.num("TF_FLASHNEXT_FILL_LAYERS", self.fill_layers);
             const busy = Env.num("TF_FLASHNEXT_FILL_LAYERS_BUSY", 1);
             var it = self.lanes.iterator();
-            while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.*.fill == null) return @max(busy, 1);
+            while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.*.fill == null) return self.busyLayers(@max(busy, 1), @max(alone, 1));
+            self.busy_last_ns = 0;
             return @max(alone, 1);
         }
 
