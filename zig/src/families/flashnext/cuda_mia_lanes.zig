@@ -295,7 +295,8 @@ pub fn Lanes(comptime E: type) type {
         /// One slice of a stream's prompt (the lanes core's `prefill_step`): the pass's admission and agreements on
         /// its first slice (`fillBegin`), then `fill_layers` more layers each call. True once the prompt is in and
         /// its first token drawn; a segment that ends keeps its mark's state and starts the next.
-        fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, row_cap: u32) anyerror!bool {
+            _ = row_cap; // this engine slices by layers (fill_layers), not by rows: each call is one bounded slice
             const self = of(ptr);
             self.fillLate();
             // the first slice: no lane yet (or one whose fill has not begun), so prefillBeginFn's admission makes
