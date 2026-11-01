@@ -310,7 +310,7 @@ pub fn Lanes(comptime E: type) type {
             try self.agree(null); // the ranks only meet before the slices' collectives
             const l = self.lanes.get(s) orelse return error.UnknownStream;
             const f = &(l.fill orelse return error.NotFilling);
-            const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
+            const done = self.e.fillStep(f.fl, self.sliceLayers(s)) catch |err| return self.lost("a prompt's fill", err);
             if (!done) return false;
             if (!f.final) {
                 const m: u32 = @intCast(f.fl.prompt.len);
@@ -336,6 +336,24 @@ pub fn Lanes(comptime E: type) type {
             l.fill = null;
             self.endPass();
             return true;
+        }
+
+        /// Layers this prompt slice runs: `fill_layers` (TF_FLASHNEXT_FILL_LAYERS) alone, `busy_layers`
+        /// (TF_FLASHNEXT_FILL_LAYERS_BUSY, default 1) while another stream is decoding, so a long prompt hands the
+        /// GPU back to the decode rounds every layer (~40 ms at 4,096 rows) instead of every 8 (~300 ms).
+        /// Same calls in the same order, so the same bits; only where the rounds fall between them changes.
+        fn sliceLayers(self: *Self, s: *const lanes.Stream) usize {
+            const Env = struct {
+                fn num(name: [:0]const u8, d: usize) usize {
+                    const v = std.c.getenv(name) orelse return d;
+                    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch d;
+                }
+            };
+            const alone = Env.num("TF_FLASHNEXT_FILL_LAYERS", self.fill_layers);
+            const busy = Env.num("TF_FLASHNEXT_FILL_LAYERS_BUSY", 1);
+            var it = self.lanes.iterator();
+            while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.*.fill == null) return @max(busy, 1);
+            return @max(alone, 1);
         }
 
         fn stopFill(self: *Self, l: *Lane) void {
