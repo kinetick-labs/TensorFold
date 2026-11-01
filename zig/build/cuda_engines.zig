@@ -32,6 +32,15 @@ pub fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
     return m;
 }
 
+/// Our Flash Next CUDA engine (EXL3, FP4-Local), served when TENSORFOLD_FLASHNEXT_ENGINE=mia (native/cuda_mia.zig).
+pub fn flashnextMiaModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addImport("core", core);
+    m.addImport("lanes", lanes);
+    return m;
+}
+
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = qwen35.import_table.get("engine_api").?; // family()'s, so the server and qwen3_5 share one
@@ -49,6 +58,8 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
             .{ .name = "core", .module = core },
             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api) },
+            .{ .name = "flashnext_mia", .module = flashnextMiaModule(b, target, optimize, cuda, core, lanes) },
+            .{ .name = "qwen_vision", .module = qwen_vision }, // our engine's --vision (native/cuda_mia_vision.zig)
             .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat, api) },
             .{ .name = "minimax_m3_cuda", .module = @import("minimax_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
             .{ .name = "qwen35", .module = qwen35 },
