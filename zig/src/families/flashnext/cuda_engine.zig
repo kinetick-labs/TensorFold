@@ -1488,6 +1488,22 @@ pub const Engine = struct {
     /// Up to `layers` more layer passes of the filling prompt (a chunk's embedding and finish ride with its first
     /// and last layer); true once the prompt is committed and `first` holds its draw. The same calls in the same
     /// order as prefillWith, so the same bits, with decode rounds of other sequences run between the slices.
+    /// Up to `layers` layer passes of the fill that holds the prompt buffers, short of its chunk's finish (that
+    /// stays with its own stream's call, which commits and reports it): a second prompt's slice lends its turn
+    /// to the holder instead of failing with PromptBuffersBusy. Same calls in the same order for the holder.
+    pub fn fillLend(e: *Engine, layers: usize) !void {
+        const fl: *Fill = @constCast(e.pfill orelse return); // the heap Fill its own stream steps too
+        if (!fl.open) return;
+        const n_layers = e.w.layers.len;
+        const R = fl.end - fl.start;
+        const segs = [1]fwd.Seg{.{ .seq = fl.seq, .a0 = 0, .a1 = R }};
+        var budget = @max(layers, 1);
+        while (budget > 0 and fl.layer < n_layers) : (budget -= 1) {
+            fl.pending = try e.f.layerForward(&e.w.layers[fl.layer], &segs, &e.pbuf, R, fl.pending, false);
+            fl.layer += 1;
+        }
+    }
+
     pub fn fillStep(e: *Engine, fl: *Fill, layers: usize) !bool {
         if (fl.done) return true;
         const pb = &e.pbuf;
