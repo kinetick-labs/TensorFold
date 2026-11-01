@@ -8,7 +8,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#include "qmm_frag.cuh"
+#include "common/qmm_frag.cuh"
 
 namespace tf_fn_qmmf_ld {
 
