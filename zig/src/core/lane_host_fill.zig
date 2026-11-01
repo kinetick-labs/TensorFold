@@ -65,7 +65,7 @@ pub const Share = struct {
     call_rows: u32 = 0, // the row hint policyRun set for the call in flight (capRows); 0 outside its calls
 
     pub const short_rows = 512;
-    pub const Policy = enum { stock, fcfs };
+    pub const Policy = enum { stock, fcfs, srf };
     pub const default_tokens: u32 = 2048; // fcfs at 2048 stalls decoders ~1.7 s a chunk (8192: ~5.9 s) for ~+13% last TTFT at N=8 x 14336
     pub const min_tokens: u32 = 64;
     pub const max_tokens: u32 = 16384; // 2 x flashnext Metal's prompt step (PMAX 8192), the most one staggered call takes (a solo 14336-row prompt is one 2 x 7168 call)
@@ -96,6 +96,7 @@ pub const Share = struct {
     pub fn policyOf(text: []const u8) Policy {
         const t = std.mem.trim(u8, text, " \t");
         if (std.mem.eql(u8, t, "fcfs")) return .fcfs;
+        if (std.mem.eql(u8, t, "srf")) return .srf;
         return .stock;
     }
 
@@ -180,11 +181,23 @@ fn policyRun(h: *LaneHost) void {
         between(h);
     }
     if (!due(h)) return; // TENSORFOLD_PREFILL_SHARE's debt, per visit
-    const at = oldestLong(h) orelse return;
+    const at = (if (h.share.policy == .srf) stickyLong(h) else oldestLong(h)) orelse return;
     // `tokens` rows while a stream decodes; alone, the engine's own cut, as without the policy
     h.share.call_rows = if (runnable(h) > 0) h.share.tokens else 0;
     defer h.share.call_rows = 0;
     _ = longStep(h, at);
+}
+
+/// TENSORFOLD_PREFILL_POLICY=srf: one long prompt at a time, the begun one until it is in, else the one with
+/// the fewest rows left, so prompts finish one after another instead of all near the end of their total.
+fn stickyLong(h: *const LaneHost) ?usize {
+    var best: ?usize = null;
+    for (h.filling.items, 0..) |j, i| {
+        if (short(j)) continue;
+        if (j.fill_began) return i;
+        if (best == null or remaining(h, j) < remaining(h, h.filling.items[best.?])) best = i;
+    }
+    return best;
 }
 
 /// The first long prompt in `filling`, which is in admission order: admitOne appends, removal keeps the order.
