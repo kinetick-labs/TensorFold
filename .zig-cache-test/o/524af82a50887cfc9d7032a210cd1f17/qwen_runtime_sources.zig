@@ -1,0 +1,13 @@
+pub const xsum = @embedFile("xsum.metal");
+pub const norm_xs = @embedFile("norm_xs.metal");
+pub const norm_input = @embedFile("norm_input.metal");
+pub const mlp_xs = @embedFile("mlp_xs.metal");
+pub const mlp_ane = @embedFile("mlp_ane.metal");
+pub const glue = @embedFile("glue.metal");
+pub const copy = @embedFile("copy.metal");
+pub const attention_mpp = @embedFile("attention_mpp.metal");
+pub const attention_io = @embedFile("attention_io.metal");
+pub const attention_prompt = @embedFile("attention_prompt.metal");
+pub const attention_prompt_sg = @embedFile("attention_prompt_sg.metal");
+pub const prompt_glue = @embedFile("prompt_glue.metal");
+pub const prompt_state = @embedFile("prompt_state.metal");

@@ -13,6 +13,7 @@ fn job(h: *Host, request: *const api.Request, cached: u32, progress: u32, began:
     result.stream.prompt_len = request.prompt.len;
     result.stream.cached = cached;
     result.stream.fill_at = .init(progress);
+    result.stream.reuse = .{}; // no cache match: short() and remaining() read reuse.at
     return result;
 }
 test "prefill remaining: progress reports cached floors and stale cursors preserve stable priority" {

@@ -539,3 +539,32 @@ test "prefill service: fcfs alone with nothing decoding takes the engine's own c
         }
     }.body, false, &.{ 2048, 2048 }, .{ .policy = .fcfs, .tokens = 1024 });
 }
+
+test "prefill service: a resumed prompt not begun yet is short from its cache match" {
+    try policyHost(struct {
+        fn body(host: *LaneHost, calls: *PolicyCalls) !void {
+            _ = calls;
+            const j = host.filling.items[0];
+            try std.testing.expect(!short(j));
+            j.stream.reuse.at = 2048 - 300; // a resumed turn: ~300 new rows past the match
+            try std.testing.expect(!j.fill_began);
+            try std.testing.expect(short(j));
+            try std.testing.expectEqual(@as(u64, 300), remaining(host, j));
+        }
+    }.body, true, &.{ 2048, 2048 }, .{ .policy = .fcfs, .tokens = 1024 });
+}
+
+test "prefill service: srf takes the fewest rows left, then keeps the begun prompt" {
+    try policyHost(struct {
+        fn body(host: *LaneHost, calls: *PolicyCalls) !void {
+            const big = &host.filling.items[0].stream;
+            const small = &host.filling.items[2].stream;
+            run(host);
+            try std.testing.expectEqual(small, calls.streams[0]);
+            try std.testing.expectEqual(@as(u64, 0), big.fill_at.load(.monotonic));
+            run(host); // begun: kept to its end
+            try std.testing.expectEqual(small, calls.streams[1]);
+            try std.testing.expectEqual(@as(usize, 2), host.filling.items.len);
+        }
+    }.body, true, &.{ 4096, 3072, 2048 }, .{ .policy = .srf, .tokens = 1024 });
+}
