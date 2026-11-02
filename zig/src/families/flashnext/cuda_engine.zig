@@ -357,6 +357,8 @@ pub const Engine = struct {
     vm: ?vmm.Vmm = null,
     /// the fill whose chunk holds the prompt buffers between slices (one at a time; prefill waits for it)
     pfill: ?*const Fill = null,
+    /// a sliced fill's chunk rows cap for the chunk it opens next (0: prefill_rows); the lanes set it per slice
+    fill_cap: usize = 0,
     graphs: std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = .empty,
     captures: usize = 0,
     /// a failed capture, instantiate or upload is not fatal: that round runs eagerly (the same bits) and captures
@@ -1500,6 +1502,7 @@ pub const Engine = struct {
                 if (e.pfill != null and e.pfill.? != fl) return error.PromptBuffersBusy;
                 e.pfill = fl;
                 var end = e.chunkEnd(fl.start, fl.prompt.len);
+                if (e.fill_cap > 0 and end - fl.start > e.fill_cap) end = fl.start + e.fill_cap;
                 if (fl.keep_at) |k| if (fl.start < k and k < end) {
                     end = k;
                 };

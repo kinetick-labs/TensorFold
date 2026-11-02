@@ -359,6 +359,12 @@ pub fn Lanes(comptime E: type) type {
         /// One slice of `s`'s fill; `lent`: run in another stream's turn, so a completion keeps its first token
         /// on the lane (firstFn) instead of the ring's last. PromptBuffersBusy is returned, other errors lost.
         fn stepFill(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling, layers: usize, lent: bool) anyerror!bool {
+            // TF_FLASHNEXT_FILL_ROWS_BUSY: a chunk opened while another stream decodes takes at most these rows, so a
+            // resumed turn waits for a shorter open chunk; alone, the full prefill_rows chunk
+            self.e.fill_cap = if (self.decodingBeside(s)) blk: {
+                const v = std.c.getenv("TF_FLASHNEXT_FILL_ROWS_BUSY") orelse break :blk 0;
+                break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+            } else 0;
             const done = self.e.fillStep(f.fl, layers) catch |err| switch (err) {
                 error.PromptBuffersBusy => return err,
                 else => return self.lost("a prompt's fill", err),
@@ -428,6 +434,13 @@ pub fn Lanes(comptime E: type) type {
             const n = self.sliceLayersOf(s);
             self.tl("layers", n, 0);
             return n;
+        }
+
+        /// Another lane is decoding (no fill of its own).
+        fn decodingBeside(self: *Self, s: *const lanes.Stream) bool {
+            var it = self.lanes.iterator();
+            while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.*.fill == null) return true;
+            return false;
         }
 
         fn sliceLayersOf(self: *Self, s: *const lanes.Stream) usize {
