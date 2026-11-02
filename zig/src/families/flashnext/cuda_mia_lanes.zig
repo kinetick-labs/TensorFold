@@ -166,6 +166,8 @@ pub fn Lanes(comptime E: type) type {
         /// TF_FLASHNEXT_FILL_PERIOD_MS: busy slices' layers, adapted so a decode round comes about every period
         busy_now: usize = 0,
         busy_last_ns: i96 = 0,
+        /// the last decode round's start: a chunk opened soon after one is capped too (TF_FLASHNEXT_FILL_ROWS_HOLD_MS)
+        last_round_ns: i96 = 0,
         lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
         /// the last verify's lanes whose windows wait for their commits: committed before the next forward
         opened: std.ArrayList(*Lane) = .empty,
@@ -361,7 +363,7 @@ pub fn Lanes(comptime E: type) type {
         fn stepFill(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling, layers: usize, lent: bool) anyerror!bool {
             // TF_FLASHNEXT_FILL_ROWS_BUSY: a chunk opened while another stream decodes takes at most these rows, so a
             // resumed turn waits for a shorter open chunk; alone, the full prefill_rows chunk
-            self.e.fill_cap = if (self.decodingBeside(s)) blk: {
+            self.e.fill_cap = if (self.decodingBeside(s) or self.roundedLately()) blk: {
                 const v = std.c.getenv("TF_FLASHNEXT_FILL_ROWS_BUSY") orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
             } else 0;
@@ -434,6 +436,19 @@ pub fn Lanes(comptime E: type) type {
             const n = self.sliceLayersOf(s);
             self.tl("layers", n, 0);
             return n;
+        }
+
+        /// A decode round ran within TF_FLASHNEXT_FILL_ROWS_HOLD_MS (default 3000): a stream between two turns
+        /// (its reply sent, its next prompt not in yet) is likely to come back resumed within it.
+        fn roundedLately(self: *Self) bool {
+            if (comptime !@hasField(E, "io")) return false;
+            if (self.last_round_ns == 0) return false;
+            const hold: i96 = blk: {
+                const v = std.c.getenv("TF_FLASHNEXT_FILL_ROWS_HOLD_MS") orelse break :blk 3000;
+                break :blk std.fmt.parseInt(i64, std.mem.span(v), 10) catch 3000;
+            };
+            const now: i96 = std.Io.Clock.awake.now(self.e.io).toNanoseconds();
+            return now - self.last_round_ns < hold * std.time.ns_per_ms;
         }
 
         /// Another lane is decoding (no fill of its own).
@@ -994,6 +1009,7 @@ pub fn Lanes(comptime E: type) type {
         fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
             const self = of(ptr);
             self.tl("verify+", windows.len, 0);
+            if (comptime @hasField(E, "io")) self.last_round_ns = std.Io.Clock.awake.now(self.e.io).toNanoseconds();
             defer self.tl("verify-", windows.len, 0);
             self.fillLate();
             var ids: [max_streams][max_rows]u32 = undefined;
