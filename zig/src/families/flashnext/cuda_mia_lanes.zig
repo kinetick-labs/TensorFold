@@ -95,7 +95,7 @@ pub fn Lanes(comptime E: type) type {
             broken: bool = false,
         };
 
-        const Tentative = struct { at: u32, kept: *Kept, adopted: bool = false };
+        const Tentative = struct { at: u32, kept: *Kept, adopted: bool = false, lane: ?*const Lane = null };
 
         const Lane = struct {
             seq: SeqPtr,
@@ -276,7 +276,7 @@ pub fn Lanes(comptime E: type) type {
             }
             s.cached = @intCast(f.at);
             s.reuse_failed = requested and from == null;
-            self.dropTentative();
+            self.dropTentativeOf(l); // a prompt begun between another's chunks leaves that one's states be
             self.startSegment(s, l, &f) catch |err| {
                 self.dropLane(s, l);
                 // a media attachment both ranks refused together (memory, bad rows): this request fails, not the server
@@ -372,7 +372,7 @@ pub fn Lanes(comptime E: type) type {
                 f.owned = true;
                 if (self.keep(l, snap, m)) |k| {
                     f.owned = false;
-                    self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| return self.lost("a prompt's fill", err);
+                    self.tentative.append(self.gpa, .{ .at = m, .kept = k, .lane = l }) catch |err| return self.lost("a prompt's fill", err);
                 } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
                 if (s.reuse.hook) |h| h.at(h.ptr, s, m);
                 f.at = m;
@@ -385,7 +385,7 @@ pub fn Lanes(comptime E: type) type {
             self.e.fillFree(f.fl);
             if (f.owned) self.e.freeSnapshot(f.cur.?);
             l.fill = null;
-            self.endPass();
+            self.endPass(l);
             return true;
         }
 
@@ -595,7 +595,7 @@ pub fn Lanes(comptime E: type) type {
                 if (times) parts[1] += passSince(e, &t_last);
             }
             const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = cur, .media = s.media });
-            self.endPass();
+            self.endPass(null);
             if (times) {
                 parts[2] = passSince(e, &t_last);
                 std.log.info("pass times: {d} tokens from {d}, marks {any}: to the marks {d:.1} ms, keeping {d:.1} ms, the rest {d:.1} ms", .{ ids.len, s.cached, s.reuse.marks, parts[0], parts[1], parts[2] });
@@ -679,14 +679,14 @@ pub fn Lanes(comptime E: type) type {
 
         /// The pass ended: rank 0 (or one rank) frees what the store did not adopt and tells rank 1 which it did;
         /// rank 1 keeps them all until that note.
-        fn endPass(self: *Self) void {
+        fn endPass(self: *Self, owner: ?*const Lane) void {
             if (self.follower) return;
             if (self.notes) |n| if (self.tentative.items.len > 0) {
                 var buf: [1 + 4 + 64 * 12]u8 = undefined;
                 var len: usize = 5;
                 buf[0] = @backingInt(Note.pass);
                 var count: u32 = 0;
-                for (self.tentative.items) |t| if (t.adopted and len + 12 <= buf.len) {
+                for (self.tentative.items) |t| if (t.lane == owner and t.adopted and len + 12 <= buf.len) {
                     std.mem.writeInt(u32, buf[len..][0..4], t.at, .little);
                     std.mem.writeInt(u64, buf[len + 4 ..][0..8], t.kept.key, .little);
                     len += 12;
@@ -695,7 +695,22 @@ pub fn Lanes(comptime E: type) type {
                 std.mem.writeInt(u32, buf[1..5], count, .little);
                 n.send(n.ptr, buf[0..len]);
             };
-            self.dropTentative();
+            self.dropTentativeOf(owner);
+        }
+
+        /// One pass's states (`owner`'s lane; null: a whole pass's) the store did not adopt; other passes' stay,
+        /// as a short prompt may begin and end between a long one's chunks.
+        fn dropTentativeOf(self: *Self, owner: ?*const Lane) void {
+            var i: usize = 0;
+            while (i < self.tentative.items.len) {
+                const t = self.tentative.items[i];
+                if (t.lane != owner) {
+                    i += 1;
+                    continue;
+                }
+                if (!t.adopted) self.freeKept(t.kept);
+                _ = self.tentative.orderedRemove(i);
+            }
         }
 
         /// The last pass's states the store did not adopt.
@@ -733,11 +748,16 @@ pub fn Lanes(comptime E: type) type {
         fn saveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
             _ = owner;
             const self = of(ptr);
-            for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
+            // newest first: the hook runs right after its pass appends, and another pass may hold one at the same `at`
+            var i = self.tentative.items.len;
+            while (i > 0) {
+                i -= 1;
+                const t = &self.tentative.items[i];
+                if (t.at != at or t.adopted) continue;
                 t.adopted = true;
                 try self.kept.append(self.gpa, t.kept);
                 return t.kept;
-            };
+            }
             return error.NoStateKept;
         }
 
@@ -1154,7 +1174,7 @@ pub fn Lanes(comptime E: type) type {
             }
             if (kv.value.fill != null) {
                 self.stopFill(kv.value); // a cancelled fill (the host discards it between steps, on both ranks)
-                self.dropTentative();
+                self.dropTentativeOf(kv.value);
             }
             self.reserved -= kv.value.reserved;
             self.forget(kv.value);
