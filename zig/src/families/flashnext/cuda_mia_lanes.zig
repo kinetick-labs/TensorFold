@@ -431,6 +431,15 @@ pub fn Lanes(comptime E: type) type {
         }
 
         fn sliceLayersOf(self: *Self, s: *const lanes.Stream) usize {
+            // a resumed turn's few rows (TF_FLASHNEXT_FILL_SHORT_ROWS, default 512) go whole in one slice: at one
+            // layer a visit its ~300 rows took ~48 decode rounds (2-3 s to first token) for a few ms of GPU work
+            if (self.lanes.get(s)) |l| if (l.fill) |f| {
+                const short_rows = blk: {
+                    const v = std.c.getenv("TF_FLASHNEXT_FILL_SHORT_ROWS") orelse break :blk 512;
+                    break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 512;
+                };
+                if (f.fl.prompt.len - f.fl.start <= short_rows) return std.math.maxInt(u16);
+            };
             const Env = struct {
                 fn num(name: [:0]const u8, d: usize) usize {
                     const v = std.c.getenv(name) orelse return d;
