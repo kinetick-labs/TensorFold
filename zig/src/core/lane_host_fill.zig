@@ -42,7 +42,7 @@ fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
     const completed = if (j.fill_began and h.core.backend.vtable.reports_fill)
         @max(j.stream.cached, j.stream.fill_at.load(.monotonic))
     else
-        j.stream.cached;
+        @max(j.stream.cached, j.stream.reuse.at);
     return j.stream.prompt_len -| completed;
 }
 
@@ -267,7 +267,8 @@ fn srptStep(h: *LaneHost, at: usize, decoding: bool) u64 {
 
 /// A prompt whose whole pass is at most `short_rows` rows (a long prompt's last rows are not).
 fn short(j: *const LaneHost.Job) bool {
-    return j.stream.prompt_len -| j.stream.cached <= Share.short_rows;
+    // a prompt not begun yet counts from the cache's match (reuse.at), so a resumed turn is short before its begin
+    return j.stream.prompt_len -| @max(j.stream.cached, j.stream.reuse.at) <= Share.short_rows;
 }
 
 /// Fill chunks' cap: only the flag, a chunk-invariant family and live decoders together; else 0 (the engine's own cut).
