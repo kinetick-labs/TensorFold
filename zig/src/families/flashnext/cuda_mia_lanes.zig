@@ -1446,6 +1446,9 @@ pub const Toy = struct {
     gpa: std.mem.Allocator,
     /// the sequence rows this toy serves, as cuda_engine's Engine.max_len (cuda_native's Open.stream_bytes reads it)
     max_len: usize = 0,
+    /// the sliced prefill's prompt-buffer holder and busy chunk cap, as cuda_engine's Engine.pfill / fill_cap (none here)
+    pfill: ?*const anyopaque = null,
+    fill_cap: usize = 0,
     stream: ?*anyopaque = null, // the engine's stream (cuda_native's records run on it)
     budget: struct { limit: usize } = .{ .limit = std.math.maxInt(usize) },
     round_windows: [max_streams]Held = undefined,
@@ -1559,6 +1562,7 @@ pub const Toy = struct {
         kept: ?*Snapshot = null,
         first: u32 = 0,
         done: bool = false,
+        start: usize = 0, // rows already in, as the engine's Fill.start (the toy fills whole)
     };
 
     pub fn fillBegin(t: *Toy, q: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
@@ -1570,6 +1574,7 @@ pub const Toy = struct {
     }
 
     pub fn fillStep(t: *Toy, fl: *Fill, layers: usize) !bool {
+        if (t.pfill != null) return error.PromptBuffersBusy; // as the engine: never here, the toy holds no buffers
         if (fl.done) return true;
         fl.left -|= layers;
         if (fl.left > 0) return false;
