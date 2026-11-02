@@ -307,6 +307,8 @@ pub fn Lanes(comptime E: type) type {
         fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, row_cap: u32) anyerror!bool {
             _ = row_cap; // this engine slices by layers (fill_layers), not by rows: each call is one bounded slice
             const self = of(ptr);
+            self.tl("slice+", @intFromPtr(s) & 0xffff, s.prompt_len);
+            defer self.tl("slice-", @intFromPtr(s) & 0xffff, s.prompt_len);
             self.fillLate();
             // the first slice: no lane yet (or one whose fill has not begun), so prefillBeginFn's admission makes
             // it and starts the first segment; a later slice finds the lane with its fill in progress
@@ -413,7 +415,22 @@ pub fn Lanes(comptime E: type) type {
             return self.busy_now;
         }
 
+        /// TF_FLASHNEXT_TIMELINE=1: a host-time line per verify round and prompt slice (diagnosis only)
+        fn tl(self: *Self, what: []const u8, a: usize, b: usize) void {
+            if (comptime !@hasField(E, "io")) return;
+            const v = std.c.getenv("TF_FLASHNEXT_TIMELINE") orelse return;
+            if (v[0] != '1') return;
+            const now = std.Io.Clock.awake.now(self.e.io).toNanoseconds();
+            std.log.info("tl {d} {s} {d} {d} pf={d}", .{ @divTrunc(now, 1000), what, a, b, @intFromBool(self.e.pfill != null) });
+        }
+
         fn sliceLayers(self: *Self, s: *const lanes.Stream) usize {
+            const n = self.sliceLayersOf(s);
+            self.tl("layers", n, 0);
+            return n;
+        }
+
+        fn sliceLayersOf(self: *Self, s: *const lanes.Stream) usize {
             const Env = struct {
                 fn num(name: [:0]const u8, d: usize) usize {
                     const v = std.c.getenv(name) orelse return d;
@@ -954,6 +971,8 @@ pub fn Lanes(comptime E: type) type {
         /// target's draw, so they cost rows, not bits.
         fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
             const self = of(ptr);
+            self.tl("verify+", windows.len, 0);
+            defer self.tl("verify-", windows.len, 0);
             self.fillLate();
             var ids: [max_streams][max_rows]u32 = undefined;
             var wins: [max_streams]E.Window = undefined;
