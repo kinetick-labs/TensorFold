@@ -1070,6 +1070,9 @@ pub const Engine = struct {
     }
 
     fn destroySeq(e: *Engine, s: *Seq) void {
+        // the stream drained first: a cancelled sliced fill (client-left mid-chunk) leaves this sequence's layer
+        // passes queued, and the unmap of its caches (cuMemUnmap, not stream-ordered) under them faults the context
+        e.stream.synchronize() catch {};
         if (e.bound == s and s != e.own) e.bound = e.own;
         e.releaseDctx(s);
         e.budget.used -|= s.charged;
