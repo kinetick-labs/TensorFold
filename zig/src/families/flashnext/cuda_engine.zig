@@ -1465,7 +1465,9 @@ pub const Engine = struct {
                 fl.done = true;
                 return true;
             }
-            budget -= 1;
+            // a chunk's end frees the prompt buffers: the slice ends here, so a short prompt can begin and end
+            // before this one opens its next chunk (same calls in the same order, so the same bits)
+            return false;
         }
         return false;
     }
