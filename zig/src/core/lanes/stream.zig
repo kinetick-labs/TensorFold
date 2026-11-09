@@ -252,6 +252,7 @@ pub const Stream = struct {
     paused: bool = false,
     hold_eos: bool = false,
     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
+    resumed_rows: usize = 0, // a held reply's result rows still to land: their EOS neither holds nor ends it
     runner: ?RunnerHook = null,
     awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
     settle: enum { none, matching, cut } = .none, // this commit: a result settled at a trigger (hold.settle), its end
@@ -440,6 +441,7 @@ pub const Stream = struct {
         s.think_open = false;
         s.force.clearRetainingCapacity();
         s.force.appendSliceAssumeCapacity(s.think_close[1..]);
+        s.resumed_rows = 0;
         return s.think_close[0];
     }
 
@@ -517,7 +519,8 @@ pub const Stream = struct {
             }
             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
-            if (@import("runner_eos.zig").hold(s, t, stopped)) break;
+            const result_row = @import("hold.zig").resultRow(s); // its EOS (ChatML's <|im_end|>) closes the tool turn
+            if (!result_row and @import("runner_eos.zig").hold(s, t, stopped)) break;
             const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
             if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
                 if (try @import("hold.zig").settle(s, gpa, r)) continue;
@@ -526,11 +529,11 @@ pub const Stream = struct {
                 s.paused = true;
                 break;
             };
-            if (s.isEos(t) and s.hold_eos) {
+            if (s.isEos(t) and s.hold_eos and !result_row) {
                 s.held = true;
                 s.paused = true;
                 break;
-            } else if (s.isEos(t) or s.stopped()) {
+            } else if (!result_row and (s.isEos(t) or s.stopped())) {
                 s.finished = true;
                 s.reason = .stop;
             } else if (fire) |period| {
@@ -545,6 +548,7 @@ pub const Stream = struct {
                     s.think_open = false;
                     s.force.clearRetainingCapacity();
                     s.force.appendSliceAssumeCapacity(s.think_close);
+                    s.resumed_rows = 0;
                 }
                 break;
             } else if (s.budgetLeft() <= 0) {
