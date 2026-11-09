@@ -128,6 +128,16 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
         .null => null,
         else => 0,
     } else null;
+    if (is_chat and srv.vision_helper != null and @import("vision_helper_prompt.zig").hasVisual(body.get("messages"))) {
+        input.media = body.get("messages"); // split, rendered and prepared with the helper (vision_helper_prompt.zig)
+        input.tools = if (srv.text.native_deepseek) try @import("deepseek_request.zig").active(cx, body.get("tools"), body.get("tool_choice")) else try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+    } else if (is_chat) {
+        input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.media());
+        try @import("compute_turns.zig").requestTools(srv, cx, body, &input, logprobs != null); // after max_tokens
+    } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+        input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, srv.media());
+    };
+    if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     if (body.get("temperature")) |t| if (t.truthy()) {
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
