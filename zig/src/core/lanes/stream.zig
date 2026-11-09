@@ -31,6 +31,7 @@ pub const loop_max_period = short_loop.loop_max_period;
 pub const loop_min_run = short_loop.loop_min_run;
 pub const loop_warm_in = short_loop.loop_warm_in;
 pub const detectLoop = short_loop.detectLoop;
+pub const RunnerHook = @import("runner_hook.zig").RunnerHook;
 
 /// Return the first token index in a candidate batch that would fire the guard.
 pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
@@ -125,6 +126,7 @@ pub const Spec = struct {
     media: ?*const Media = null, // helper/tower rows for a media engine; such a prompt is neither kept nor resumed
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
     hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
+    runner: ?RunnerHook = null, // committed tokens go to the in-model runner, which may hold the stream at a token
 };
 
 /// Images and video frames for a prompt: replaced rows, [n, 3] rotary positions, decode delta, bf16 features.
@@ -252,6 +254,10 @@ pub const Stream = struct {
     paused: bool = false,
     hold_eos: bool = false,
     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
+    runner: ?RunnerHook = null,
+    awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
+    settle: enum { none, matching, cut } = .none, // this commit: a result settled at a trigger (hold.settle), its end
+    runner_eos_pending: bool = false,
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
@@ -284,7 +290,7 @@ pub const Stream = struct {
             .think_budget = spec.think_budget,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
-            .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
+            .think_open = spec.think_open orelse (spec.think_budget > 0 or ((spec.loop_guard or spec.runner != null) and spec.think_end >= 0)),
             .answer_max = spec.answer_max,
             .loop_guard = spec.loop_guard,
             .loop_stop = spec.loop_stop,
@@ -304,6 +310,7 @@ pub const Stream = struct {
             .media = spec.media,
             .key = spec.key,
             .hold_eos = spec.hold_eos,
+            .runner = spec.runner,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
@@ -486,8 +493,10 @@ pub const Stream = struct {
             try s.long_loop.reserve(gpa, s.emitted().len + end);
         }
         var landed: usize = 0;
+        s.settle = .none;
         for (tokens, 0..) |t, i| {
             if (s.finished) break;
+            if (s.settle == .matching and !@import("hold.zig").settledNext(s, t)) break;
             if (s.grammar) |g| {
                 if (!try g.follow(t)) {
                     s.finished = true;
@@ -499,6 +508,7 @@ pub const Stream = struct {
             s.context.appendAssumeCapacity(t);
             if (rows.len > 0) s.rows.appendAssumeCapacity(rows[i]);
             landed += 1;
+            const ended_think = s.think_open and @as(i64, t) == s.think_end;
             if (@as(i64, t) == s.think_end) {
                 s.think_open = false;
                 if (s.answer_from == null) s.answer_from = s.emitted().len;
@@ -512,6 +522,15 @@ pub const Stream = struct {
             }
             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+            if (@import("runner_eos.zig").hold(s, t, stopped)) break;
+            const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
+            if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
+                if (try @import("hold.zig").settle(s, gpa, r)) continue;
+                s.held = true;
+                s.awaiting = true;
+                s.paused = true;
+                break;
+            };
             if (s.isEos(t) and s.hold_eos) {
                 s.held = true;
                 s.paused = true;

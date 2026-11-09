@@ -6,8 +6,10 @@ const recalls = @import("lane_host_recall.zig");
 const LaneHost = host.LaneHost;
 const Job = LaneHost.Job;
 
-/// A job's drafter freed: the family's (LaneHost.proposers) or the built-in one.
+/// A job's drafter freed (the family's or the built-in one), and its runner session.
 pub fn freeProposer(h: *LaneHost, job: *Job) void {
+    if (job.runner) |s| s.destroy();
+    job.runner = null;
     if (job.custom) |c| h.proposers.?.free(h.proposers.?.ctx, c) else job.proposer.deinit();
     job.custom = null;
 }
@@ -35,6 +37,11 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
     } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
     const recall = recalls.reader(h, job);
+    // forced result rows would leave a grammar, and logprob rows would rank tokens the model never drew
+    if (h.runner) |rn| if (r.run_cells and r.structure == null and r.logprobs == null) {
+        job.runner = rn.session(r.run_trace) catch return !h.drop(job, "out of memory");
+        if (job.runner) |s| s.commit.ask = r.run_commit;
+    };
     job.stream = lanes.Stream.init(h.gpa, .{
         .id = "request",
         .prompt = r.prompt,
@@ -75,6 +82,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .media = r.media, // our mia engine's --vision-helper rows (Stream.media, 224a74c0)
         .key = r.cache_key,
         .hold_eos = r.hold_eos and r.structure == null and r.logprobs == null, // forced rows would leave the grammar
+        .runner = if (job.runner) |s| s.hook() else null,
     }) catch {
         freeProposer(h, job);
         recalls.release(job);

@@ -69,7 +69,7 @@ const Box = struct {
         defer b.mutex.unlock(std.testing.io);
         switch (e.*) {
             .prefilled => |c| b.cached = c,
-            .logprobs, .prompt_logprobs, .audio => {},
+            .logprobs, .prompt_logprobs, .audio, .cells => {},
             .tokens => |t| b.tokens.appendSlice(std.testing.allocator, t) catch {},
             .finished => |f| b.done = f.reason,
         }
