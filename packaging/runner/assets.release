@@ -1,0 +1,4 @@
+# The archive assets.py downloads for build-assets.sh: the files listed in assets.sha256, one deterministic tar.gz.
+# DeepSeek-V4.1's runner asset release, used as it is (not re-hosted); a mirror must serve the same bytes.
+url https://github.com/jayleaton/deepseek-v41-tensorfold-spark/releases/download/runner-assets-20261107/runner-assets-20261107.tar.gz
+sha256 b5c40d32bcab0fa896795d08aaa651d55d0574e500f3624e61db23058cdd800f
