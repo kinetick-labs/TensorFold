@@ -23,7 +23,7 @@ pub const Program = struct {
 };
 
 /// Why a frontend or backend declines; the model's own continuation then stands (nothing is owned).
-pub const Abstain = enum { language, unsupported, syntax, name, too_long, too_big, context };
+pub const Abstain = enum { language, unsupported, syntax, name, too_long, too_big, context, markup }; // markup: runner_binding.Family
 
 pub const Translation = union(enum) { program: Program, abstain: Abstain };
 

@@ -124,6 +124,12 @@ test "a stream the lone driver does not take stays in the lane core to its end" 
     try std.testing.expectEqual(@as(u32, 0), runs.resumed);
 }
 
+test "a runner's stream stays in the lane core, where its cells are read and held" {
+    const runs = try serve(&.{ .prompt = &prompt, .max_tokens = 24, .run_cells = true }, true);
+    try std.testing.expectEqual(@as(u32, 0), runs.opened);
+    try std.testing.expectEqual(@as(u32, 0), runs.resumed);
+}
+
 test "a lone driver that takes plain streams opens one with drafts off" {
     const runs = try serveDriver(&.{ .prompt = &prompt, .max_tokens = 24, .drafts = false }, false, true, true);
     try std.testing.expectEqual(@as(u32, 1), runs.opened);

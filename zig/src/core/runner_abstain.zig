@@ -20,6 +20,7 @@ pub const Reason = enum {
     fault, // the run: its own abstain (error_name: its tag), the step budget, a machine fault
     empty_output,
     multiline_output, // an inline value that is not one line
+    markup, // a result that spells the family's chat markup (runner_binding.Family.never)
     mark_value_shape, // INLINE_MARK: a blank or multi-line value cannot carry the mark
     token_cap, // the owned text would pass the token cap
     trace_shape, // a trace run that did not print one value
@@ -31,7 +32,7 @@ pub fn stage(r: Reason) []const u8 {
         .language, .unsupported, .syntax, .name, .too_long, .too_big => "frontend",
         .out_of_memory => "dispatch",
         .backend_abstain, .budget, .fault => "execute",
-        .empty_output, .multiline_output, .mark_value_shape, .token_cap, .trace_shape => "own",
+        .empty_output, .multiline_output, .mark_value_shape, .token_cap, .trace_shape, .markup => "own",
     };
 }
 
@@ -62,7 +63,7 @@ pub fn reason(c: anytype, hint: ?Reason) struct { Reason, ?[]const u8 } {
     }
     const res = c.result orelse return .{ .out_of_memory, "OutOfMemory" };
     return switch (res.status) {
-        .abstain => .{ .backend_abstain, if (res.abstain) |a| @tagName(a) else null },
+        .abstain => if (res.abstain == .markup) .{ .markup, "markup" } else .{ .backend_abstain, if (res.abstain) |a| @tagName(a) else null },
         .budget => .{ .budget, "budget" },
         .fault => .{ .fault, "fault" },
         .ok => if (res.out.len == 0) .{ .empty_output, null } else if (std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, res.out, "\n"), '\n') != null) .{ .multiline_output, null } else .{ .mark_value_shape, null },
