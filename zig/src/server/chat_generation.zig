@@ -6,6 +6,7 @@ const chat = @import("chat.zig");
 const reply_text = @import("reply_text.zig");
 const recipient_reply = @import("recipient_reply.zig");
 const reply_owned = @import("reply_owned.zig");
+const projection = @import("runner_projection.zig");
 const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_lfm2 = @import("tool_lfm2.zig");
@@ -79,6 +80,10 @@ pub const Generation = struct {
     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
     lane_own: bool = false, // Input.lane_own: a call max_tokens cut never shows as prose, as the reply's own call
     owned: ?reply_owned.Owned = null, // engine-owned bytes of this segment's content (reply_owned.of its cell writes)
+    guide: ?[]const u8 = null, // the runner guide text the chat got ("" none); null: the runner is off
+    cells_sent: usize = 0, // the runner records the stream sent last: a prefix the client has every landed byte of
+    cells_sig: u64 = 0, // their Mailbox.covered sig
+    base: usize = 0, // the reply's tokens before this segment's (compute_segments.zig): the runner records count them
     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
@@ -274,6 +279,7 @@ pub const Generation = struct {
                 g.deadline_hit = true;
                 g.srv.engine.cancel(g.id); // the engine ends the stream: its tokens and usage stay whole
             };
+            if (chunk == null) if (g.sink) |sink| try g.liveCells(sink);
             if (chunk == null and @hasDecl(Gone, "beat")) {
                 // queueing and a long prefill send nothing: a client that times out a silent stream would leave
                 const now = nowNs(g.srv.io);
@@ -286,8 +292,54 @@ pub const Generation = struct {
             }
             const tokens = try g.skipInserted(chunk orelse continue);
             if (g.reason == null) try g.commit(tokens);
+            if (g.sink) |sink| try g.liveCells(sink);
             if (g.held) return;
         }
+    }
+
+    /// Sends the runner records whose bytes the client has (`tensorfold.runner.cells`), so a cut stream keeps them.
+    pub fn liveCells(g: *Generation, sink: Sink) Failure!void {
+        const m = g.box;
+        var text: std.ArrayList(u8) = .empty;
+        {
+            m.mutex.lockUncancelable(m.io);
+            defer m.mutex.unlock(m.io);
+            const got = m.covered(.{ g.streamed_reasoning.text.items.len, g.streamed.text.items.len });
+            // never fewer than sent: the text may have been replaced shorter (a stop string's held prefix)
+            if (got.n < g.cells_sent or got.sig == g.cells_sig) return; // records off: n 0, sig 0, so never
+            try text.appendSlice(g.a, "{\"runner\":{\"live\":true,\"cells\":[");
+            for (m.cells.items[0..got.n], 0..) |versions, i| {
+                if (i > 0) try text.append(g.a, ',');
+                try text.appendSlice(g.a, versions.items[0].json);
+            }
+            try text.appendSlice(g.a, "]}}");
+            g.cells_sent = got.n;
+            g.cells_sig = got.sig;
+        }
+        const v = switch (try json.parse(g.a, text.items)) {
+            .ok => |v| v,
+            .err => return,
+        };
+        const delta = try json.newObject(g.a);
+        try delta.put(g.a, "tensorfold", v); // openai.zig's chunk puts it beside the choices, as the final chunk's receipt
+        try g.emit(sink, .{ .object = delta });
+    }
+
+    /// The engine-owned bytes of `content` (reply_owned.of), from the runner records the stream has had so far.
+    fn ownedOf(g: *Generation, tokens: []const u32, raw: []const u8, content: []const u8) Allocator.Error!?reply_owned.Owned {
+        if (g.srv.text.vtable.token_bytes == null) return null;
+        var records: std.ArrayList([]const u8) = .empty;
+        {
+            const m = g.box;
+            m.mutex.lockUncancelable(m.io);
+            defer m.mutex.unlock(m.io);
+            for (m.cells.items) |versions| if (versions.items.len > 0)
+                try records.append(g.a, try g.a.dupe(u8, versions.items[versions.items.len - 1].json));
+        }
+        if (records.items.len == 0) return null;
+        const pieces = try g.a.alloc([]const u8, tokens.len);
+        for (tokens, pieces) |t, *p| p.* = (try g.srv.text.tokenBytes(g.a, t)) orelse return null;
+        return reply_owned.of(g.a, records.items, g.base, pieces, raw, content, reply_text.openersOf(g.srv.markers));
     }
 
     /// Drops the inserted result that opens a resumed segment; a different token there fails the reply.
@@ -365,6 +417,7 @@ pub const Generation = struct {
             break :blk nr;
         } else try g.readText(raw, content_tokens, reason, stopped);
         const text, const close, const content, const reasoning, const recovered = .{ read.text, read.close, read.content, read.reasoning, read.recovered };
+        g.owned = try g.ownedOf(content_tokens, raw, content); // the runner's cell writes (none: null)
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
@@ -427,6 +480,23 @@ pub const Generation = struct {
             try runtime.put(a, "loop", .{ .object = loop_field });
         }
         if (recovered) try runtime.put(a, "reasoning_recovered", .{ .bool = true });
+        const cells = try a.dupe(u8, m.runner);
+        var runner_raw: ?[2][]const u8 = null; // abstain anchors index these; openai.zig maps them to what it sends
+        if (cells.len > 0) switch (try json.parse(a, cells)) {
+            .ok => |v| {
+                if (v.get("abstains") != null) runner_raw = try projection.rawFields(a, g.srv.text, content_tokens, if (g.thinking) g.srv.think_close_end else null);
+                try runtime.put(a, "runner", v);
+            },
+            .err => {},
+        };
+        if (g.guide) |given| {
+            const guide = try json.newObject(a);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(given, &digest, .{});
+            try guide.put(a, "sha256", .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) });
+            try guide.put(a, "bytes", try json.intValue(a, given.len));
+            try runtime.put(a, "runner_guide", .{ .object = guide });
+        }
         const s = m.stats;
         const spec = try json.newObject(a);
         try spec.put(a, "rounds", try json.intValue(a, s.rounds));
@@ -447,6 +517,7 @@ pub const Generation = struct {
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
             .native_tool_format = native != null,
             .native_calls = if (native) |n| n.calls else null,
+            .runner_raw = runner_raw,
             .owned = g.owned,
             .finish_reason = reason,
             .prompt_tokens = prompt_len,

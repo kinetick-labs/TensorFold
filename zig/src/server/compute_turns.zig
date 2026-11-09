@@ -51,9 +51,15 @@ pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
     return pool;
 }
 
-/// Whether thinking chats get the built-in tool, whatever they send (the compute default).
+/// Whether thinking chats get the built-in tool and the boot's guide, whatever they send (the compute default).
 pub fn forced(srv: *const Server) bool {
     return srv.compute != null and srv.info.compute.?.default;
+}
+
+/// The request's own "runner_guide"; under the default the boot's (null) for a thinking chat, else none (""), always.
+pub fn guideAsked(srv: *const Server, fields: Value, thinking: bool) ?Value {
+    // the boot's guide was measured inside thinking; in a visible answer it writes `<expr> =` cells at the client
+    return if (!forced(srv)) fields.get("runner_guide") else if (thinking) null else .{ .string = "" };
 }
 
 /// The default binding's max_tokens under which the default offers no built-in tool unasked (Tool.min_tokens).
