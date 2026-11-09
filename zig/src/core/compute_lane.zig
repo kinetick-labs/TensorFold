@@ -16,13 +16,15 @@ pub const Config = struct {
     mem_mb: u32 = 1024, // RLIMIT_AS
     python: []const u8 = "/usr/bin/python3",
     cpus: []const u8 = "", // optional affinity list like "16-19" or "1,3,5-7"
+    default: bool = false, // PREFIX_DEFAULT=1: every thinking chat gets the built-in tool, whatever it sends
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
-        const on = get(prefix) orelse return null;
-        if (on.len == 0 or std.mem.eql(u8, on, "0")) return null;
+        const always = try flag(get, prefix ++ "_DEFAULT");
+        const on = get(prefix) orelse "";
+        if (on.len == 0 or std.mem.eql(u8, on, "0")) return if (always) bad(prefix ++ "_DEFAULT", "1 without the lane") else null;
         if (!std.mem.eql(u8, on, "1")) return bad(prefix, on);
-        var c: Config = .{};
+        var c: Config = .{ .default = always };
         c.workers = try knob(u8, get, prefix ++ "_WORKERS", c.workers, 1, 64);
         c.max_ms = try knob(u32, get, prefix ++ "_MAX_MS", c.max_ms, 1, 3_600_000);
         c.max_result_tokens = try knob(u32, get, prefix ++ "_MAX_RESULT_TOKENS", c.max_result_tokens, 1, 1 << 20);
@@ -38,6 +40,13 @@ pub const Config = struct {
             c.cpus = s;
         };
         return c;
+    }
+
+    fn flag(get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8) error{BadKnob}!bool {
+        const text = get(name) orelse return false;
+        if (text.len == 0 or std.mem.eql(u8, text, "0")) return false;
+        if (std.mem.eql(u8, text, "1")) return true;
+        return bad(name, text);
     }
 
     fn knob(comptime T: type, get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8, default: T, min: T, max: T) error{BadKnob}!T {
