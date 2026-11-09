@@ -253,7 +253,7 @@ fn toolTurn(a: Allocator, call: Value, output: []const u8) Allocator.Error!Value
     return .{ .object = o };
 }
 
-/// The template's tokens after the held EOS: render(history + call turn + results) past render(history + call turn).
+/// The template's tokens after the held EOS: render(history + call turn + results) past the call turn's EOS.
 fn suffix(srv: *Server, cx: *Cx, p: chat.Prepared, history: *const std.ArrayList(Value), assistant: Value, calls: []const Value, reports: []const Value) chat.Failure!?[]const u32 {
     const a = cx.a;
     var with: std.ArrayList(Value) = .empty;
@@ -262,13 +262,22 @@ fn suffix(srv: *Server, cx: *Cx, p: chat.Prepared, history: *const std.ArrayList
     const before = prompt_mod.renderIds(srv, cx, .{ .array = try a.dupe(Value, with.items) }, p.input.tools, p.thinking, p.effort, false) catch |e| return lost(e);
     for (calls, reports) |c, r| try with.append(a, try toolTurn(a, c, r.get("output").?.string));
     const after = prompt_mod.renderIds(srv, cx, .{ .array = with.items }, p.input.tools, p.thinking, p.effort, true) catch |e| return lost(e);
-    // the history must end at the model's own EOS and stand unchanged under the results: else no exact insert exists
-    const ends = before.len > 0 and std.mem.indexOfScalar(u32, srv.eos, before[before.len - 1]) != null;
-    if (!ends or after.len <= before.len or !std.mem.eql(u32, after[0..before.len], before)) {
+    // the history stands unchanged under the results, its call turn ends at the model's EOS: else no exact insert
+    const end = try callEnd(srv, a, before);
+    if (end == null or after.len <= before.len or !std.mem.eql(u32, after[0..before.len], before)) {
         log.line("warning: compute lane: this template's tool-result turn does not extend the call turn; the reply ends at the call", .{});
         return null;
     }
-    return after[before.len..];
+    return after[end.?..];
+}
+
+/// Past the call turn's EOS if only template whitespace follows it (ChatML's `<|im_end|>\n`), forced in after it.
+fn callEnd(srv: *Server, a: Allocator, before: []const u32) Allocator.Error!?usize {
+    const at = std.mem.lastIndexOfAny(u32, before, srv.eos) orelse return null;
+    const close = before[at + 1 ..];
+    if (close.len == 0) return before.len;
+    const text = try srv.text.decode(a, close);
+    return if (std.mem.trim(u8, text, " \t\r\n").len == 0) at + 1 else null;
 }
 
 fn lost(e: anyerror) chat.Failure!?[]const u32 {
