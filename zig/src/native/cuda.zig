@@ -458,6 +458,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // TF_RUNNER*: the family's in-model runner, open for the engine's life; the server gives it the tokenizer
     const runner = if (@hasDecl(F, "runner")) if (try F.runner.parse(&cuda_device.knob)) |rc| try api.runner.open(gpa, rc) else null else null;
     if (runner != null) try F.runner.openRoundTrace(&cuda_device.knob);
+    const compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null; // replies hold at EOS
+    // TF_COMPUTE_LANE_RUNNER=1 (S3, off by default): lane calls the circuit can run go there, sharing its circuit
+    const s3 = if (@hasDecl(F, "compute")) try api.compute_circuit.open(F.compute, gpa, &cuda_device.knob, compute != null, runner, null) else null;
     try h.serve(io, served.facts, loaded.rows, familyInfo(F, .{
         .benchmark_ranks = bench.ranks,
         .benchmark_group = bench.group,
@@ -485,8 +488,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .text_generation = readouts == null, // a readout engine answers its readouts only (Clef's /v1/systemone)
     }), .{ .ctx = loaded.ctx, .text = F.explain }, snaps.warmQuiet(F));
         .compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null, // replies hold at EOS
+        .compute = compute,
         .compute_tool = if (@hasDecl(F, "compute")) F.compute.tool else .{},
         .runner = runner,
+        .compute_runner = s3,
     }), .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, if (paged) |p| p.taken else 0, std.log); // TF_KV_SHARE: no copied rows

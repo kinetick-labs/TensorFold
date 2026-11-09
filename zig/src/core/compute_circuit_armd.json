@@ -1,0 +1,264 @@
+{
+ "source": "imr-measure-20261101T155322Z off/d (G 58bece1d3 + compute lane, greedy, c=4)",
+ "calls": [
+  {
+   "task": "add30-06",
+   "call": 0,
+   "code": "a=140857552301908510213574088100\nb=690019271788334891377792747413\nprint(a+b)",
+   "status": "ok",
+   "output": "830876824090243401591366835513"
+  },
+  {
+   "task": "add30-11",
+   "call": 0,
+   "code": "a=461609435149449013647033723574\nb=681984820754533573978520423340\nprint(a+b)",
+   "status": "ok",
+   "output": "1143594255903982587625554146914"
+  },
+  {
+   "task": "add30-22",
+   "call": 0,
+   "code": "a=264278028996235349740985471434\nb=771565915835769397012014492734\nprint(a+b)",
+   "status": "ok",
+   "output": "1035843944832004746752999964168"
+  },
+  {
+   "task": "add30-23",
+   "call": 0,
+   "code": "a=201353929467531947324387649049\nb=878008121024580933149930071041\nprint(a+b)",
+   "status": "ok",
+   "output": "1079362050492112880474317720090"
+  },
+  {
+   "task": "add30-25",
+   "call": 0,
+   "code": "a=113795210844261092862101166842\nb=132376119681879481561963467234\nprint(a+b)",
+   "status": "ok",
+   "output": "246171330526140574424064634076"
+  },
+  {
+   "task": "add30-30",
+   "call": 0,
+   "code": "a=692917166071944244802612751294\nb=637124983390994126179087347218\nprint(a+b)",
+   "status": "ok",
+   "output": "1330042149462938370981700098512"
+  },
+  {
+   "task": "add30-33",
+   "call": 0,
+   "code": "a=522246220506633173639726478281\nb=738473471932250682253360151658\nprint(a+b)",
+   "status": "ok",
+   "output": "1260719692438883855893086629939"
+  },
+  {
+   "task": "add30-40",
+   "call": 0,
+   "code": "a=373587962793998036961665294312\nb=745804667042638645410155978295\nprint(a+b)",
+   "status": "ok",
+   "output": "1119392629836636682371821272607"
+  },
+  {
+   "task": "algo-36",
+   "call": 0,
+   "code": "import sys\ndata=list(map(int, sys.stdin.buffer.read().split()))\nn=data[0]\na=sorted(data[1:1+n])\nprefix=0\nans=0\nfor i,x in enumerate(a):\n    ans += x*i - prefix\n    prefix += x\nprint(ans)\n",
+   "status": "exit_error",
+   "output": "[stderr]\nTraceback (most recent call last):\n  File \"<code>\", line 2, in <module>\n    data=list(map(int, sys.stdin.buffer.read().split()))\n                       ^^^^^^^^^^^^^^^^\nAttributeError: '_io.StringIO' object has no attribute 'buffer'\n[exit status 1]"
+  },
+  {
+   "task": "algo-36",
+   "call": 1,
+   "code": "import sys\ns='''5\n884459 -967751 -759299 145943 -533788\n'''\ndata=list(map(int, s.split()))\nn=data[0]\na=sorted(data[1:1+n])\nprefix=0\nans=0\nfor i,x in enumerate(a):\n    ans += x*i - prefix\n    prefix += x\nprint(ans)\n",
+   "status": "ok",
+   "output": "9219324"
+  },
+  {
+   "task": "bignum-10",
+   "call": 0,
+   "code": "a=11232463670103386525\nb=732667528837627997\nc=242246186388029\nprint(a-b*129+c)\nprint(b*129)\n",
+   "status": "ok",
+   "output": "-83281405303764237059\n94514111220054011613"
+  },
+  {
+   "task": "bignum-18",
+   "call": 0,
+   "code": "print(2**114 - 3**67)",
+   "status": "ok",
+   "output": "20676477970991412677036223391469797"
+  },
+  {
+   "task": "div_big-04",
+   "call": 0,
+   "code": "a=-23777868243178464\nb=-41832496\nprint(a//b, a%b)\nprint(a/b)\nprint(divmod(a,b))\n",
+   "status": "ok",
+   "output": "568406634 0\n568406634.0\n(568406634, 0)"
+  },
+  {
+   "task": "div_big-08",
+   "call": 0,
+   "code": "from fractions import Fraction\nn=44253970636272\nprint(n//48, n%48)\nprint(Fraction(n,-48))\nprint(n/-48)\n",
+   "status": "ok",
+   "output": "921957721589 0\n-921957721589\n-921957721589.0"
+  },
+  {
+   "task": "div_big-20",
+   "call": 0,
+   "code": "from fractions import Fraction\nn=-160371104\nd=932\nf=Fraction(n,d)\nprint(f, float(f))\nprint(n//d, n%d)\nimport math\nprint(math.gcd(abs(n),d))\n",
+   "status": "ok",
+   "output": "-172072 -172072.0\n-172072 0\n932"
+  },
+  {
+   "task": "div_big-23",
+   "call": 0,
+   "code": "from fractions import Fraction\nn=32685677580\nd=-4826\nf=Fraction(n,d)\nprint(f, f.numerator, f.denominator)\nprint(n/d)\nimport math\nprint(math.gcd(n,4826))\n",
+   "status": "ok",
+   "output": "-6772830 -6772830 1\n-6772830.0\n4826"
+  },
+  {
+   "task": "div_big-32",
+   "call": 0,
+   "code": "from fractions import Fraction\nn=-334567426983174\nd=-8613\nprint(n//d, n%d)\nprint(Fraction(n,d))\nprint(divmod(n,d))\n",
+   "status": "ok",
+   "output": "38844470798 0\n38844470798\n(38844470798, 0)"
+  },
+  {
+   "task": "div_big-36",
+   "call": 0,
+   "code": "from fractions import Fraction\nn=392764052; d=116\nprint(n//d, n%d)\nprint(Fraction(n,d))\nprint(n/d)",
+   "status": "ok",
+   "output": "3385897 0\n3385897\n3385897.0"
+  },
+  {
+   "task": "mbpp-11",
+   "call": 0,
+   "code": "def remove_Occ(s, ch):\n    first = s.find(ch)\n    if first == -1:\n        return s\n\n    last = s.rfind(ch)\n    if first == last:\n        return s[:first] + s[first + 1:]\n\n    return s[:first] + s[first + 1:last] + s[last + 1:]\n\nassert remove_Occ(\"hello\", \"l\") == \"heo\"\nassert remove_Occ(\"banana\", \"a\") == \"bnan\"\nassert remove_Occ(\"abc\", \"x\") == \"abc\"\nassert remove_Occ(\"a\", \"a\") == \"\"\nassert remove_Occ(\"lll\", \"l\") == \"l\"\nprint(\"all tests passed\")",
+   "status": "ok",
+   "output": "all tests passed"
+  },
+  {
+   "task": "mbpp-12",
+   "call": 0,
+   "code": "def sort_matrix(matrix):\n    return sorted(matrix, key=sum)\n\nassert sort_matrix([[1, 2, 3], [2, 4, 5], [1, 1, 1]]) == [[1, 1, 1], [1, 2, 3], [2, 4, 5]]\nprint(\"passed\")",
+   "status": "ok",
+   "output": "passed"
+  },
+  {
+   "task": "mbpp-56",
+   "call": 0,
+   "code": "def check(n):\n    rev = int(str(n)[::-1])\n    return n == 2 * rev - 1\n\nprint(check(70))\nprint(check(13))\nprint(check(0))\n",
+   "status": "ok",
+   "output": "False\nFalse\nFalse"
+  },
+  {
+   "task": "mbpp-57",
+   "call": 0,
+   "code": "def find_Max_Num(digits):\n    if not digits:\n        return 0\n    return int(''.join(map(str, sorted(digits, reverse=True))))\n\nassert find_Max_Num([1,2,3]) == 321\nprint(find_Max_Num([1,2,3]))\nprint(find_Max_Num([0,0,0]))\nprint(find_Max_Num([9,0,1,5]))\n",
+   "status": "ok",
+   "output": "321\n0\n9510"
+  },
+  {
+   "task": "mbpp-61",
+   "call": 0,
+   "code": "s='112112'\nc=0\nsubs=[]\nfor i in range(len(s)):\n    sm=0\n    for j in range(i,len(s)):\n        sm+=int(s[j])\n        if sm==j-i+1:\n            c+=1; subs.append(s[i:j+1])\nprint(c, subs)\n",
+   "status": "ok",
+   "output": "6 ['1', '11', '1', '1', '11', '1']"
+  },
+  {
+   "task": "mbpp-66",
+   "call": 0,
+   "code": "def pos_count(numbers):\n    return sum(1 for number in numbers if number > 0)\n\nassert pos_count([1, -2, 3, -4]) == 2\nprint(pos_count([1, -2, 3, -4]))",
+   "status": "ok",
+   "output": "2"
+  },
+  {
+   "task": "mbpp-74",
+   "call": 0,
+   "code": "def is_samepatterns(colors, patterns):\n    if len(colors) != len(patterns):\n        return False\n\n    color_to_pattern = {}\n    pattern_to_color = {}\n\n    for color, pattern in zip(colors, patterns):\n        if color in color_to_pattern:\n            if color_to_pattern[color] != pattern:\n                return False\n        else:\n            color_to_pattern[color] = pattern\n\n        if pattern in pattern_to_color:\n            if pattern_to_color[pattern] != color:\n                return False\n        else:\n            pattern_to_color[pattern] = color\n\n    return True\n\nassert is_samepatterns([\"red\",\"green\",\"green\"], [\"a\", \"b\", \"b\"]) == True\nassert is_samepatterns([\"red\",\"green\",\"greenn\"], [\"a\",\"b\",\"b\"]) == False\nassert is_samepatterns([\"red\",\"green\",\"green\"], [\"a\",\"b\",\"c\"]) == False\nprint(\"ok\")",
+   "status": "ok",
+   "output": "ok"
+  },
+  {
+   "task": "mbpp-80",
+   "call": 0,
+   "code": "def tetrahedral_number(n):\n    return n * (n + 1) * (n + 2) // 6\n\nassert tetrahedral_number(5) == 35\nprint(tetrahedral_number(5))",
+   "status": "ok",
+   "output": "35"
+  },
+  {
+   "task": "mbpp-82",
+   "call": 0,
+   "code": "import math\n\ndef volume_sphere(radius):\n    return (4/3) * math.pi * radius ** 3\n\nprint(volume_sphere(10))\nprint(math.isclose(volume_sphere(10), 4188.790204786391, rel_tol=0.001))",
+   "status": "ok",
+   "output": "4188.790204786391\nTrue"
+  },
+  {
+   "task": "mbpp-86",
+   "call": 0,
+   "code": "def centered_hexagonal_number(n):\n    return 3 * n * (n - 1) + 1\n\nassert centered_hexagonal_number(10) == 271\nprint(centered_hexagonal_number(10))",
+   "status": "ok",
+   "output": "271"
+  },
+  {
+   "task": "mbpp-91",
+   "call": 0,
+   "code": "def find_substring(strings, substring):\n    return any(substring in s for s in strings)\n\nassert find_substring([\"red\", \"black\", \"white\", \"green\", \"orange\"], \"ack\") == True\nprint(\"passed\")",
+   "status": "ok",
+   "output": "passed"
+  },
+  {
+   "task": "mul30-14",
+   "call": 0,
+   "code": "a=831680992073052982499463120866\nb=548277608446792630955630629392\nprint(a*b)",
+   "status": "ok",
+   "output": "455992065324469389066179825281039054396652721075268148093472"
+  },
+  {
+   "task": "mul30-16",
+   "call": 0,
+   "code": "a=282668092539785370248997280888\nb=816005819957362936377102597457\nprint(a*b)",
+   "status": "ok",
+   "output": "230658808628711306228254750906181282393137692640595023501816"
+  },
+  {
+   "task": "mul_big-05",
+   "call": 0,
+   "code": "print(213625928 * 48215)",
+   "status": "ok",
+   "output": "10299974118520"
+  },
+  {
+   "task": "mul_big-08",
+   "call": 0,
+   "code": "from decimal import Decimal\nprint(Decimal('-27.201')*Decimal('4952356'))",
+   "status": "ok",
+   "output": "-134709035.556"
+  },
+  {
+   "task": "mul_big-17",
+   "call": 0,
+   "code": "from decimal import Decimal\nprint(Decimal('562.1') * Decimal('7.691'))",
+   "status": "ok",
+   "output": "4323.1111"
+  },
+  {
+   "task": "mul_big-18",
+   "call": 0,
+   "code": "from decimal import Decimal\nprint(Decimal('-540262.6')*Decimal('703773'))",
+   "status": "ok",
+   "output": "-380222230789.8"
+  },
+  {
+   "task": "mul_big-30",
+   "call": 0,
+   "code": "print(-502290021 * 145302369)",
+   "status": "ok",
+   "output": "-72983929976359749"
+  },
+  {
+   "task": "mul_big-40",
+   "call": 0,
+   "code": "print(28424792 * 72455974)",
+   "status": "ok",
+   "output": "2059545990107408"
+  }
+ ]
+}
