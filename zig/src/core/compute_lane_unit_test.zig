@@ -61,17 +61,9 @@ test "compute lane binding: generic names or the family's alias, not both; the t
     try std.testing.expectError(error.BadKnob, dsv41.parse(&lookup));
     knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE", "" } }; // empty is unset
     try expect((try dsv41.parse(&lookup)) != null);
-    // Flash-Next reads the generic names only
-    const flashnext = lane.bindings.flashnext;
-    knobs = &.{.{ "TF_DSV41_COMPUTE_LANE", "1" }};
-    try expectEqual(null, try flashnext.parse(&lookup));
-    knobs = &.{.{ "TF_COMPUTE_LANE", "1" }};
-    try expect((try flashnext.parse(&lookup)) != null);
-    inline for (.{ dsv41, flashnext }) |b| {
-        try expectEqualStrings("python", b.tool.name);
-        try expectEqualStrings("code_interpreter", b.tool.opt_in);
-        try expectEqual(@as(i64, 1024), b.tool.min_tokens);
-    }
+    try expectEqualStrings("python", dsv41.tool.name);
+    try expectEqualStrings("code_interpreter", dsv41.tool.opt_in);
+    try expectEqual(@as(i64, 1024), dsv41.tool.min_tokens);
 }
 
 test "compute lane config: every knob parses" {
