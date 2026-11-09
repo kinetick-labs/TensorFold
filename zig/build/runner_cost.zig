@@ -12,4 +12,7 @@ pub fn steps(b: *std.Build) void {
     const hold = b.createModule(.{ .root_source_file = b.path("zig/src/core/runner_hold_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "dsv41_tokenizer", .module = tok } } });
     const hold_exe = b.addExecutable(.{ .name = "runner-hold-bench", .root_module = hold });
     b.step("bench-runner-hold", "A runner hold's parts through the served runner (TF_RUNNER* knobs; tokenizer.json, replies.jsonl)").dependOn(&b.addInstallArtifact(hold_exe, .{}).step);
+    const s3 = b.createModule(.{ .root_source_file = b.path("zig/src/core/runner_s3_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const s3_exe = b.addExecutable(.{ .name = "runner-s3-bench", .root_module = s3 });
+    b.step("bench-runner-s3", "S3 lane calls through the served runner: route, steps, ms (TF_COMPUTE_LANE_RUNNER* knobs; cells.jsonl)").dependOn(&b.addInstallArtifact(s3_exe, .{}).step);
 }

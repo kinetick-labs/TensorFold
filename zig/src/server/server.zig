@@ -178,6 +178,8 @@ pub const Server = struct {
     idle_manager: ?*idle_unload.Manager = null,
     /// The compute lane's sandboxes when the engine serves it (Info.compute); null: code_interpreter is refused.
     compute: ?api.hold.compute_lane.Pool = null,
+    /// S3 (Info.compute_runner): built-in calls the circuit can run run there; null: every call goes to the sandbox.
+    compute_exec: ?api.compute_circuit.Exec = null,
     preparing: std.atomic.Value(i64) = .init(0),
     speech_inflight: std.atomic.Value(u32) = .init(0),
     arena: std.heap.ArenaAllocator,
@@ -226,6 +228,10 @@ pub const Server = struct {
             return srv;
         }
         if (srv.info.compute) |c| srv.compute = try @import("compute_turns.zig").open(srv, c);
+        if (srv.compute != null) if (srv.info.compute_runner) |s| {
+            srv.compute_exec = .init(s);
+            std.log.info("compute lane: calls the circuit can run run there (in-model runner), the rest in the sandbox (code tool){s}", .{if (s.cfg.verify) "; verify: the sandbox's result is inserted" else ""});
+        };
         if (srv.info.runner) |r| {
             try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
             srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);

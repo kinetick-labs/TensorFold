@@ -116,7 +116,7 @@ fn segmentAnswer(g: *Generation) chat.Failure!Answer {
     return .{ .prose = parsed.content, .reasoning = read.reasoning, .calls = parsed.calls };
 }
 
-/// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls the sandbox ran.
+/// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls an executor ran.
 fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, executed: *usize, gone: anytype) chat.Failure![]Value {
     const Watch = struct {
         gone: @TypeOf(gone),
@@ -131,18 +131,66 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
         const code = try codeOf(a, c);
         var o: lane.Outcome = .{ .status = .unavailable, .stderr = "the call has no string argument \"code\"" };
         var body: []const u8 = undefined;
+        var s3: ?s3_api.Outcome = null;
+        var verify: ?bool = null;
+        const t0 = s3_api.nowNs();
         if (ran.* >= cfg.max_calls) {
             body = "[call limit reached: answer without running more code]";
         } else {
-            if (code) |src| o = try srv.compute.?.run(a, src, .{ .ctx = &watch, .gone = Watch.left });
-            if (o.status == .cancelled) return error.Cancelled;
-            if (code != null and o.status != .unavailable) executed.* += 1;
-            body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
+            const hook: lane.Cancel = .{ .ctx = &watch, .gone = Watch.left };
+            // S3: the circuit first; a decline, or verify's shadow run, goes to the sandbox as the lane always did
+            if (code) |src| if (srv.compute_exec) |*e| {
+                s3 = try e.run(a, src, hook);
+            };
+            if (s3) |r| if (r == .declined and r.declined == .cancelled) return error.Cancelled;
+            const owned = ownedOf(s3);
+            const shadow = owned != null and srv.compute_exec.?.cfg.verify;
+            var started = owned != null;
+            if (owned == null or shadow) {
+                if (code) |src| o = try srv.compute.?.run(a, src, hook);
+                if (o.status == .cancelled) return error.Cancelled;
+                if (code != null and o.status != .unavailable) started = true;
+                body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
+            }
+            if (started) executed.* += 1;
+            if (owned) |w| if (shadow) {
+                verify = std.mem.eql(u8, w.body, body);
+                if (!verify.?) log.line("warning: compute lane verify: the circuit printed [{s}], the sandbox [{s}]", .{ w.body, body });
+            } else {
+                body = w.body;
+                o = .{ .status = .ok, .exec_ns = w.exec_ns };
+            };
             ran.* += 1;
         }
         slot.* = try report(a, srv.info.compute_tool.name, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
+        if (srv.compute_exec != null) try executor(a, slot.object, s3, verify, s3_api.nowNs() - t0);
     }
     return out;
+}
+
+const s3_api = api.compute_circuit;
+
+/// The circuit's run when it ran the call to its halt; null when declined or S3 is off.
+fn ownedOf(s3: ?s3_api.Outcome) ?s3_api.Owned {
+    const r = s3 orelse return null;
+    return switch (r) {
+        .owned => |w| w,
+        .declined => null,
+    };
+}
+
+/// S3's report fields: who produced the inserted body (never both), what ran it or why the circuit declined.
+fn executor(a: Allocator, r: *json.Object, s3: ?s3_api.Outcome, verify: ?bool, call_ns: u64) Allocator.Error!void {
+    const w = ownedOf(s3);
+    // the server's whole time on the call (translate, queue, run; both executors under verify), beside exec_ms's run
+    try r.put(a, "call_ms", .{ .float = @as(f64, @floatFromInt(call_ns)) / 1e6 });
+    const by_circuit = w != null and verify == null;
+    try r.put(a, "executor", .{ .string = if (by_circuit) s3_api.in_model else s3_api.code_tool });
+    if (by_circuit) {
+        try r.put(a, "program", .{ .string = @tagName(w.?.kind) });
+        try r.put(a, "steps", try json.intValue(a, w.?.steps));
+    } else if (s3) |x| if (x == .declined) try r.put(a, "runner_abstain", .{ .string = @tagName(x.declined) });
+    if (verify) |same| try r.put(a, "verify", .{ .string = if (same) "same" else "differ" });
 }
 
 /// The call's "code" argument, its arguments a JSON object or a JSON string; null when missing or not a string.
@@ -267,6 +315,20 @@ fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.
     try c.put(a, "calls", .{ .array = m.calls.items });
     try c.put(a, "inserted_tokens", try json.intValue(a, m.inserted));
     try c.put(a, "prefix_tokens", try json.intValue(a, m.ids.items.len));
+    try counts(a, c, m.calls.items);
     try rt.put(a, "compute", .{ .object = c });
     return r;
+}
+
+/// S3's per-executor call counts (only when the reports name executors): in-model runner and code tool, never summed.
+fn counts(a: Allocator, c: *json.Object, calls: []const Value) Allocator.Error!void {
+    var by_circuit: i64 = 0;
+    var by_tool: i64 = 0;
+    for (calls) |r| {
+        const e = r.strField("executor") orelse return;
+        if (std.mem.eql(u8, e, s3_api.in_model)) by_circuit += 1 else by_tool += 1;
+    }
+    if (calls.len == 0) return;
+    try c.put(a, "runner_calls", try json.intValue(a, by_circuit));
+    try c.put(a, "tool_calls", try json.intValue(a, by_tool));
 }

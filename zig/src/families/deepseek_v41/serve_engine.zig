@@ -160,6 +160,8 @@ pub const Served = struct {
             s.host.info_.runner = s.host.runner;
             try api.runner.bindings.dsv41.openRoundTrace(&@import("serve_knobs.zig").env); // PREFIX_TRACE
         }
+        // TF_COMPUTE_LANE_RUNNER=1 or TF_DSV41_COMPUTE_LANE_RUNNER=1 (S3, off by default): lane calls on the circuit
+        s.host.info_.compute_runner = try api.compute_circuit.open(binding, gpa, &@import("serve_knobs.zig").env, s.host.info_.compute != null, s.host.runner, engineCpus);
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak

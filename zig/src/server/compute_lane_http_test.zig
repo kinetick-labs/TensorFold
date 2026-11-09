@@ -154,6 +154,8 @@ test "compute lane: a held python call's result is forced in as the template's t
     try t.expectEqualStrings("42", report.strField("output").?);
     try t.expectEqualStrings("ok", report.strField("status").?);
     try t.expect(report.get("inserted").?.bool);
+    // S3 off: the reply names no executor and counts none (the lane's reply as before)
+    try t.expect(report.get("executor") == null and report.get("call_ms") == null and compute.get("runner_calls") == null);
 }
 
 test "compute lane: code_interpreter on a server without the lane is refused before the engine sees it" {
@@ -179,4 +181,131 @@ test "compute lane: code_interpreter on a server without the lane is refused bef
     @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
     try t.expect(reply.code >= 400);
     try t.expect(script.sink == null);
+}
+
+const rapi = api.compute_circuit.api;
+
+/// S3's scripted circuit: code with "abstain" abstains (unsupported), else it runs and prints `out`.
+const Circuit = struct {
+    out: []const u8,
+    fn frontend(c: *Circuit) rapi.Frontend {
+        return .{ .ctx = c, .translate = translate };
+    }
+    fn translate(_: ?*anyopaque, _: Allocator, cell: rapi.Cell) Allocator.Error!rapi.Translation {
+        if (std.mem.indexOf(u8, cell.code, "abstain") != null) return .{ .abstain = .unsupported };
+        return .{ .program = .{ .kind = .calc, .bytes = cell.code } };
+    }
+    fn backend(c: *Circuit) rapi.Backend {
+        return .{ .ctx = c, .vtable = &.{ .start = start, .poll = poll, .cancel = noop, .release = noop } };
+    }
+    fn start(_: *anyopaque, _: u64, _: rapi.Program, _: u64) error{ OutOfMemory, Busy }!rapi.JobId {
+        return 1;
+    }
+    fn poll(ctx: *anyopaque, _: rapi.JobId) rapi.Poll {
+        const c: *Circuit = @ptrCast(@alignCast(ctx));
+        return .{ .done = .{ .status = .ok, .out = c.out, .steps = 3 } };
+    }
+    fn noop(_: *anyopaque, _: u64) void {}
+};
+
+/// A report's millisecond field: a float, or an int when it printed without a fraction.
+fn ms(v: json.Value) f64 {
+    return switch (v) {
+        .float => |x| x,
+        .int => |text| std.fmt.parseFloat(f64, text) catch -1,
+        else => -1,
+    };
+}
+
+/// One held call of `code` through the chat route with S3 on: the forced tokens and the result turn they must equal.
+const S3Run = struct { reply: Reply, inserted: []const u32, want: []const u32, report: json.Value, compute: json.Value };
+
+fn s3Run(a: Allocator, code: []const u8, circuit: *Circuit, sandbox_ok: bool, verify: bool, result: []const u8) !S3Run {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
+    const python = "/usr/bin/python3";
+    std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
+    var tmp = try fixture(a);
+    defer tmp.deinit();
+    var problem: []const u8 = "";
+    const hf = try HfText.load(a, t.io, tmp.path, null, a, &problem);
+    defer hf.deinit();
+    const text = hf.text();
+    const history = try tf.messages(a, "What is 6*7?");
+    const call_turn = try obj(a,
+        \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"python","arguments":""}}]}
+    );
+    const args = try json.newObject(a);
+    try args.put(a, "code", .{ .string = code });
+    const function = call_turn.get("tool_calls").?.array[0].get("function").?;
+    try function.object.put(a, "arguments", .{ .string = try json.stringify(a, .{ .object = args }, .{}) });
+    const asked = try text.renderIds(a, history, .{ .add_generation_prompt = true }, &problem);
+    const called = try text.renderIds(a, try appendTo(a, history, &.{call_turn}), .{ .add_generation_prompt = false }, &problem);
+    const eos = called[called.len - 1];
+    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, "It is 42."), &.{eos} });
+    const script = try a.create(Script);
+    script.* = .{ .a = a, .call = called[asked.len..], .answer = answer };
+    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
+    defer srv.deinit();
+    const cfg: lane.Config = .{ .python = python };
+    srv.info.compute = cfg;
+    // a sandbox that cannot run python would print something else: a circuit-owned call never reaches it
+    const launcher: []const []const u8 = if (sandbox_ok) &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner } else &.{"/nonexistent"};
+    srv.compute = lane.Pool.init(cfg, launcher);
+    srv.compute_exec = .{ .frontend = circuit.frontend(), .backend = circuit.backend(), .max_steps = 1000, .cfg = .{ .verify = verify } };
+    var reply: Reply = .{ .a = a };
+    var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
+    defer conn.deinit();
+    const body = try json.newObject(a);
+    try body.put(a, "model", .{ .string = "m" });
+    try body.put(a, "max_tokens", try json.intValue(a, 400));
+    try body.put(a, "messages", history);
+    try body.put(a, "tools", try obj(a, "[{\"type\":\"code_interpreter\"}]"));
+    @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
+    errdefer std.debug.print("S3_REPLY {s}\n", .{json.stringify(a, reply.body, .{}) catch ""});
+    try t.expectEqual(@as(u16, 200), reply.code);
+    const turn = try obj(a, "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"\"}");
+    try turn.object.put(a, "content", .{ .string = result });
+    const full = try text.renderIds(a, try appendTo(a, history, &.{ call_turn, turn }), .{ .add_generation_prompt = true }, &problem);
+    const compute = reply.body.get("tensorfold").?.get("compute").?;
+    return .{ .reply = reply, .inserted = script.resumes.items[0], .want = full[called.len..], .report = compute.get("calls").?.array[0], .compute = compute };
+}
+
+test "compute runner: a held call the circuit runs inserts the lane's own result turn, named in-model runner" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var c: Circuit = .{ .out = "42\n" };
+    const r = try s3Run(arena.allocator(), "print(6*7)", &c, false, false, "42");
+    try t.expectEqualSlices(u32, r.want, r.inserted);
+    try t.expectEqualStrings("in-model runner", r.report.strField("executor").?);
+    try t.expectEqualStrings("calc", r.report.strField("program").?);
+    // the server's time on the call covers the run's own
+    try t.expect(ms(r.report.get("call_ms").?) >= ms(r.report.get("exec_ms").?));
+    try t.expectEqual(@as(i64, 1), r.compute.get("runner_calls").?.int64().?);
+    try t.expectEqual(@as(i64, 0), r.compute.get("tool_calls").?.int64().?);
+}
+
+test "compute runner: a call the circuit declines runs in the sandbox, named code tool with the reason" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var c: Circuit = .{ .out = "wrong\n" };
+    const r = try s3Run(arena.allocator(), "print(42)  # abstain", &c, true, false, "42");
+    try t.expectEqualSlices(u32, r.want, r.inserted);
+    try t.expectEqualStrings("code tool", r.report.strField("executor").?);
+    try t.expectEqualStrings("unsupported", r.report.strField("runner_abstain").?);
+    try t.expect(r.report.get("program") == null);
+    try t.expectEqual(@as(i64, 0), r.compute.get("runner_calls").?.int64().?);
+    try t.expectEqual(@as(i64, 1), r.compute.get("tool_calls").?.int64().?);
+}
+
+test "compute runner: verify inserts the sandbox's result and reports a circuit that printed otherwise" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var c: Circuit = .{ .out = "41\n" };
+    const r = try s3Run(arena.allocator(), "print(6*7)", &c, true, true, "42");
+    try t.expectEqualSlices(u32, r.want, r.inserted);
+    try t.expectEqualStrings("code tool", r.report.strField("executor").?);
+    try t.expectEqualStrings("differ", r.report.strField("verify").?);
+    var same: Circuit = .{ .out = "42\n" };
+    const s = try s3Run(arena.allocator(), "print(6*7)", &same, true, true, "42");
+    try t.expectEqualStrings("same", s.report.strField("verify").?);
 }

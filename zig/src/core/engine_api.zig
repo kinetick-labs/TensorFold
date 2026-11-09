@@ -19,6 +19,8 @@ pub const kv_ledger = @import("kv_ledger.zig");
 pub const hold = @import("engine_hold.zig");
 /// The in-model runner a family opens from its binding's knobs (runner_binding.zig); the server gives it the tokenizer.
 pub const runner = @import("runner_open.zig");
+/// S3: the compute lane's calls the in-model runner can run, on the circuit (off by default; compute_circuit.zig).
+pub const compute_circuit = @import("compute_circuit.zig");
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
 
@@ -255,6 +257,7 @@ pub const Info = struct {
     compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
     compute_tool: hold.compute_lane.Tool = .{}, // the built-in tool its binding names (compute_binding.zig)
     runner: ?*runner.Runner = null, // the in-model runner: the server gives it the tokenizer and chats set run_cells
+    compute_runner: ?compute_circuit.Setup = null, // S3: lane calls the circuit can run go there (compute_circuit.zig)
 
     pub const Capability = @import("engine_capabilities.zig").Capability;
 
