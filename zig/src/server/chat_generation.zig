@@ -5,6 +5,7 @@ const json = @import("json");
 const chat = @import("chat.zig");
 const reply_text = @import("reply_text.zig");
 const recipient_reply = @import("recipient_reply.zig");
+const reply_owned = @import("reply_owned.zig");
 const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_lfm2 = @import("tool_lfm2.zig");
@@ -77,6 +78,7 @@ pub const Generation = struct {
     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
     lane_own: bool = false, // Input.lane_own: a call max_tokens cut never shows as prose, as the reply's own call
+    owned: ?reply_owned.Owned = null, // engine-owned bytes of this segment's content (reply_owned.of its cell writes)
     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
@@ -368,14 +370,15 @@ pub const Generation = struct {
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
             const cut = g.lane_own and std.mem.eql(u8, reason, "length");
-            const shown = if (cut) try reply_text.cutProse(a, content) else if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking or g.recipient != null) content else text, g.tools, reason, g.single) else content;
+            const o = reply_text.openersOf(g.srv.markers);
+            const shown = if (cut) try reply_owned.cutProse(a, content, o, g.owned) else if (g.calls != null) try tool_stream.endProseOwned(a, content, if (g.thinking or g.recipient != null) content else text, g.tools, reason, g.single, o, g.owned) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (rest.len > 0) try g.emit(sink, .{ .string = rest });
             if (g.calls) |*c| {
                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
                 var out: std.ArrayList(Value) = .empty;
-                const final_text = if (read) content else text;
+                const final_text = if (g.thinking or g.recipient != null) content else text;
                 if (std.mem.eql(u8, reason, "length")) {
                     try c.finishCut(final_text, &out);
                 } else if (close.len > 0 or c.streamed or g.recipient != null) {
@@ -444,6 +447,7 @@ pub const Generation = struct {
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
             .native_tool_format = native != null,
             .native_calls = if (native) |n| n.calls else null,
+            .owned = g.owned,
             .finish_reason = reason,
             .prompt_tokens = prompt_len,
             .cached_tokens = cached_tokens.within(m.cached, prompt_len),

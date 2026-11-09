@@ -5,6 +5,8 @@ const json = @import("json");
 const errors = @import("errors.zig");
 const chat = @import("chat.zig");
 const tool_specs = @import("tool_specs.zig");
+const reply_text = @import("reply_text.zig");
+const reply_owned = @import("reply_owned.zig");
 const Server = @import("server.zig").Server;
 const lane = api.hold.compute_lane;
 const Value = json.Value;
@@ -166,8 +168,8 @@ pub fn ownedByServer(srv: *const Server, raw: ?Value, specs: []const Value) bool
     return false;
 }
 
-/// A reply's calls for its client (`own`: the default's tool `n`, whose unrun calls end the reply at length, unseen).
-pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
+/// A reply's calls for its client (`own`: the default's tool `n`, unrun calls cut `prose` at `o`, `owned` bytes kept).
+pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, found: ?[]Value, prose: []const u8, o: reply_text.Openers, owned: ?reply_owned.Owned) Allocator.Error!?[]Value {
     if (!own) return found;
     const all: []const Value = found orelse &.{};
     var kept: std.ArrayList(Value) = .empty;
@@ -175,7 +177,7 @@ pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, foun
     const dropped = kept.items.len < all.len;
     // a call the lane could not run (no room left), or one max_tokens cut: the budget ended the reply
     if (dropped or (found == null and std.mem.eql(u8, reply.finish_reason, "length"))) {
-        reply.content = try @import("reply_text.zig").cutProse(a, prose);
+        reply.content = try reply_owned.cutProse(a, prose, o, owned);
         reply.finish_reason = "length";
     }
     return if (kept.items.len > 0) kept.items else null;
