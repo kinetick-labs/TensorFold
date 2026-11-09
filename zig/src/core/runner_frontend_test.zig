@@ -5,6 +5,9 @@ const t = std.testing;
 test {
     _ = @import("runner_frontend_integer_test.zig");
     _ = @import("runner_frontend_integer_python.zig");
+    _ = @import("runner_frontend_integer_def_test.zig");
+    _ = @import("runner_frontend_integer_list_test.zig");
+    _ = @import("runner_frontend_integer_loop_test.zig");
     _ = @import("runner_frontend_algorithm_test.zig");
     _ = @import("runner_frontend_cwide_test.zig");
     _ = @import("runner_frontend_blocks_test.zig");
