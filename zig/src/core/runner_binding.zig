@@ -2,21 +2,52 @@
 const std = @import("std");
 const runner = @import("runner.zig");
 const log = std.log.scoped(.runner);
+const quiet_max = @import("runner_scan_quiet.zig").max;
+
+/// What the runner must know of a family's chat markup, taken from its chat template and tokenizer.
+pub const Family = struct {
+    quiet: []const [2][]const u8 = &.{}, // opener and closer of text no cell is read in: tool calls, tool results
+    never: []const []const u8 = &.{}, // markup an owned result may not spell (it would read as a call or a think end)
+    trust: ?[]const u8 = null, // the compute default's guide, measured on this family; null: none yet, chats get none
+
+    /// Whether `out` spells any of the family's markup: such a result is the model's to write, never owned.
+    pub fn unsafe(f: Family, out: []const u8) bool {
+        for (f.never) |m| if (std.mem.indexOf(u8, out, m) != null) return true;
+        return false;
+    }
+
+    /// Marks `res` abstained (`markup`) when its output spells the family's markup; true when it did.
+    pub fn screen(f: Family, res: *@import("runner_api.zig").Result) bool {
+        if (!f.unsafe(res.out)) return false;
+        res.status = .abstain;
+        res.abstain = .markup;
+        return true;
+    }
+};
 
 pub const Binding = struct {
     prefix: []const u8 = "TF_RUNNER", // PREFIX=1 enables; PREFIX_CIRCUIT, PREFIX_FORMS, ... (runner.Config.parse)
     alias: ?[]const u8 = null, // the family's own older names for the same knobs: a boot switches one or the other on
+    family: Family = .{},
 
     /// The runner's config under the prefix whose switch the boot set; both switches set is error.BadKnob.
     pub fn parse(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!?runner.Config {
         // by the switch alone: TF_RUNNER_CIRCUIT, _CLANG and _LLD also name tools for tests and image checks
-        const old = b.alias orelse return runner.Config.parse(get, b.prefix);
-        if (!set(get(old))) return runner.Config.parse(get, b.prefix);
+        const old = b.alias orelse return b.of(try runner.Config.parse(get, b.prefix));
+        if (!set(get(old))) return b.of(try runner.Config.parse(get, b.prefix));
         if (set(get(b.prefix))) {
             log.warn("turn the in-model runner on with {s} or {s}, not both", .{ b.prefix, old });
             return error.BadKnob;
         }
-        return runner.Config.parse(get, old);
+        return b.of(try runner.Config.parse(get, old));
+    }
+
+    fn of(comptime b: Binding, parsed: ?runner.Config) ?runner.Config {
+        comptime for (b.family.quiet) |s| std.debug.assert(s[0].len > 0 and s[0].len <= quiet_max and s[1].len <= quiet_max);
+        var c = parsed orelse return null;
+        c.family = b.family;
+        c.scan.quiet = b.family.quiet;
+        return c;
     }
 
     /// The prefix a boot's knobs are read under: the alias when its switch is set, else the generic one.
@@ -54,10 +85,8 @@ fn set(v: ?[]const u8) bool {
     return if (v) |s| s.len > 0 else false;
 }
 
-/// DeepSeek-V4.1: the generic names, or TF_DSV41_RUNNER* as before.
-pub const dsv41: Binding = .{ .alias = "TF_DSV41_RUNNER" };
-/// Qwen3.8 Flash-Next (`qwen4_exp`): the generic names only. Its serve engine does not read it yet.
-pub const flashnext: Binding = .{};
+/// DeepSeek-V4.1: the generic names, or TF_DSV41_RUNNER* as before; AB3's tool-full guide is its trust guide.
+pub const dsv41: Binding = .{ .alias = "TF_DSV41_RUNNER", .family = .{ .trust = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand." } };
 
 const t = std.testing;
 
@@ -79,12 +108,16 @@ test "runner binding: the generic names or the family's alias, never both switch
     try t.expectEqualStrings("/g.tfpc", generic.circuit);
     try t.expect(generic.scan.inline_math and !generic.scan.fence);
     try t.expectEqualStrings("TF_RUNNER", dsv41.active(&Env.get));
-    try t.expectEqualStrings("/g.tfpc", (try flashnext.parse(&Env.get)).?.circuit);
+    const plain: Binding = .{ .family = .{ .quiet = &.{.{ "<a>", "</a>" }}, .never = &.{"</a>"} } };
+    const fam = (try plain.parse(&Env.get)).?;
+    try t.expectEqualStrings("/g.tfpc", fam.circuit);
+    try t.expectEqualStrings("</a>", fam.scan.quiet[0][1]);
+    try t.expect(fam.family.unsafe("1 </a>") and !fam.family.unsafe("42") and fam.family.trust == null);
     Env.pairs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_DSV41_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/g.tfpc" } };
     try t.expectError(error.BadKnob, dsv41.parse(&Env.get));
     Env.pairs = &.{.{ "TF_RUNNER_CIRCUIT", "/test.tfpc" }};
     try t.expect((try dsv41.parse(&Env.get)) == null);
-    try t.expect((try flashnext.parse(&Env.get)) == null);
+    try t.expect((try plain.parse(&Env.get)) == null);
 }
 
 test "runner binding: the round trace stays off unless asked, and a bad round count is refused" {

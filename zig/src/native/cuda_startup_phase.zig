@@ -29,6 +29,7 @@ pub fn serve(h: anytype, io: std.Io, facts: lanes.Model, rows: u32, info: api.In
     h.core = lanes.Engine.init(h.gpa, &h.cfg, callbacks.backend(h), h.clock.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+    h.host.runner = info.runner; // code cells replies write run here (Request.run_cells)
     h.host.on_thread = .{ .ctx = h, .run = callbacks.initThread };
     h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
     h.host.explain = explain;

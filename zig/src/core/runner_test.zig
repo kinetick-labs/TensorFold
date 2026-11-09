@@ -543,7 +543,7 @@ test "runner: inline provenance tags only successful owned inline values" {
         const off = try one(lead, .{ .inline_math = true });
         defer gpa.free(off);
         try t.expectEqualStrings(off, got);
-        try t.expect(std.mem.indexOf(u8, got, runner.inline_mark_suffix) == null);
+        try t.expect(std.mem.indexOf(u8, got, @import("runner_output.zig").suffix) == null);
     }
     const cell = "```python\nprint(2**100)\n```\nResult:\n";
     const marked = try one(cell, .{ .inline_mark = true });
