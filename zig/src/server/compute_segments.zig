@@ -5,6 +5,7 @@ const json = @import("json");
 const chat = @import("chat.zig");
 const reply_text = @import("reply_text.zig");
 const tool_parse = @import("tool_parse.zig");
+const reply_owned = @import("reply_owned.zig");
 const tool_stream = @import("tool_stream.zig");
 const prompt_mod = @import("prompt.zig");
 const turns = @import("compute_turns.zig");
@@ -29,6 +30,7 @@ const Merge = struct {
     inserted: usize = 0,
     calls: std.ArrayList(Value) = .empty, // one report a call
     ran: usize = 0, // the calls the sandbox ran (Reply.compute_ran)
+    owned: ?reply_owned.Owned = null, // the segments' engine-owned bytes in `content`
     history: std.ArrayList(Value) = .empty, // the request's messages, then each segment's call turn and results
 };
 
@@ -228,7 +230,9 @@ fn lost(e: anyerror) chat.Failure!?[]const u32 {
 
 /// A finished held segment into the merge: its words, its tokens and the result inserted after it.
 fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted: []const u32) Allocator.Error!void {
-    try m.content.appendSlice(a, (try tool_parse.parse(a, seg.content, g.tools, null)).content);
+    const parsed = try tool_parse.parseOwned(a, seg.content, g.tools, null, seg.owned);
+    m.owned = reply_owned.Owned.join(m.owned, reply_owned.Owned.shift(parsed.owned, m.content.items.len));
+    try m.content.appendSlice(a, parsed.content);
     if (seg.reasoning) |r| try m.reasoning.appendSlice(a, r);
     m.completion += seg.completion_tokens;
     m.reasoning_tokens += seg.reasoning_tokens;
@@ -241,6 +245,7 @@ fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted
 fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.Failure!chat.Reply {
     var r = last;
     if (m.content.items.len > 0) r.content = try std.mem.concat(a, u8, &.{ m.content.items, last.content });
+    r.owned = reply_owned.Owned.join(m.owned, reply_owned.Owned.shift(last.owned, m.content.items.len));
     if (m.reasoning.items.len > 0) r.reasoning = try std.mem.concat(a, u8, &.{ m.reasoning.items, last.reasoning orelse "" });
     r.completion_tokens += m.completion;
     r.reasoning_tokens += m.reasoning_tokens;
