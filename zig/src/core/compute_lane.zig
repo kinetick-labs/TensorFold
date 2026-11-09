@@ -5,6 +5,10 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 pub const sandbox = @import("compute_sandbox.zig");
 pub const runner = @import("compute_runner.zig");
+/// A family's knob names and built-in tool (compute_binding.zig).
+pub const Binding = @import("compute_binding.zig").Binding;
+pub const Tool = @import("compute_binding.zig").Tool;
+pub const bindings = @import("compute_binding.zig");
 const log = std.log.scoped(.compute_lane);
 
 pub const Config = struct {
@@ -17,6 +21,9 @@ pub const Config = struct {
     python: []const u8 = "/usr/bin/python3",
     cpus: []const u8 = "", // optional affinity list like "16-19" or "1,3,5-7"
     default: bool = false, // PREFIX_DEFAULT=1: every thinking chat gets the built-in tool, whatever it sends
+
+    /// The knobs `parse` reads, after the prefix.
+    pub const knobs = [_][]const u8{ "", "_DEFAULT", "_WORKERS", "_MAX_MS", "_MAX_RESULT_TOKENS", "_MAX_CALLS", "_MEM_MB", "_PYTHON", "_CPUS" };
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {

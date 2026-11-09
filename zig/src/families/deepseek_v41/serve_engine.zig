@@ -148,8 +148,10 @@ pub const Served = struct {
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .benchmark_ranks = m.session.nccl.size, .benchmark_group = m.benchmark_group, .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
         s.host.info_.draft_sources = draftSources(m.pass != null, s.cfg.max_copy > 0);
-        // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
-        s.host.info_.compute = try api.hold.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
+        // TF_COMPUTE_LANE=1 or TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS
+        const binding = api.hold.compute_lane.bindings.dsv41;
+        s.host.info_.compute = try binding.parse(&@import("serve_knobs.zig").env);
+        s.host.info_.compute_tool = binding.tool;
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
