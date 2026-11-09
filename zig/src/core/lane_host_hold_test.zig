@@ -164,3 +164,46 @@ test "compute hold: a held reply that is cancelled ends cancelled, in the defaul
     try heldReply(false, .cancel);
     try heldReply(true, .cancel);
 }
+
+const Shape = enum { plain, mtp, mtp_no_drafts };
+
+/// A result whose rows hold the EOS (ChatML closes the tool turn with `<|im_end|>`, Qwen's EOS): it lands whole.
+fn forcedEos(shape: Shape) !void {
+    const eos = try eosAfter(&prompt);
+    const result = [_]u32{ 11, 22, 33, eos.token, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24, eos.token, 35 };
+    var costs: [16]lanes.config.Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
+    // Flash-Next's lanes model (families/flashnext/batch_costs.zig): MTP head drafts over 16-row windows
+    const model: lanes.config.Model = if (shape == .plain) .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true } else .{ .exact_width = 16, .first_copy_rows = 4, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 16, .max_streams = 2, .draft_streams = true };
+    var cfg = try lanes.Config.init(gpa, model, if (shape == .plain) 8 else 16, if (shape == .plain) 7 else 15);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    var box: Box = .{};
+    defer box.tokens.deinit(gpa);
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 80, .eos = &.{eos.token}, .hold_eos = true, .drafts = shape != .mtp_no_drafts };
+    const e = host.engine();
+    try host.start();
+    defer host.stop();
+    try e.submit(7, &request, .{ .ctx = &box, .event = Box.event });
+    errdefer e.cancel(7); // a stream held again would keep the host from stopping
+    try box.reach(eos.at + 1);
+    try std.testing.expect(api.hold.resumeHeld(e, 7, .{ .tokens = &result }));
+    // every forced row and the model's next draw arrive: a forced EOS neither holds nor ends the reply
+    try box.reach(eos.at + 1 + result.len + 1);
+    const c = box.count();
+    try std.testing.expect(c.n >= eos.at + 1 + result.len + 1);
+    try std.testing.expectEqualSlices(u32, &result, box.tokens.items[eos.at + 1 .. eos.at + 1 + result.len]);
+    e.cancel(7);
+    _ = try box.wait();
+}
+
+test "compute hold: a result whose forced rows hold the EOS lands whole, plain, MTP-drafted and MTP without drafts" {
+    try forcedEos(.plain);
+    try forcedEos(.mtp);
+    try forcedEos(.mtp_no_drafts);
+}

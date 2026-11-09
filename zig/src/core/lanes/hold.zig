@@ -38,10 +38,17 @@ pub fn resumeHeld(s: *Stream, gpa: Allocator, tokens: []const u32, think_open: b
         return if (tokens.len == 0) .ended else .no_room;
     }
     try s.force.appendSlice(gpa, tokens);
+    s.resumed_rows = tokens.len;
     s.held = false;
     s.paused = false;
     s.think_open = think_open;
     return .resumed;
+}
+
+/// Whether the token landing now is a resumeHeld result's row: the template's, so its EOS neither holds nor ends.
+pub fn resultRow(s: *Stream) bool {
+    defer s.resumed_rows -|= 1;
+    return s.resumed_rows > 0;
 }
 
 /// Continues a stream held at a runner trigger: `tokens` (cut to the room left) are forced next, then the model draws.
