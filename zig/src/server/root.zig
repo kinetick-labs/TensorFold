@@ -244,6 +244,7 @@ test {
     _ = @import("compute_turns.zig");
     _ = @import("compute_segments.zig");
     _ = @import("compute_lane_http_test.zig");
+    _ = @import("compute_lane_chatml_test.zig");
     _ = @import("compute_default_test.zig");
     _ = @import("compute_default_fit_test.zig");
     _ = @import("reply_owned_test.zig");
