@@ -106,6 +106,7 @@ test {
     _ = @import("runner_frontend_coverage_test.zig");
     _ = @import("runner_frontend_notation_test.zig");
     _ = @import("runner_frontend_boot.zig");
+    _ = @import("runner_frontend_boot_main.zig");
 }
 
 test "real compiler emits circuit ELF for loops and C with negative controls" {

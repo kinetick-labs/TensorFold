@@ -50,6 +50,9 @@ pub const Reserve = struct {
     give: *const fn (ctx: *anyopaque, s: *Stream) void,
 };
 
+/// A scripted target: its draw after `history` (prompt and reply so far).
+pub const Script = struct { ctx: *anyopaque, next: *const fn (ctx: *anyopaque, history: []const u32) u32 };
+
 pub const Fake = struct {
     /// A ring slot: the draw it holds (null: free) and whether it still blocks a queued draw.
     const Slot = struct { handle: ?u64 = null, blocking: bool = false };
@@ -92,6 +95,7 @@ pub const Fake = struct {
     image_rows: usize = 0, // image rows fed (`image_words`): the rows a tower had to make
     gpu_charge: ?f64 = null, // each verify and step charges its streams this many GPU seconds, as a timed backend does
     head_accepts: ?usize = null, // head drafts a round right before one wrong (null: one in five wrong)
+    script: ?Script = null, // the target's draws come from here instead (a scripted model)
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -254,6 +258,7 @@ pub const Fake = struct {
     }
 
     fn targetNext(x: *Fake, history: []const u32, sampling: ?Sampling, position: u64) u32 {
+        if (x.script) |sc| return sc.next(sc.ctx, history);
         if (x.cycle_after) |start| if (history.len >= x.probe_prompt) {
             const reply = history[x.probe_prompt..];
             if (std.mem.indexOfScalar(u32, reply, 91)) |close| {

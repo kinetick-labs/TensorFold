@@ -39,6 +39,7 @@ pub const Mailbox = struct {
                 m.chunks.append(m.gpa, m.tokens.items.len) catch {};
             },
             .audio => |n| m.audio = n,
+            .cells => {}, // runner records: the server takes them with the runner (run_cells)
             .finished => |f| {
                 m.finished = true;
                 m.reason = f.reason;

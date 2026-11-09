@@ -17,6 +17,8 @@ pub const embedding_vector = @import("embedding_vector.zig");
 pub const load_ledger = @import("load_ledger.zig");
 pub const kv_ledger = @import("kv_ledger.zig");
 pub const hold = @import("engine_hold.zig");
+/// The in-model runner a family opens from its binding's knobs (runner_binding.zig); the server gives it the tokenizer.
+pub const runner = @import("runner_open.zig");
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
 
@@ -96,6 +98,9 @@ pub const Request = struct {
     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
     cache_key: []const u32 = &.{},
     hold_eos: bool = false, // at an EOS the stream holds for hold.resumeHeld (a built-in tool's result), not finishing
+    run_cells: bool = false, // code cells the reply writes run on the host's in-model runner (core/runner.zig)
+    run_trace: runner.TraceAsk = .{}, // with run_cells: the request's own say over form trace
+    run_commit: @import("runner_commit.zig").Ask = .{}, // with run_cells: the answer-commit's settings (PREFIX_COMMIT)
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -153,8 +158,9 @@ pub const Event = union(enum) {
     /// Tokens committed for this request, in order; valid only during the call.
     tokens: []const u32,
     audio: usize,
-    /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
-    finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "" },
+    cells: []const @import("runner_receipt.zig").Note, // runner records new or grown, ahead of the tokens they land
+    /// The reply ended; nothing follows. ``message`` says why a failed reply failed; ``runner`` is its runner receipt.
+    finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "", runner: []const u8 = "" },
 };
 
 /// Where a request's events go. Called on the engine's thread: it must return at once and not re-enter the engine.
@@ -248,6 +254,7 @@ pub const Info = struct {
     media: bool = false,
     compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
     compute_tool: hold.compute_lane.Tool = .{}, // the built-in tool its binding names (compute_binding.zig)
+    runner: ?*runner.Runner = null, // the in-model runner: the server gives it the tokenizer and chats set run_cells
 
     pub const Capability = @import("engine_capabilities.zig").Capability;
 
