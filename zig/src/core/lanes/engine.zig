@@ -119,6 +119,7 @@ pub const Engine = struct {
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
         _ = e.arena.reset(.retain_capacity);
+        if (@import("round_trace.zig").on()) @import("round_trace.zig").before(e);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
         e.steps += 1;
@@ -157,6 +158,7 @@ pub const Engine = struct {
             }
         }
         try trail.resolve(e);
+        if (@import("round_trace.zig").on()) @import("round_trace.zig").after(e);
         try e.sweep();
         try trail.state(e);
     }
@@ -268,10 +270,7 @@ pub const Engine = struct {
         var path: []u32 = undefined;
         var committed: std.ArrayList(u32) = .empty;
         if (p.kind == .forced) {
-            path = try a.alloc(u32, rows);
-            for (path, 0..) |*r, i| r.* = @intCast(i);
-            try committed.appendSlice(a, p.forced);
-            try committed.append(a, s.popForce() orelse sampled[rows - 1]);
+            path = try @import("forced_drafts.zig").conclude(e, s, p, tokens, sampled, &committed);
         } else {
             path = try accept.acceptPath(a, tokens, parents, sampled);
             for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
@@ -360,7 +359,8 @@ pub const Engine = struct {
         }
         const landed = try s.commit(e.gpa, committed.items, committed_rows);
         const got = committed.items[0..landed];
-        if ((s.finished or s.held) and got.len < path.len) path = path[0 .. got.len + @intFromBool(s.finished)]; // held: EOS row reruns
+        // held: the EOS row reruns; settled at a trigger (cut): its last kept token reruns, forced next
+        if ((s.finished or s.held or s.settle == .cut) and got.len < path.len) path = path[0 .. got.len + @intFromBool(s.finished and !s.held and s.settle != .cut)];
         const keep = path.len;
         s.cache_len += keep;
         s.pending = committed.items[keep - 1];
@@ -379,7 +379,7 @@ pub const Engine = struct {
     /// Read the kept rows with their following tokens and ask the head for the next round's drafts.
     pub fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
         var w = win.who(s);
-        const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
+        const d: u32 = @intCast(try @import("forced_drafts.zig").headDepth(e, s, &w, budget, win.probe(e)));
         const request: be.DraftRequest = .{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d };
         if (!e.late.put(e.backend.defer_lone_draft and e.alone, request)) try e.askDrafts(&.{request});
     }

@@ -158,6 +158,7 @@ pub const Served = struct {
             rc.place.engine = engineCpus; // PREFIX_CPUS=auto keeps the runner's threads off these
             s.host.runner = try api.runner.open(gpa, rc);
             s.host.info_.runner = s.host.runner;
+            try api.runner.bindings.dsv41.openRoundTrace(&@import("serve_knobs.zig").env); // PREFIX_TRACE
         }
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };

@@ -26,6 +26,7 @@ pub const Model = struct {
     mtp: bool = false, // a draft head is loaded
     speculate: bool = false, // the head can draft from a verify's rows
     speculate_early: bool = true, // draft every row's first draft behind the verify
+    forced_drafts: bool = false, // a lone window holding a forced tail takes the last fed row's drafts past it
     draft_prior: []const f64 = &.{}, // the head's acceptance by depth until a stream has its own
     depth_rate: f64 = 0, // the newest round's weight in a depth's acceptance estimate (0: the core's)
     plain_guard: bool = false, // plain rounds compete with drafted depths
@@ -77,6 +78,7 @@ pub const Config = struct {
     base_width: u32,
     family_mtp: bool,
     speculate_early: bool,
+    forced_drafts: bool = false, // Model.forced_drafts
     pipelined: bool,
     plain_guard: bool,
     most_drafts: u32,
@@ -168,6 +170,7 @@ pub const Config = struct {
             .base_width = @min(width, first_copy + 1),
             .family_mtp = m.mtp and width >= 2 and m.speculate,
             .speculate_early = m.speculate_early and !(m.root_copies and m.copy_drafts),
+            .forced_drafts = m.forced_drafts,
             .pipelined = m.gpu_tokens,
             .plain_guard = m.plain_guard,
             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
