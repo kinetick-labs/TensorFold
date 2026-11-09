@@ -22,6 +22,12 @@ pub fn steps(b: *std.Build) void {
     const hold = b.step("test-compute-hold-host", "Replies held at an EOS for a server tool's result, then resumed or ended, without devices");
     hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"compute hold:"} })).step);
     hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"compute hold:"} })).step);
+    b.step("test-runner-abstain-host", "Abstain records: each abstained cell's source, reason and decision point").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner abstain records:"} })).step);
+    b.step("test-runner-host", "The in-model runner: scanner, held results and delivery with a fake circuit backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner"} })).step);
+    // proof 2 on the real circuit (TF_RUNNER_CIRCUIT): optimized, since a debug evaluator takes minutes a run
+    const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+    const api_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_fast }} });
+    @import("runner_proof_shards.zig").steps(b, api_fast);
     const copies = b.step("test-root-copy-host", "Root copy precedence, drafter absorption and real worker checks without GPU");
     copies.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"root copy:"} })).step);
     copies.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"root copy:"} })).step);

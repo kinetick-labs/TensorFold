@@ -47,6 +47,7 @@ pub const LaneHost = struct {
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
     cancels: std.ArrayList(Id) = .empty,
+    runner: ?*@import("runner.zig").Runner = null, // runs the code cells replies write (Request.run_cells)
     resumes: std.ArrayList(holds.Pending) = .empty, // results for held replies (lane_host_hold.zig)
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
@@ -280,7 +281,10 @@ pub const LaneHost = struct {
 
     /// Hands a stream the tokens its rounds committed since the last delivery (their logprob rows first).
     pub fn send(h: *LaneHost, job: *Job) void {
-        const emitted = job.stream.emitted();
+        const all = job.stream.emitted();
+        const emitted = all[0 .. all.len - @intFromBool(job.stream.runner_eos_pending)];
+        // the runner records as they stand (records on), ahead of the tokens they land: a cut stream keeps them
+        if (job.runner) |rs| if (@import("runner_receipt.zig").notes(rs)) |n| emit(job, .{ .cells = n });
         if (emitted.len > job.delivered) {
             if (job.stream.logprobs != null) emit(job, .{ .logprobs = job.stream.rows.items[job.delivered..emitted.len] });
             emit(job, .{ .tokens = emitted[job.delivered..] });
@@ -319,7 +323,8 @@ pub const LaneHost = struct {
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .grammar = if (s.grammar_time.windows > 0) s.grammar_time else null, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .prefill_widths = s.prefill_widths.items, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         var told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
         told.queued_seconds = if (job.admitted_ns) |at| @as(f64, @floatFromInt(@max(0, at - job.submitted))) / 1e9 else 0;
-        emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
+        const summary = if (job.runner) |rs| rs.receipt() else ""; // the session's buffer: freed with it, after the emit
+        emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message, .runner = summary } });
         if (job.started) {
             if (s.grammar) |g| g.deinit(h.gpa);
             s.deinit(h.gpa);
@@ -518,6 +523,7 @@ pub const LaneHost = struct {
             defer activity.end();
             ends.takeCancels(h);
             holds.take(h);
+            @import("lane_host_runner.zig").tick(h);
             pressure.step(h);
             rows_host.answer(h);
             scoring.answer(h);
@@ -555,7 +561,7 @@ pub const LaneHost = struct {
                 activity.end();
                 if (rows_host.idle(h)) continue;
                 if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or admit.holds(h)))
-                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(@import("lane_host_runner.zig").idleWait(h, 100)), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;
             }

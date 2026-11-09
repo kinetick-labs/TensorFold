@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
     @import("zig/build/lane_halt_host.zig").steps(b);
     @import("zig/build/cache_replay.zig").steps(b);
     @import("zig/build/runner_place.zig").steps(b);
+    @import("zig/build/runner_cost.zig").steps(b);
     @import("zig/build/dsv41_shared.zig").steps(b);
     @import("zig/build/dsv41_cuda.zig").steps(b);
     @import("zig/build/dsv41_state.zig").steps(b);
@@ -81,6 +82,7 @@ pub fn build(b: *std.Build) void {
     defer @import("zig/build/host_tests.zig").wire(b, target);
     @import("zig/build/copy_source.zig").steps(b);
     @import("zig/build/checkpoint_io_host.zig").steps(b, target);
+    @import("zig/build/runner_frontend.zig").linkCheck(b, target);
     if (target.result.os.tag == .macos) @import("zig/build/masked_values.zig").steps(b, target, .ReleaseSafe);
     const release_version = b.option([]const u8, "version", "Release version, exactly MAJOR.MINOR.PATCH");
     if (release_version) |v| if (!dist_build.validVersion(v)) @panic("-Dversion must be exactly MAJOR.MINOR.PATCH");

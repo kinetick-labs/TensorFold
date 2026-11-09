@@ -19,6 +19,7 @@ pub const Job = struct {
     recall: recalls.Slot = .{}, // its reads of Recall's record (lane_host_recall.zig)
     /// the family's proposer (LaneHost.proposers), in place of `proposer`
     custom: ?lanes.proposer.Proposer = null,
+    runner: ?*@import("runner.zig").Session = null, // its in-model runner session (Request.run_cells)
     delivered: usize = 0,
     started: bool = false,
     prefill_sent: bool = false, // a lone driver's prefilled event went out
