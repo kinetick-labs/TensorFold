@@ -9,8 +9,10 @@ const maxTraceRepeat = @import("engine_api").runner.maxTraceRepeat;
 /// RUNNER-GUIDE.md without its final newline (76 tokens on DeepSeek V4.1).
 pub const text = "Exact computation is available. Write the full expression inline as `<expr> =`, or a Python fenced cell with `print(<expr>)` followed by a `Result:` header. The exact value will follow. Request the whole computation early; wait for the result instead of working digits, loops, carries or long division by hand. Unsupported requests leave your own continuation.";
 
-/// The trust guide AB3's tool-full arm sent as each request's "runner_guide" (512 bytes); the compute default's guide.
-pub const trust = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand.";
+/// The trust guide AB3's tool-full arm sent as each request's "runner_guide" (512 bytes): DeepSeek-V4.1's binding's.
+pub const trust = @import("engine_api").runner.bindings.dsv41.family.trust.?;
+/// AB3's bytes as the arm sent them: the binding's text must stay these.
+const ab3 = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand.";
 
 /// The most a request's own "runner_guide" may hold.
 pub const max_request = 512;
@@ -172,6 +174,7 @@ test "runner guide: the trust guide is AB3's tool-full text, byte for byte" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(trust, &digest, .{});
     try std.testing.expectEqualStrings("53ed328f72e2e79076aaf9e7ce2a1da1b11f3cae7ed22b76798b15c6e59add92", &std.fmt.bytesToHex(digest, .lower));
+    try std.testing.expectEqualStrings(ab3, trust);
     try std.testing.expectEqual(max_request, trust.len);
     try std.testing.expectEqualStrings(trust, trim(trust)); // a request sending it injected these same bytes
 }

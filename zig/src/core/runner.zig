@@ -12,9 +12,6 @@ const log = std.log.scoped(.runner);
 const output = @import("runner_output.zig");
 const answer = @import("runner_commit.zig");
 
-/// Opt-in attribution on a successfully owned inline value; plain-text tokens, not a special token.
-pub const inline_mark_suffix = output.suffix;
-
 pub const Config = struct {
     scan: scan.Config = .{},
     max_steps: u64 = 4_000_000, // per run (a step count: wall time never changes a result)
@@ -37,6 +34,7 @@ pub const Config = struct {
     abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
     commit: bool = false, // PREFIX_COMMIT: an owned value of the task's own expression closes the think and is the answer
     prefix: []const u8 = "TF_RUNNER", // the knob prefix it was parsed under (runner_binding.zig), for messages
+    family: @import("runner_binding.zig").Family = .{}, // the family's chat markup (its binding sets it)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -360,6 +358,7 @@ pub const Session = struct {
         if (w.trace) return try s.ownTrace(c, w.index, held_ms);
         // an inline value is owned only when the run halted with a one-line value
         if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
+        if (!c.abstained and s.r.cfg.family.screen(&c.result.?)) c.abstained = true; // it would read as the family's markup
         if (!c.abstained and s.r.cfg.inline_mark and w.inline_space != null) {
             const value = output.value(c.result.?.out);
             if (std.mem.trim(u8, value, " \t\r").len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null)

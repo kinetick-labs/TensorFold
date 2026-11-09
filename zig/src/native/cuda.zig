@@ -455,6 +455,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.kv_count = if (admit != null) kv_pages.ledgerPool(F, loaded) else null;
     const bench = if (@hasDecl(F, "benchmark")) F.benchmark(loaded.ctx) else api.Benchmark{ .ranks = 1 };
     const readouts: ?lanes.readout.Info = if (@hasField(@TypeOf(loaded), "readouts")) loaded.readouts else null;
+    // TF_RUNNER*: the family's in-model runner, open for the engine's life; the server gives it the tokenizer
+    const runner = if (@hasDecl(F, "runner")) if (try F.runner.parse(&cuda_device.knob)) |rc| try api.runner.open(gpa, rc) else null else null;
+    if (runner != null) try F.runner.openRoundTrace(&cuda_device.knob);
     try h.serve(io, served.facts, loaded.rows, familyInfo(F, .{
         .benchmark_ranks = bench.ranks,
         .benchmark_group = bench.group,
@@ -482,6 +485,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .text_generation = readouts == null, // a readout engine answers its readouts only (Clef's /v1/systemone)
         .compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null, // replies hold at EOS
         .compute_tool = if (@hasDecl(F, "compute")) F.compute.tool else .{},
+        .runner = runner,
     }), .{ .ctx = loaded.ctx, .text = F.explain }, snaps.warmQuiet(F));
     opened = true;
     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, if (paged) |p| p.taken else 0, std.log); // TF_KV_SHARE: no copied rows

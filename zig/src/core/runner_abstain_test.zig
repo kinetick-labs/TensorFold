@@ -134,7 +134,11 @@ test "runner abstain records: the reason of every frontend tag, a lost start, an
         const why = abstain.reason(Fake{ .translation = .{ .abstain = tag } }, null);
         try t.expectEqualStrings(@tagName(tag), @tagName(why[0]));
         try t.expectEqualStrings(@tagName(tag), why[1].?);
-        try t.expectEqualStrings(if (tag == .context) "context" else "frontend", abstain.stage(why[0]));
+        try t.expectEqualStrings(switch (tag) {
+            .context => "context",
+            .markup => "own", // the run's screen gives it (runner_binding.Family.never), not a frontend
+            else => "frontend",
+        }, abstain.stage(why[0]));
     }
     const prog: rapi.Translation = .{ .program = .{ .kind = .graph, .bytes = "" } };
     const lost = abstain.reason(Fake{ .translation = prog }, null);
@@ -143,6 +147,9 @@ test "runner abstain records: the reason of every frontend tag, a lost start, an
     const bare = abstain.reason(Fake{ .translation = prog, .result = .{ .status = .abstain } }, null);
     try t.expectEqual(abstain.Reason.backend_abstain, bare[0]);
     try t.expect(bare[1] == null);
+    const marked = abstain.reason(Fake{ .translation = prog, .result = .{ .status = .abstain, .abstain = .markup } }, null);
+    try t.expectEqual(abstain.Reason.markup, marked[0]);
+    try t.expectEqualStrings("markup", marked[1].?);
     try t.expectEqual(abstain.Reason.token_cap, abstain.reason(Fake{ .translation = prog, .result = .{ .status = .ok, .out = "1" } }, .token_cap)[0]);
 }
 

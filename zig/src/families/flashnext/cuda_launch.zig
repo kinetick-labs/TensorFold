@@ -489,6 +489,8 @@ test {
     _ = train;
     _ = @import("living.zig");
     _ = @import("compute_binding.zig");
+    _ = @import("runner_binding.zig");
+    _ = @import("runner_binding_test.zig");
 }
 
 test "embed grid is one program per row and per group of 32" {

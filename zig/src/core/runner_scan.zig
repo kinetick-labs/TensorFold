@@ -4,6 +4,7 @@ const api = @import("runner_api.zig");
 const trace = @import("runner_trace.zig");
 const header = @import("runner_scan_boundary.zig");
 const inline_scan = @import("runner_scan_inline.zig");
+const quiet = @import("runner_scan_quiet.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
@@ -20,6 +21,7 @@ pub const Config = struct {
     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
     trace_repeat: u8 = 0, // a restated, already owned line is owned again up to this many times
     trace_whole: bool = false, // opt-in (PREFIX_STATED): trace also takes the whole-statement shapes
+    quiet: quiet.Spans = &.{}, // the family's spans no cell is read in: tool calls, tool results (runner_binding.Family)
 };
 
 /// Trace ownerships per reply, and trace cells (stated computations) a reply may open.
@@ -64,6 +66,7 @@ pub const Scanner = struct {
     tail: [16]u8 = undefined, // the last bytes fed, for cues split across tokens
     tail_len: usize = 0,
     think: bool = false, // the think block was open at the last token
+    hush: quiet.Quiet = .{}, // inside one of cfg.quiet's spans
     code_cells: u32 = 0, // fence and REPL cells closed so far
     tracer: ?trace.Tracer = null, // names and owned statements (form trace; made at the first reasoning line)
     trace_src: std.ArrayList(u8) = .empty, // the pending statement's Python source
@@ -104,6 +107,7 @@ pub const Scanner = struct {
         }
         if (s.trace_cell != null and s.tokens - s.trace_at > s.cfg.trace_window) s.trace_cell = null;
         for (bytes) |b| {
+            if (s.hush.skip(s.cfg.quiet, b)) continue;
             s.cue(b);
             if (s.state == .after and !std.ascii.isWhitespace(b)) s.terminal_ready = false;
             if (s.armed != null and b != '\n' and b != ' ' and b != '\t' and b != '\r') s.armed = null;
@@ -560,4 +564,5 @@ test "runner scan: a header after an inline cell still names the fence cell befo
 
 comptime {
     _ = @import("runner_scan_result_test.zig");
+    _ = @import("runner_scan_quiet.zig");
 }
