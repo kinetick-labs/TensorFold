@@ -69,6 +69,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
     b.step("test-ocr-host", "OCR route readers, shared page steps and dialects without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"ocr "} })).step);
     b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"compute lane:"} })).step);
+    b.step("test-runner-server-host", "The in-model runner through the chat route: guide, live records, field anchors").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "runner guide:", "runner commit ask:", "runner projection:", "runner live records:" } })).step);
     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage and ids").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
     @import("request_starts_host.zig").steps(b, native_modules.engines, server_tests);
