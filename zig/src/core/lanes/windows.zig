@@ -74,6 +74,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
         p.kind = .forced;
         p.forced = forced;
         p.tokens = forced;
+        try @import("forced_drafts.zig").extend(e, s, &p, queued);
     } else {
         var copy: Copy = .{};
         if (copied) |c| copy = c else if (s.drafts) copy = try copyProposal(e, s);
@@ -542,7 +543,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
     const ds = try accept.depths(a, parents);
     const positions = try a.alloc(u64, rows);
     for (positions, ds) |*x, d| x.* = p.position + 1 + d;
-    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .masks = p.masks };
+    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .forced = @intCast(p.forced.len), .masks = p.masks };
 }
 
 pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
