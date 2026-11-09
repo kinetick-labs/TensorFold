@@ -210,6 +210,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
     @import("compute_lane_host.zig").steps(b, host, step);
     @import("runner_t2.zig").tests(b, step);
+    @import("runner_frontend.zig").tests(b, step);
     // the SASS profile rule (cuda_kernels.zig) and the -Dgpu check of prebuilt images
     for ([_][]const u8{ "zig/build/cuda_kernels.zig", "zig/build/check_product_fatbins.zig" }) |root|
         step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(root), .target = host }) })).step);
