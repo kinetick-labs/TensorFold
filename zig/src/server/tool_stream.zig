@@ -3,6 +3,7 @@ const std = @import("std");
 const json = @import("json");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
+const reply_owned = @import("reply_owned.zig");
 const tool_dsml = @import("tool_dsml.zig");
 const tool_dsml_stream = @import("tool_dsml_stream.zig");
 const tool_glm_cut = @import("tool_glm_cut.zig");
@@ -377,6 +378,14 @@ pub fn endProse(a: Allocator, content: []const u8, text: []const u8, tools: []co
     if (single) return reply_text.pyRstrip(try reply_text.finishedProse(a, content));
     const cut = std.mem.eql(u8, reason, "length") and (try cutCalls(a, text, tools)) != null;
     return if (cut) reply_text.cutProse(a, content) else reply_text.finishedProse(a, content);
+}
+
+/// ``endProse`` keeping the engine's `owned` bytes of `content`, its strip points the reply's openers `o`.
+pub fn endProseOwned(a: Allocator, content: []const u8, text: []const u8, tools: []const Value, reason: []const u8, single: bool, o: reply_text.Openers, owned: ?reply_owned.Owned) Allocator.Error![]const u8 {
+    if (owned == null) return endProse(a, content, text, tools, reason, single);
+    if (single) return reply_owned.rstrip(try reply_owned.finishedProse(a, content, o, owned), owned);
+    const cut = std.mem.eql(u8, reason, "length") and (try cutCalls(a, text, tools)) != null;
+    return if (cut) reply_owned.cutProse(a, content, o, owned) else reply_owned.finishedProse(a, content, o, owned);
 }
 
 /// A reply max_tokens cut inside a call: the calls its stream sent, the cut one included; null when none was left open.

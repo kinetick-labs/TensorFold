@@ -15,15 +15,16 @@ const choice: u32 = 0;
 pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
     const tools = r.plan.input.tools;
     if (tools.len == 0) return null;
+    const o = @import("reply_text.zig").openersOf(r.srv.markers);
     if (reply.native_tool_format) {
-        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, reply.native_calls, reply.content);
+        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, reply.native_calls, reply.content, o, null);
         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse return null;
         reply.content = try r.plan.policy.parsedContent(r.a, reply.content);
         reply.finish_reason = "tool_calls";
         reply.tool_calls_streamed = false;
         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
     }
-    const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+    const parsed = try tool_parse.parseOwned(r.a, reply.content, tools, r.plan.policy.maxCalls(), reply.owned);
     if (parsed.rejected_envelopes > 0) {
         log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
         r.srv.metrics.keptToolCalls(r.srv.io, parsed.kept_unoffered, parsed.kept_malformed);
@@ -31,8 +32,8 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
     }
     // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
     const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
-    if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
-    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
+    if (cut != null) reply.content = try @import("reply_owned.zig").cutProse(r.a, reply.content, o, reply.owned);
+    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content, o, if (cut != null) reply.owned else parsed.owned);
     const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
         if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
         return null;

@@ -240,6 +240,7 @@ test {
     _ = @import("compute_lane_http_test.zig");
     _ = @import("compute_default_test.zig");
     _ = @import("compute_default_fit_test.zig");
+    _ = @import("reply_owned_test.zig");
     // the benchmark command's serve child runs under POSIX signals and waits; Windows refuses the command
     if (comptime @import("builtin").os.tag != .windows) {
         _ = @import("benchmark_suite.zig");

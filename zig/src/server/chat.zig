@@ -89,6 +89,7 @@ pub const Reply = struct {
     prompt_logprobs: ?Value = null,
     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
     compute_ran: usize = 0, // the lane's built-in calls the sandbox ran (not malformed or past the cap)
+    owned: ?@import("reply_owned.zig").Owned = null, // engine-owned bytes of `content`, which no strip may cut
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
