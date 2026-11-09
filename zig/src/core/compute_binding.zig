@@ -32,7 +32,5 @@ fn anySet(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) 
     return false;
 }
 
-/// DeepSeek-V4.1: the generic names, or TF_DSV41_COMPUTE_LANE* as before.
+/// DeepSeek-V4.1: the generic names, or TF_DSV41_COMPUTE_LANE* as before (Flash-Next: families/flashnext).
 pub const dsv41: Binding = .{ .alias = "TF_DSV41_COMPUTE_LANE" };
-/// Qwen3.8 Flash-Next (`qwen4_exp`): the generic names only. Its serve engine does not read it yet.
-pub const flashnext: Binding = .{};

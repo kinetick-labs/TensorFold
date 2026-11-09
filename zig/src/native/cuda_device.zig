@@ -30,6 +30,16 @@ pub fn getenv(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(std.c.getenv(name) orelse return null);
 }
 
+/// A knob a family binding names at run time (compute_lane.Binding.parse): blank is unset.
+pub fn knob(name: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    if (name.len >= buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    const v = (@import("sys").environment.Process{}).get(buf[0..name.len :0]) orelse return null;
+    return if (std.mem.trim(u8, v, " \t\r\n").len == 0) null else v;
+}
+
 /// The same strict setting contract as the direct CLI, with flags taking precedence over environment text.
 pub fn setting(a: Allocator, flag: ?u32, comptime name: [:0]const u8, default: u32, problem: *[]const u8) !?u32 {
     const settings = @import("sys").environment;
