@@ -152,6 +152,13 @@ pub const Served = struct {
         const binding = api.hold.compute_lane.bindings.dsv41;
         s.host.info_.compute = try binding.parse(&@import("serve_knobs.zig").env);
         s.host.info_.compute_tool = binding.tool;
+        // TF_RUNNER=1 or TF_DSV41_RUNNER=1: code cells a reply writes run on the compiled circuit, results in place
+        if (try api.runner.bindings.dsv41.parse(&@import("serve_knobs.zig").env)) |parsed| {
+            var rc = parsed;
+            rc.place.engine = engineCpus; // PREFIX_CPUS=auto keeps the runner's threads off these
+            s.host.runner = try api.runner.open(gpa, rc);
+            s.host.info_.runner = s.host.runner;
+        }
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
@@ -196,6 +203,17 @@ pub const Served = struct {
     fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
         const u = @import("cuda").usage(reset_peak);
         return .{ .active = u.device, .cache = 0, .peak = u.peak };
+    }
+
+    /// The CPUs the engine's own threads run on: the plan thread's pin and the TP knobs' CPUs.
+    fn engineCpus(set: *api.runner.place.Set) void {
+        const pinned = @import("tp").planlink.pinned_cpu.load(.acquire);
+        if (pinned >= 0) api.runner.place.add(set, @intCast(pinned));
+        const knobs = @import("serve_knobs.zig");
+        for ([_]?[]const u8{ knobs.env("TF_TP_PLAN_PIN"), knobs.env("TF_TP_ROCE_CPU") }) |v| {
+            const cpu = std.fmt.parseInt(u32, v orelse continue, 10) catch continue;
+            api.runner.place.add(set, cpu);
+        }
     }
 
     fn bindContext(ctx: *anyopaque) anyerror!void {

@@ -142,7 +142,7 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
     const sampling = try json.newObject(cx.a);
-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget", "deadline_s" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget", "runner_guide", "runner_trace", "runner_trace_format", "runner_trace_check", "runner_trace_repeat", "deadline_s" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
@@ -228,6 +228,7 @@ pub const Run = struct {
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
     text_offset: usize = 0, // characters a completion stream's logprob rows have covered
     turn: ?*cortheon.Turn = null, // --cortheon's work on this request
+    sent: @import("runner_projection.zig").Sent = .{}, // the fields a stream sent, for the runner's field map
     call_ids: ids.Calls, // the reply's tool-call ids, from this request (openai_calls.zig)
 
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
@@ -237,6 +238,7 @@ pub const Run = struct {
         try o.put(a, "object", .{ .string = if (r.is_chat) "chat.completion.chunk" else "text_completion" });
         try o.put(a, "created", try json.intValue(a, r.created));
         try o.put(a, "model", .{ .string = r.plan.named });
+        if (delta) |v| if (v == .object) if (v.object.fetchOrderedRemove("tensorfold")) |kv| try o.put(a, kv.key, kv.value); // live records
         const choice = try json.newObject(a);
         try choice.put(a, "index", .{ .int = "0" });
         if (r.is_chat) {
@@ -260,7 +262,7 @@ pub const Run = struct {
     }
 
     fn emit(r: *Run, payload: Value) error{Closed}!void {
-        return r.out.vt.event(r.out.ctx, payload);
+        return r.out.vt.event(r.out.ctx, r.sent.seen(r.a, payload) catch return error.Closed);
     }
 
     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
@@ -283,7 +285,7 @@ pub const Run = struct {
         try o.put(r.a, "exact_mode", .{ .string = "exact" });
         if (reply.stop_sequence) |s| try o.put(r.a, "stop_sequence", .{ .string = s });
         if (r.srv.config.spark_stats) try @import("spark_wire.zig").add(r.a, reply);
-        try o.put(r.a, "tensorfold", reply.runtime);
+        try o.put(r.a, "tensorfold", try @import("runner_projection.zig").runtimeOf(r.a, reply, &r.sent, r.is_chat));
         try o.put(r.a, "speculative", reply.speculative);
         if (r.turn) |t| try o.put(r.a, "cortheon", try t.summary(r.a));
     }
@@ -405,7 +407,7 @@ pub const Run = struct {
             if (!s.opened) return s.pending.append(r.a, delta) catch error.Closed;
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
-                if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
+                if (!r.is_chat and delta != .string and (delta != .object or (delta.object.get("content") == null and delta.object.get("tensorfold") == null))) return;
                 return r.emit(r.chunk(delta, null) catch return error.Closed);
             }
             @import("openai_calls.zig").streamed(r, delta) catch return error.Closed;

@@ -94,6 +94,7 @@ pub const Reply = struct {
     prompt_logprobs: ?Value = null,
     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
     reasoning_recovered: bool = false, // ended at its end token in an unclosed think block: content repeats it
+    runner_raw: ?[2][]const u8 = null, // with abstain records: the runner's raw field bytes (runner_projection.zig)
     compute_ran: usize = 0, // the lane's built-in calls the sandbox ran (not malformed or past the cap)
     owned: ?@import("reply_owned.zig").Owned = null, // engine-owned bytes of `content`, which no strip may cut
 };
@@ -140,6 +141,7 @@ pub const Prepared = struct {
     sampled: bool, // a sampling config, which the reply labels "exact"; greedy otherwise
     drafts: bool,
     token_ids: bool,
+    guide: ?[]const u8 = null, // the runner guide the chat got ("" none); null with the runner off
     stops: fields_mod.Stops,
     preparing: bool,
     frames: []const ?api.Size = &.{}, // each image part's tower input size, in part order (prompt.Rendered.frames)
@@ -147,8 +149,17 @@ pub const Prepared = struct {
 };
 
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
-pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepared {
+pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepared {
     const a = cx.a;
+    var input = given;
+    // the runner guide (runner_guide.zig) with the runner on: the request's, or the boot's under the compute default
+    const thinks = input.prompt == null and (flag(input.fields, "enable_thinking") orelse srv.config.enable_thinking);
+    const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields, thinks);
+    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
+        error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    input.messages = guided.messages;
     const io = srv.io;
     const received = nowNs(io);
     const f = input.fields;
@@ -234,6 +245,12 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     request.prompt_logprobs = input.prompt_logprobs;
     // the compute lane: a reply offered the built-in tool holds at each EOS for its results (not with stop strings)
     request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
+    // the in-model runner (runner_binding.zig): code cells this reply writes run, their results owned in place
+    request.run_cells = srv.info.runner != null;
+    if (request.run_cells and thinking and srv.think_close.len > 0) request.think_end = srv.think_close_end;
+    if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
+        return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_check a boolean, runner_trace_repeat 0 to 3");
+    if (thinking) request.run_commit = try @import("runner_commit_ask.zig").of(a, srv.info.runner, srv.think_close, input.messages, input.tools, &request);
     if (try engine_refusal.of(srv.engine, cx, &request)) |message| return cx.refuse(message);
     if (input.trace) |trace| trace.prepared(&request, thinking, effort);
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = fields_mod.flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .frames = rendered.frames };
@@ -242,7 +259,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (!(s > 0 and s <= 1e6)) return cx.refuse("deadline_s must be more than 0 and at most 1000000 seconds");
         break :blk received + @as(i96, @intFromFloat(s * std.time.ns_per_s));
     } else null;
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .frames = rendered.frames, .deadline_ns = deadline };
+    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .frames = rendered.frames, .guide = guided.guide, .deadline_ns = deadline };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -290,7 +307,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |x| x else undefined };
     var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |x| x else undefined, .tool = srv.info.compute_tool.name };
     const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns, .lane_own = input.lane_own };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns, .lane_own = input.lane_own, .guide = prepared.guide };
     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     if (srv.recipients and input.prompt == null) gen.recipient = try recipient_reply.Reading.of(a, srv.text, request.prompt, input.tools, prepared.reasoning);

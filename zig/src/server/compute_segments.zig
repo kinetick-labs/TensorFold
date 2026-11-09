@@ -80,6 +80,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
             if (g.sink != null) filter.direct(try reportDelta(a, r)) catch return error.Cancelled;
         }
         g = try next(g, s, p.request.max_tokens - (used + s.len));
+        g.base = m.ids.items.len; // the runner records' token indices count every segment and result before it
         filter.nextSegment();
         try g.loop(gone);
     }
@@ -93,7 +94,7 @@ fn finish(g: *Generation, cx: *Cx, p: chat.Prepared) chat.Failure!chat.Reply {
 /// The segment after an inserted result: the same reply, its first tokens the result's, its own text and calls.
 fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Generation {
     const n = try g.a.create(Generation);
-    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
+    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .cells_sent = g.cells_sent, .cells_sig = g.cells_sig, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
     if (g.calls != null) n.calls = try tool_stream.Streamer.init(g.a, g.tools);
     return n;
 }
