@@ -44,7 +44,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
     while (g.held) {
         const used = m.ids.items.len + g.collected.items.len;
         const answer = try segmentAnswer(g);
-        const calls = builtInOnly(answer.calls);
+        const calls = builtInOnly(answer.calls, srv.info.compute_tool.name);
         var plan: ?[]const u32 = null;
         var assistant: Value = .null;
         var reports: []Value = &.{};
@@ -97,9 +97,9 @@ fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Genera
 }
 
 /// The segment's calls when every one is the built-in tool's (a client's call ends the reply for its client).
-fn builtInOnly(calls: ?[]Value) []Value {
+fn builtInOnly(calls: ?[]Value, n: []const u8) []Value {
     const all = calls orelse return &.{};
-    for (all) |c| if (!turns.isBuiltInCall(c)) return &.{};
+    for (all) |c| if (!turns.isCallTo(c, n)) return &.{};
     return all;
 }
 
@@ -137,7 +137,7 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
             body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
             ran.* += 1;
         }
-        slot.* = try report(a, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
+        slot.* = try report(a, srv.info.compute_tool.name, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
     }
     return out;
 }
@@ -166,9 +166,9 @@ fn capTokens(a: Allocator, srv: *Server, body: []const u8, max: u32) Allocator.E
     return std.fmt.allocPrint(a, "[output truncated at {d} tokens]", .{max});
 }
 
-fn report(a: Allocator, call: Value, code: []const u8, o: lane.Outcome, output: []const u8) Allocator.Error!Value {
+fn report(a: Allocator, n: []const u8, call: Value, code: []const u8, o: lane.Outcome, output: []const u8) Allocator.Error!Value {
     const r = try json.newObject(a);
-    try r.put(a, "name", .{ .string = turns.name });
+    try r.put(a, "name", .{ .string = n });
     try r.put(a, "id", call.get("id") orelse .null);
     try r.put(a, "code", .{ .string = code });
     try r.put(a, "status", .{ .string = @tagName(o.status) });

@@ -247,6 +247,7 @@ pub const Info = struct {
     /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
     media: bool = false,
     compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
+    compute_tool: hold.compute_lane.Tool = .{}, // the built-in tool its binding names (compute_binding.zig)
 
     pub const Capability = @import("engine_capabilities.zig").Capability;
 

@@ -16,7 +16,7 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
     const tools = r.plan.input.tools;
     if (tools.len == 0) return null;
     if (reply.native_tool_format) {
-        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, reply, reply.native_calls, reply.content);
+        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, reply.native_calls, reply.content);
         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse return null;
         reply.content = try r.plan.policy.parsedContent(r.a, reply.content);
         reply.finish_reason = "tool_calls";
@@ -32,7 +32,7 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
     // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
     const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
     if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
-    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
+    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
     const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
         if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
         return null;

@@ -49,6 +49,31 @@ test "compute lane config: _DEFAULT is off unless 1, needs the lane and refuses 
     try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "0" }, .{ "TF_X_DEFAULT", "1" } }));
 }
 
+test "compute lane binding: generic names or the family's alias, not both; the tool is python" {
+    const dsv41 = lane.bindings.dsv41;
+    knobs = &.{};
+    try expectEqual(null, try dsv41.parse(&lookup));
+    knobs = &.{ .{ "TF_DSV41_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE_WORKERS", "3" } };
+    try expectEqual(@as(u8, 3), (try dsv41.parse(&lookup)).?.workers);
+    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_COMPUTE_LANE_DEFAULT", "1" } };
+    try expect((try dsv41.parse(&lookup)).?.default);
+    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE_MAX_MS", "5" } };
+    try std.testing.expectError(error.BadKnob, dsv41.parse(&lookup));
+    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE", "" } }; // empty is unset
+    try expect((try dsv41.parse(&lookup)) != null);
+    // Flash-Next reads the generic names only
+    const flashnext = lane.bindings.flashnext;
+    knobs = &.{.{ "TF_DSV41_COMPUTE_LANE", "1" }};
+    try expectEqual(null, try flashnext.parse(&lookup));
+    knobs = &.{.{ "TF_COMPUTE_LANE", "1" }};
+    try expect((try flashnext.parse(&lookup)) != null);
+    inline for (.{ dsv41, flashnext }) |b| {
+        try expectEqualStrings("python", b.tool.name);
+        try expectEqualStrings("code_interpreter", b.tool.opt_in);
+        try expectEqual(@as(i64, 1024), b.tool.min_tokens);
+    }
+}
+
 test "compute lane config: every knob parses" {
     const c = (try parse(&.{
         .{ "TF_X", "1" },                          .{ "TF_X_WORKERS", "3" },    .{ "TF_X_MAX_MS", "2500" },

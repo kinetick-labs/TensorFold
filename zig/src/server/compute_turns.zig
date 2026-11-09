@@ -11,16 +11,25 @@ const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
-/// The built-in tool's name, the type a request lists to opt in, and its description (which marks it as ours).
+/// The default binding's tool name and opt-in type (a family's: srv.info.compute_tool), and our description.
 pub const name = "python";
 pub const opt_in = "code_interpreter";
 pub const description = "Run Python 3 code in a sandbox with no network, no files and no installs, and get its stdout and " ++
     "stderr. print() what you need; the value of a final bare expression is printed too.";
-pub const definition =
-    \\{"type":"function","function":{"name":"python","description":"
+const head =
+    \\{"type":"function","function":{"name":"
+;
+const tail =
+    \\","description":"
 ++ description ++
     \\","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Python 3 source to run"}},"required":["code"]}}}
 ;
+pub const definition = head ++ name ++ tail;
+
+/// The built-in tool's definition under the binding's name `n`.
+fn definitionOf(a: Allocator, n: []const u8) Allocator.Error![]const u8 {
+    return std.mem.concat(a, u8, &.{ head, n, tail });
+}
 
 /// The server's sandbox pool for an engine that serves the lane; boot fails when an opted-in sandbox cannot run.
 pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
@@ -45,16 +54,16 @@ pub fn forced(srv: *const Server) bool {
     return srv.compute != null and srv.info.compute.?.default;
 }
 
-/// Under this max_tokens the default offers no built-in tool unasked: a call, its result and an answer do not fit.
+/// The default binding's max_tokens under which the default offers no built-in tool unasked (Tool.min_tokens).
 pub const default_min_tokens = 1024;
 
 /// What a request asks, known before it renders, that decides whether its reply can hold for the lane (`arms`).
 pub const Fit = struct { max_tokens: i64, thinking: bool = true, stop: bool = false, logprobs: bool = false, structured: bool = false };
 
-/// Whether a reply that asked `f` thinks, holds at its EOS and has room for a call, its result and an answer.
-fn fits(f: Fit) bool {
+/// Whether a reply that asked `f` thinks, holds at its EOS and has `min` tokens for a call, its result and an answer.
+fn fits(f: Fit, min: i64) bool {
     // unthinking, the prose before a call is the visible answer and the result's answer runs on into it
-    return f.thinking and !f.stop and !f.logprobs and !f.structured and f.max_tokens >= default_min_tokens;
+    return f.thinking and !f.stop and !f.logprobs and !f.structured and f.max_tokens >= min;
 }
 
 /// A chat body's tools (`tools`) and `lane_own` into `input`, whose max_tokens is read; `logprobs`: rows asked.
@@ -72,28 +81,29 @@ pub fn requestTools(srv: *Server, cx: *Cx, body: Value, input: *chat.Input, logp
 /// The request's tools, `{"type": "code_interpreter"}` as the built-in tool (the default's: every chat that `fit`s).
 pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value, fit: Fit) errors.Refused![]Value {
     const always = forced(srv);
+    const tool = srv.info.compute_tool;
     const list = raw orelse Value{ .array = &.{} };
     if (list != .array and !always) return active(srv, cx, raw, choice);
     var rest: std.ArrayList(Value) = .empty;
     var listed = false;
     if (list == .array) for (list.array) |t| {
         const kind = if (t == .object) t.strField("type") orelse "" else "";
-        if (std.mem.eql(u8, kind, opt_in)) listed = true else try rest.append(cx.a, t);
+        if (std.mem.eql(u8, kind, tool.opt_in)) listed = true else try rest.append(cx.a, t);
     };
-    if (!listed and (!always or !fits(fit))) return active(srv, cx, raw, choice);
-    if (srv.compute == null) return cx.other("code_interpreter is not enabled on this server");
+    if (!listed and (!always or !fits(fit, tool.min_tokens))) return active(srv, cx, raw, choice);
+    if (srv.compute == null) return cx.other(try std.fmt.allocPrint(cx.a, "{s} is not enabled on this server", .{tool.opt_in}));
     var specs = try active(srv, cx, if (list == .array) .{ .array = rest.items } else raw, choice);
     // a client's own copy of the built-in definition is the same tool: one declaration, not a refusal (default only)
-    if (always) specs = try withoutBuiltIn(cx.a, specs);
-    for (specs) |t| if (std.mem.eql(u8, toolName(t), name)) {
+    if (always) specs = try withoutBuiltIn(cx.a, specs, tool.name);
+    for (specs) |t| if (std.mem.eql(u8, toolName(t), tool.name)) {
         // a call names only its tool: the default leaves `python` to the client that offers it
         if (always and !listed) return specs;
-        return cx.other("a request with code_interpreter cannot also offer a function named python");
+        return cx.other(try std.fmt.allocPrint(cx.a, "a request with {s} cannot also offer a function named {s}", .{ tool.opt_in, tool.name }));
     };
     // only an automatic choice offers it ("required" and a named function do not); the default also offers it on "none"
     if (choice) |c| if (!(c == .null or (c == .string and std.mem.eql(u8, c.string, "auto")) or
         (always and c == .string and std.mem.eql(u8, c.string, "none")))) return specs;
-    const built = switch (try json.parse(cx.a, definition)) {
+    const built = switch (try json.parse(cx.a, try definitionOf(cx.a, tool.name))) {
         .ok => |v| v,
         .err => unreachable,
     };
@@ -118,9 +128,9 @@ pub fn countExecuted(a: Allocator, runtime: Value, ran: usize) Allocator.Error!v
     try runtime.object.put(a, "compute_executed", .{ .object = o });
 }
 
-fn withoutBuiltIn(a: Allocator, specs: []Value) Allocator.Error![]Value {
+fn withoutBuiltIn(a: Allocator, specs: []Value, n: []const u8) Allocator.Error![]Value {
     var out: std.ArrayList(Value) = .empty;
-    for (specs) |t| if (!isBuiltIn(t)) try out.append(a, t);
+    for (specs) |t| if (!isBuiltInAs(t, n)) try out.append(a, t);
     return out.items;
 }
 
@@ -135,28 +145,33 @@ fn toolName(t: Value) []const u8 {
     return f.strField("name") orelse "";
 }
 
-/// Whether `t` is the built-in tool (its name and our description), as `tools` added it.
+/// Whether `t` is the default binding's built-in tool, as `tools` added it.
 pub fn isBuiltIn(t: Value) bool {
+    return isBuiltInAs(t, name);
+}
+
+/// Whether `t` is the built-in tool (its name `n` and our description), as `tools` added it.
+pub fn isBuiltInAs(t: Value, n: []const u8) bool {
     const f = t.get("function") orelse return false;
-    return std.mem.eql(u8, f.strField("name") orelse "", name) and std.mem.eql(u8, f.strField("description") orelse "", description);
+    return std.mem.eql(u8, f.strField("name") orelse "", n) and std.mem.eql(u8, f.strField("description") orelse "", description);
 }
 
 /// Whether `specs` hold the default's own built-in tool (no code_interpreter listed): its calls never reach the client.
 pub fn ownedByServer(srv: *const Server, raw: ?Value, specs: []const Value) bool {
     if (!forced(srv)) return false;
     if (raw) |list| if (list == .array) for (list.array) |t| {
-        if (t == .object and std.mem.eql(u8, t.strField("type") orelse "", opt_in)) return false;
+        if (t == .object and std.mem.eql(u8, t.strField("type") orelse "", srv.info.compute_tool.opt_in)) return false;
     };
-    for (specs) |t| if (isBuiltIn(t)) return true;
+    for (specs) |t| if (isBuiltInAs(t, srv.info.compute_tool.name)) return true;
     return false;
 }
 
-/// A reply's calls for its client (`own`: the default's tool, whose unrun calls end the reply at length, unseen).
-pub fn ownCalls(a: Allocator, own: bool, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
+/// A reply's calls for its client (`own`: the default's tool `n`, whose unrun calls end the reply at length, unseen).
+pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
     if (!own) return found;
     const all: []const Value = found orelse &.{};
     var kept: std.ArrayList(Value) = .empty;
-    for (all) |c| if (!isBuiltInCall(c)) try kept.append(a, c);
+    for (all) |c| if (!isCallTo(c, n)) try kept.append(a, c);
     const dropped = kept.items.len < all.len;
     // a call the lane could not run (no room left), or one max_tokens cut: the budget ended the reply
     if (dropped or (found == null and std.mem.eql(u8, reply.finish_reason, "length"))) {
@@ -166,9 +181,14 @@ pub fn ownCalls(a: Allocator, own: bool, reply: *chat.Reply, found: ?[]Value, pr
     return if (kept.items.len > 0) kept.items else null;
 }
 
-/// Whether a call names the built-in tool.
+/// Whether a call names the default binding's built-in tool.
 pub fn isBuiltInCall(call: Value) bool {
-    return std.mem.eql(u8, toolName(call), name);
+    return isCallTo(call, name);
+}
+
+/// Whether a call names the built-in tool `n`.
+pub fn isCallTo(call: Value, n: []const u8) bool {
+    return std.mem.eql(u8, toolName(call), n);
 }
 
 /// Whether a prepared request holds at its EOS for the lane: offered the tool, nothing that forced rows would break.
@@ -176,7 +196,7 @@ pub fn arms(srv: *const Server, input: chat.Input, r: *const api.Request) bool {
     if (srv.compute == null or r.eos.len == 0 or r.background or r.max_tokens == 0) return false;
     if (srv.text.vtable.format == .kimi) return false; // its native reader keeps calls apart from the text
     if (r.structure != null or r.call != null or r.logprobs != null or r.prompt_logprobs != null) return false;
-    for (input.tools) |t| if (isBuiltIn(t)) return true;
+    for (input.tools) |t| if (isBuiltInAs(t, srv.info.compute_tool.name)) return true;
     return false;
 }
 
@@ -184,6 +204,7 @@ pub fn arms(srv: *const Server, input: chat.Input, r: *const api.Request) bool {
 pub const Filter = struct {
     a: Allocator,
     inner: chat.Sink,
+    tool: []const u8 = name, // the built-in tool's name (srv.info.compute_tool)
     base: i64 = 0, // client calls earlier segments showed
     seen: i64 = 0, // client calls this segment showed
     map: std.AutoHashMapUnmanaged(i64, ?i64) = .empty, // this segment's call index -> the client's (null: built-in)
@@ -217,7 +238,7 @@ pub const Filter = struct {
         for (list.?.array) |one| {
             const at = (one.get("index") orelse continue).int64() orelse continue;
             if (one.get("function")) |fun| if (fun.strField("name")) |n| if (!f.map.contains(at)) {
-                const client: ?i64 = if (std.mem.eql(u8, n, name)) null else f.base + f.seen;
+                const client: ?i64 = if (std.mem.eql(u8, n, f.tool)) null else f.base + f.seen;
                 if (client != null) f.seen += 1;
                 f.map.put(f.a, at, client) catch return error.Closed;
             };
@@ -273,4 +294,20 @@ test "compute lane: the built-in definition parses and is recognized; another fu
     try std.testing.expect(isBuiltIn(built));
     const other = (try json.parse(arena.allocator(), "{\"type\":\"function\",\"function\":{\"name\":\"python\"}}")).ok;
     try std.testing.expect(!isBuiltIn(other));
+}
+
+test "compute lane: a binding's tool name renames the built-in definition; the default's bytes are as before" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings(definition, try definitionOf(a, name));
+    try std.testing.expect(std.mem.startsWith(u8, definition, "{\"type\":\"function\",\"function\":{\"name\":\"python\",\"description\":\"Run Python 3 code"));
+    const t: lane.Tool = .{};
+    try std.testing.expectEqualStrings(name, t.name);
+    try std.testing.expectEqualStrings(opt_in, t.opt_in);
+    try std.testing.expectEqual(@as(i64, default_min_tokens), t.min_tokens);
+    const run = (try json.parse(a, try definitionOf(a, "run_code"))).ok;
+    try std.testing.expect(isBuiltInAs(run, "run_code") and !isBuiltIn(run));
+    const call = try json.parse(a, "{\"function\":{\"name\":\"run_code\",\"arguments\":\"{}\"}}");
+    try std.testing.expect(isCallTo(call.ok, "run_code") and !isBuiltInCall(call.ok));
 }
