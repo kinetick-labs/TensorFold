@@ -28,6 +28,7 @@ const Merge = struct {
     ids: std.ArrayList(u32) = .empty, // the engine's whole continuation: segments and inserted results
     inserted: usize = 0,
     calls: std.ArrayList(Value) = .empty, // one report a call
+    ran: usize = 0, // the calls the sandbox ran (Reply.compute_ran)
     history: std.ArrayList(Value) = .empty, // the request's messages, then each segment's call turn and results
 };
 
@@ -49,7 +50,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
         var reports: []Value = &.{};
         if (calls.len > 0 and used + answer_room < p.request.max_tokens) {
             assistant = try assistantTurn(a, answer.prose, answer.reasoning, calls);
-            reports = try runAll(a, srv, cfg, calls, &run_calls, gone);
+            reports = try runAll(a, srv, cfg, calls, &run_calls, &m.ran, gone);
             plan = try suffix(srv, cx, p, &m.history, assistant, calls, reports);
             if (plan) |s| if (used + s.len + answer_room > p.request.max_tokens) {
                 plan = null;
@@ -90,7 +91,7 @@ fn finish(g: *Generation, cx: *Cx, p: chat.Prepared) chat.Failure!chat.Reply {
 /// The segment after an inserted result: the same reply, its first tokens the result's, its own text and calls.
 fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Generation {
     const n = try g.a.create(Generation);
-    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit };
+    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
     if (g.calls != null) n.calls = try tool_stream.Streamer.init(g.a, g.tools);
     return n;
 }
@@ -112,8 +113,8 @@ fn segmentAnswer(g: *Generation) chat.Failure!Answer {
     return .{ .prose = parsed.content, .reasoning = read.reasoning, .calls = parsed.calls };
 }
 
-/// Runs each call in order (results stay in call order); past the reply's call cap a call gets that note instead.
-fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, gone: anytype) chat.Failure![]Value {
+/// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls the sandbox ran.
+fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, executed: *usize, gone: anytype) chat.Failure![]Value {
     const Watch = struct {
         gone: @TypeOf(gone),
         fn left(ctx: *anyopaque) bool {
@@ -132,6 +133,7 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
         } else {
             if (code) |src| o = try srv.compute.?.run(a, src, .{ .ctx = &watch, .gone = Watch.left });
             if (o.status == .cancelled) return error.Cancelled;
+            if (code != null and o.status != .unavailable) executed.* += 1;
             body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
             ran.* += 1;
         }
@@ -242,6 +244,7 @@ fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.
     if (m.reasoning.items.len > 0) r.reasoning = try std.mem.concat(a, u8, &.{ m.reasoning.items, last.reasoning orelse "" });
     r.completion_tokens += m.completion;
     r.reasoning_tokens += m.reasoning_tokens;
+    r.compute_ran = m.ran;
     if (m.calls.items.len == 0 and m.inserted == 0) return r;
     const rt = r.runtime.object;
     const tail = if (rt.get("token_ids")) |t| t.array else &[_]Value{};

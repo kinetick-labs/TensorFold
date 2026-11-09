@@ -38,6 +38,17 @@ test "compute lane config: off unless the flag is 1" {
     try expectEqualStrings("", c.cpus);
 }
 
+test "compute lane config: _DEFAULT is off unless 1, needs the lane and refuses other values" {
+    try expect(!(try parse(&.{.{ "TF_X", "1" }})).?.default);
+    try expect(!(try parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT", "0" } })).?.default);
+    try expect(!(try parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT", "" } })).?.default);
+    try expect((try parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT", "1" } })).?.default);
+    try expectEqual(null, try parse(&.{ .{ "TF_X", "0" }, .{ "TF_X_DEFAULT", "0" } }));
+    try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT", "yes" } }));
+    try std.testing.expectError(error.BadKnob, parse(&.{.{ "TF_X_DEFAULT", "1" }}));
+    try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "0" }, .{ "TF_X_DEFAULT", "1" } }));
+}
+
 test "compute lane config: every knob parses" {
     const c = (try parse(&.{
         .{ "TF_X", "1" },                          .{ "TF_X_WORKERS", "3" },    .{ "TF_X_MAX_MS", "2500" },

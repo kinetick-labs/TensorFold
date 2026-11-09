@@ -67,6 +67,7 @@ pub const Generation = struct {
     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
+    lane_own: bool = false, // Input.lane_own: a call max_tokens cut never shows as prose, as the reply's own call
     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
@@ -322,7 +323,8 @@ pub const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, g.single) else content;
+            const cut = g.lane_own and std.mem.eql(u8, reason, "length");
+            const shown = if (cut) try reply_text.cutProse(a, content) else if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, g.single) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (rest.len > 0) try g.emit(sink, .{ .string = rest });
