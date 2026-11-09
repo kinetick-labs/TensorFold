@@ -17,6 +17,7 @@ pub const Window = struct {
     parents: ?[]const i32, // each row's parent row (row 0: -1) for a tree; null for a chain
     positions: []const u64, // the absolute position each row's draw is keyed at
     early: bool = false, // also draft each row's first head draft behind the verify (speculate_early)
+    forced: u32 = 0, // rows after the pending one that are forced (a result's tokens): always kept, never drafts
     masks: []const u32 = &.{}, // structured output: each row's allowed-token bits (rows x words, lanes/grammar.zig); empty: none
 
     pub fn rows(w: Window) usize {

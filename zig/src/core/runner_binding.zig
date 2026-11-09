@@ -24,7 +24,31 @@ pub const Binding = struct {
         const old = b.alias orelse return b.prefix;
         return if (set(get(old))) old else b.prefix;
     }
+
+    /// PREFIX_TRACE=1 (stderr) or a path: rounds around each runner fire (lanes round_trace); PREFIX_TRACE_ROUNDS: 12.
+    pub fn openRoundTrace(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!void {
+        if (b.alias) |old| if (set(get(old))) return roundTrace(old, get);
+        return roundTrace(b.prefix, get);
+    }
 };
+
+fn roundTrace(comptime p: []const u8, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!void {
+    const path = get(p ++ "_TRACE") orelse return;
+    if (path.len == 0 or std.mem.eql(u8, path, "0")) return;
+    const rounds = if (get(p ++ "_TRACE_ROUNDS")) |r| std.fmt.parseInt(u32, r, 10) catch {
+        log.warn("{s}_TRACE_ROUNDS={s}: not a count of rounds", .{ p, r });
+        return error.BadKnob;
+    } else 12;
+    var z: [std.fs.max_path_bytes:0]u8 = undefined;
+    const fd: c_int = if (std.mem.eql(u8, path, "1")) 2 else if (path.len < z.len) blk: {
+        @memcpy(z[0..path.len], path);
+        z[path.len] = 0;
+        break :blk std.c.open(z[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    } else -1;
+    if (fd < 0) return log.warn("{s}_TRACE: cannot open {s}", .{ p, path });
+    @import("lanes").round_trace.open(fd, rounds, null);
+    log.info("in-model runner: round trace, {d} rounds around each fire to {s}", .{ rounds, if (fd == 2) "stderr" else path });
+}
 
 fn set(v: ?[]const u8) bool {
     return if (v) |s| s.len > 0 else false;
@@ -61,4 +85,17 @@ test "runner binding: the generic names or the family's alias, never both switch
     Env.pairs = &.{.{ "TF_RUNNER_CIRCUIT", "/test.tfpc" }};
     try t.expect((try dsv41.parse(&Env.get)) == null);
     try t.expect((try flashnext.parse(&Env.get)) == null);
+}
+
+test "runner binding: the round trace stays off unless asked, and a bad round count is refused" {
+    Env.pairs = &.{.{ "TF_DSV41_RUNNER", "1" }};
+    try dsv41.openRoundTrace(&Env.get);
+    Env.pairs = &.{ .{ "TF_DSV41_RUNNER", "1" }, .{ "TF_DSV41_RUNNER_TRACE", "0" } };
+    try dsv41.openRoundTrace(&Env.get);
+    try t.expect(!@import("lanes").round_trace.on());
+    Env.pairs = &.{ .{ "TF_DSV41_RUNNER", "1" }, .{ "TF_DSV41_RUNNER_TRACE", "1" }, .{ "TF_DSV41_RUNNER_TRACE_ROUNDS", "x" } };
+    try t.expectError(error.BadKnob, dsv41.openRoundTrace(&Env.get));
+    Env.pairs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_DSV41_RUNNER_TRACE_ROUNDS", "x" } };
+    try dsv41.openRoundTrace(&Env.get);
+    try t.expect(!@import("lanes").round_trace.on());
 }
