@@ -70,6 +70,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
         const take = @min(width - 1, s.force.items.len);
         const forced = try a.dupe(u32, s.force.items[0..take]);
         s.force.replaceRangeAssumeCapacity(0, take, &.{});
+        s.forced_out += take;
         p.kind = .forced;
         p.forced = forced;
         p.tokens = forced;
