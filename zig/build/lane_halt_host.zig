@@ -38,6 +38,7 @@ pub fn steps(b: *std.Build) void {
     hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"compute hold:"} })).step);
     b.step("test-runner-abstain-host", "Abstain records: each abstained cell's source, reason and decision point").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner abstain records:"} })).step);
     b.step("test-settle-fire-host", "PREFIX_SYNC_GRAPH on the fake target: fires settled at their trigger never hold").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"settled fires:"} })).step);
+    b.step("test-forced-rows-host", "A held fire's forced result lands whole on the fake target: no hold inside it").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"forced rows:"} })).step);
     b.step("test-runner-host", "The in-model runner: scanner, held results and delivery with a fake circuit backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner"} })).step);
     // proof 2 on the real circuit (TF_RUNNER_CIRCUIT): optimized, since a debug evaluator takes minutes a run
     const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });

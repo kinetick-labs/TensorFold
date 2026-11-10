@@ -74,6 +74,7 @@ test {
     _ = @import("hold_test.zig");
     _ = @import("fire_replay_test.zig");
     _ = @import("settle_fire_test.zig");
+    _ = @import("forced_rows_hold_test.zig");
     _ = @import("round_trace_test.zig");
     _ = @import("open_first_test.zig");
     _ = @import("open_trace_test.zig");
