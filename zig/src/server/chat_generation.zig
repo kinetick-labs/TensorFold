@@ -87,6 +87,7 @@ pub const Generation = struct {
     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
+    resumed: bool = false, // a segment after an inserted tool result (compute_segments.next)
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -372,6 +373,12 @@ pub const Generation = struct {
             const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
             r.reasoning = nonEmpty(reply_text.pyStrip(split.reasoning));
             r.content = split.answer;
+            // a resumed segment that ended at its EOS inside the think block the result turn reopened: its text answers
+            const t = g.collected.items;
+            if (g.resumed and close_at != .token and r.reasoning != null and reply_text.pyStrip(r.content).len == 0 and t.len > 0 and g.eos(t[t.len - 1])) {
+                r.content = r.reasoning.?;
+                r.reasoning = null;
+            }
         } else if (g.srv.info.capability(.reasoning)) {
             const h = reply_text.parseHarmony(text);
             r.content = h.content;
