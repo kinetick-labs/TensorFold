@@ -51,6 +51,13 @@ pub fn resultRow(s: *Stream) bool {
     return s.resumed_rows > 0;
 }
 
+/// The next forced token off the queue, a forced row of the next commit (no hold before its last), or null.
+pub fn popForce(s: *Stream) ?u32 {
+    if (s.force.items.len == 0) return null;
+    s.forced_out += 1;
+    return s.force.orderedRemove(0);
+}
+
 /// Continues a stream held at a runner trigger: `tokens` (cut to the room left) are forced next, then the model draws.
 pub fn resumeAwaiting(s: *Stream, gpa: Allocator, tokens: []const u32) Allocator.Error!bool {
     if (!s.awaiting or !s.held or s.finished) return false;

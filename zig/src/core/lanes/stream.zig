@@ -253,6 +253,7 @@ pub const Stream = struct {
     hold_eos: bool = false,
     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
     resumed_rows: usize = 0, // a held reply's result rows still to land: their EOS neither holds nor ends it
+    forced_out: usize = 0, // forced rows taken off `force` for the next commit: a hold before the last drops them
     runner: ?RunnerHook = null,
     awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
     settle: enum { none, matching, cut } = .none, // this commit: a result settled at a trigger (hold.settle), its end
@@ -491,6 +492,7 @@ pub const Stream = struct {
         }
         var landed: usize = 0;
         s.settle = .none;
+        defer s.forced_out = 0; // the commit's forced rows lead it: those it did not land are gone
         for (tokens, 0..) |t, i| {
             if (s.finished) break;
             if (s.settle == .matching and !@import("hold.zig").settledNext(s, t)) break;
@@ -505,6 +507,7 @@ pub const Stream = struct {
             s.context.appendAssumeCapacity(t);
             if (rows.len > 0) s.rows.appendAssumeCapacity(rows[i]);
             landed += 1;
+            s.forced_out -|= 1;
             const ended_think = s.think_open and @as(i64, t) == s.think_end;
             if (@as(i64, t) == s.think_end) {
                 s.think_open = false;
@@ -521,7 +524,7 @@ pub const Stream = struct {
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
             const result_row = @import("hold.zig").resultRow(s); // its EOS (ChatML's <|im_end|>) closes the tool turn
             if (!result_row and @import("runner_eos.zig").hold(s, t, stopped)) break;
-            const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
+            const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.forced_out == 0 and s.budgetLeft() > 1;
             if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
                 if (try @import("hold.zig").settle(s, gpa, r)) continue;
                 s.held = true;
@@ -564,10 +567,7 @@ pub const Stream = struct {
         return c.check(c.ptr, s.emitted());
     }
 
-    pub fn popForce(s: *Stream) ?u32 {
-        if (s.force.items.len == 0) return null;
-        return s.force.orderedRemove(0);
-    }
+    pub const popForce = @import("hold.zig").popForce;
 };
 
 test {
