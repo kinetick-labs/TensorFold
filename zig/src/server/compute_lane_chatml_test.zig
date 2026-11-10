@@ -51,8 +51,11 @@ const Run = struct {
     }
 };
 
-/// One lane chat on the dory template (markers are text, as in Qwen): a held call segment, then `answer_text`.
-fn run(a: std.mem.Allocator, dir_out: *std.testing.TmpDir, thinking: bool, stream: bool, answer_text: []const u8) !Run {
+const Opt = struct { thinking: bool, stream: bool = false, answer: []const u8, then: []const u8 = "", max_tokens: i64 = 400 };
+
+/// One lane chat on the dory template (markers are text, as in Qwen): a held call segment, `answer`, then `then`.
+fn run(a: std.mem.Allocator, dir_out: *std.testing.TmpDir, o: Opt) !Run {
+    const thinking, const stream = .{ o.thinking, o.stream };
     const tok = try h.obj(a, @embedFile("fixtures/control_tokens/mini_tokenizer.json"));
     for (tok.get("added_tokens").?.array) |added| {
         const name = added.strField("content").?;
@@ -69,9 +72,10 @@ fn run(a: std.mem.Allocator, dir_out: *std.testing.TmpDir, thinking: bool, strea
     const text = hf.text();
     const eos = text.tokenId("<|im_end|>").?;
     const call = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, call_text), &.{eos} });
-    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, answer_text), &.{eos} });
+    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, o.answer), &.{eos} });
+    const then = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, o.then), &.{eos} });
     const script = try a.create(h.Script);
-    script.* = .{ .a = a, .call = call, .answer = answer };
+    script.* = .{ .a = a, .call = call, .answer = answer, .answers = if (o.then.len > 0) try a.dupe([]const u32, &.{ answer, then }) else &.{} };
     const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = thinking, .use_drafts = false }, null);
     const cfg: lane.Config = .{ .python = python };
     srv.info.compute = cfg;
@@ -81,7 +85,7 @@ fn run(a: std.mem.Allocator, dir_out: *std.testing.TmpDir, thinking: bool, strea
     conn.* = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
     const body = try json.newObject(a);
     try body.put(a, "model", .{ .string = "m" });
-    try body.put(a, "max_tokens", try json.intValue(a, 400));
+    try body.put(a, "max_tokens", try json.intValue(a, o.max_tokens));
     try body.put(a, "messages", try tf.messages(a, "What is 6*7?"));
     try body.put(a, "tools", try h.obj(a, "[{\"type\":\"code_interpreter\"}]"));
     if (thinking) try body.put(a, "chat_template_kwargs", try h.obj(a, "{\"enable_thinking\":true}"));
@@ -104,7 +108,7 @@ test "compute lane: a ChatML turn close after the held EOS goes in with the resu
     const a = arena.allocator();
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
-    var r = try run(a, &tmp, false, false, "It is 42.");
+    var r = try run(a, &tmp, .{ .thinking = false, .answer = "It is 42." });
     defer r.deinit();
     const said = try json.stringify(a, r.reply.body, .{});
     errdefer std.debug.print("COMPUTE_LANE_CHATML_REPLY {s}\n", .{said});
@@ -122,36 +126,68 @@ test "compute lane: a ChatML turn close after the held EOS goes in with the resu
     try t.expect(report.get("inserted").?.bool);
 }
 
-test "compute lane: an answer after the result, ended inside the think block the result turn reopened, is the content" {
-    try skipUnlessLinux();
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    // thinking on: the generation prompt after the tool turn opens a think block; the model answers and stops in it
-    var r = try run(a, &tmp, true, false, "The product is 42.");
-    defer r.deinit();
-    const said = try json.stringify(a, r.reply.body, .{});
-    errdefer std.debug.print("COMPUTE_LANE_CHATML_THINK_REPLY {s}\n", .{said});
-    try t.expectEqual(@as(u16, 200), r.reply.code);
-    try t.expectEqual(@as(usize, 2), r.script.resumes.items.len);
-    try t.expect(std.mem.endsWith(u8, try r.text.decode(a, r.script.resumes.items[0]), "<|im_start|>assistant\n<think>\n"));
-    const choice = r.reply.body.get("choices").?.array[0];
-    try t.expectEqualStrings("stop", choice.get("finish_reason").?.string);
-    try t.expect(std.mem.indexOf(u8, choice.get("message").?.strField("content").?, "The product is 42.") != null);
+/// The reply's content and reasoning, non-streamed.
+fn message(r: *const Run) struct { content: []const u8, reasoning: []const u8 } {
+    const m = r.reply.body.get("choices").?.array[0].get("message").?;
+    return .{ .content = m.strField("content") orelse "", .reasoning = m.strField("reasoning_content") orelse "" };
 }
 
-test "compute lane: streamed, that answer arrives as content too" {
+test "compute lane: an answer left inside the think block the result turn reopened gets the next turn, thinking off" {
     try skipUnlessLinux();
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
-    var r = try run(a, &tmp, true, true, "The product is 42.");
+    // thinking on: the model stops inside the reopened think block, then answers in the turn the template opens next
+    var r = try run(a, &tmp, .{ .thinking = true, .answer = "Bo has 42.", .then = "Answer: 42" });
     defer r.deinit();
-    errdefer std.debug.print("COMPUTE_LANE_CHATML_STREAM content [{s}] reasoning [{s}]\n", .{ r.streamed.content.items, r.streamed.reasoning.items });
+    errdefer std.debug.print("COMPUTE_LANE_CLOSE_TURN {s}\n", .{json.stringify(a, r.reply.body, .{}) catch ""});
+    try t.expectEqual(@as(u16, 200), r.reply.code);
+    try t.expectEqual(@as(usize, 3), r.script.resumes.items.len);
+    try t.expect(std.mem.endsWith(u8, try r.text.decode(a, r.script.resumes.items[0]), "<|im_start|>assistant\n<think>\n"));
+    // the template's close after the EOS, then its generation prompt with thinking off: the think block closed
+    try t.expectEqualStrings("\n<|im_start|>assistant\n<think></think>", try r.text.decode(a, r.script.resumes.items[1]));
+    try t.expectEqual(@as(usize, 0), r.script.resumes.items[2].len);
+    const choice = r.reply.body.get("choices").?.array[0];
+    try t.expectEqualStrings("stop", choice.get("finish_reason").?.string);
+    try t.expectEqualStrings("Answer: 42", std.mem.trim(u8, message(&r).content, " \n"));
+    try t.expect(std.mem.indexOf(u8, message(&r).reasoning, "Bo has 42.") != null);
+}
+
+test "compute lane: streamed, the next turn's answer is the content and the unclosed text stays reasoning" {
+    try skipUnlessLinux();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var r = try run(a, &tmp, .{ .thinking = true, .stream = true, .answer = "Bo has 42.", .then = "Answer: 42" });
+    defer r.deinit();
+    errdefer std.debug.print("COMPUTE_LANE_CLOSE_STREAM content [{s}] reasoning [{s}]\n", .{ r.streamed.content.items, r.streamed.reasoning.items });
+    try t.expectEqual(@as(usize, 3), r.script.resumes.items.len);
+    try t.expectEqualStrings("Answer: 42", std.mem.trim(u8, r.streamed.content.items, " \n"));
+    try t.expect(std.mem.indexOf(u8, r.streamed.reasoning.items, "Bo has 42.") != null);
+}
+
+test "compute lane: with no room for that turn, the unclosed text is the content" {
+    try skipUnlessLinux();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var roomy = t.tmpDir(.{});
+    defer roomy.cleanup();
+    var first = try run(a, &roomy, .{ .thinking = true, .answer = "Bo has 42.", .then = "Answer: 42" });
+    defer first.deinit();
+    const rs = first.script.resumes.items;
+    // one token short of the close turn and its answer room (compute_segments.answer_room, 16); the result still fits
+    const used = first.script.call.len + rs[0].len + first.script.answer.len;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var r = try run(a, &tmp, .{ .thinking = true, .answer = "Bo has 42.", .then = "Answer: 42", .max_tokens = @intCast(used + rs[1].len + 16 - 1) });
+    defer r.deinit();
+    errdefer std.debug.print("COMPUTE_LANE_NO_ROOM {s}\n", .{json.stringify(a, r.reply.body, .{}) catch ""});
     try t.expectEqual(@as(usize, 2), r.script.resumes.items.len);
-    try t.expect(std.mem.indexOf(u8, r.streamed.content.items, "The product is 42.") != null);
+    try t.expectEqual(@as(usize, 0), r.script.resumes.items[1].len);
+    try t.expect(std.mem.indexOf(u8, message(&r).content, "Bo has 42.") != null);
 }
