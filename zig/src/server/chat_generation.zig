@@ -79,6 +79,7 @@ pub const Generation = struct {
     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
     resumed: bool = false, // a segment after an inserted tool result (compute_segments.next)
+    close_turn: bool = false, // compute_segments answers its unclosed think block in a next turn: its text stays reasoning
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -327,7 +328,7 @@ pub const Generation = struct {
     }
 
     /// A reply's text as `finish` reads it: stops, MiniMax calls as DSML, a call closed at its EOS, the think split.
-    pub const Read = struct { text: []const u8, close: []const u8, content: []const u8, reasoning: ?[]const u8 };
+    pub const Read = struct { text: []const u8, close: []const u8, content: []const u8, reasoning: ?[]const u8, unclosed: bool = false };
 
     /// `raw`, the decoded `content_tokens`, as the client reads it: every format but Kimi's native reader.
     pub fn readText(g: *const Generation, raw: []const u8, content_tokens: []const u32) Failure!Read {
@@ -344,9 +345,10 @@ pub const Generation = struct {
             const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
             r.reasoning = nonEmpty(reply_text.pyStrip(split.reasoning));
             r.content = split.answer;
-            // a resumed segment that ended at its EOS inside the think block the result turn reopened: its text answers
+            // a resumed segment that ended at its EOS inside the think block the result turn reopened
             const t = g.collected.items;
-            if (g.resumed and close_at != .token and r.reasoning != null and reply_text.pyStrip(r.content).len == 0 and t.len > 0 and g.eos(t[t.len - 1])) {
+            r.unclosed = g.resumed and close_at != .token and r.reasoning != null and reply_text.pyStrip(r.content).len == 0 and t.len > 0 and g.eos(t[t.len - 1]);
+            if (r.unclosed and !g.close_turn) { // no turn to answer in (no room, or the template has none): its text answers
                 r.content = r.reasoning.?;
                 r.reasoning = null;
             }

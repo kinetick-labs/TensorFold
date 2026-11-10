@@ -58,6 +58,19 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
                 plan = null;
             };
         }
+        if (plan == null and calls.len == 0 and answer.unclosed) if (try closeTurn(srv, cx)) |ct| if (used + ct.len + answer_room <= p.request.max_tokens) {
+            // it ended inside the think block its result turn reopened: the template's next turn, thinking off, answers
+            g.close_turn = true;
+            _ = api.hold.resumeHeld(srv.engine, g.id, .{ .tokens = ct, .think_open = false });
+            const seg = try finish(g, cx, p);
+            try note(a, &m, g, seg, ct);
+            try m.history.append(a, try assistantTurn(a, "", seg.reasoning, &.{}));
+            g = try next(g, ct, p.request.max_tokens - (used + ct.len), false);
+            g.base = m.ids.items.len;
+            filter.nextSegment();
+            try g.loop(gone);
+            continue;
+        };
         const s = plan orelse {
             // no call to run, a client's call, or no room: the reply ends at this EOS as it would without the lane
             _ = api.hold.resumeHeld(srv.engine, g.id, .{ .tokens = &.{} });
@@ -79,7 +92,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
             try m.calls.append(a, r);
             if (g.sink != null) filter.direct(try reportDelta(a, r)) catch return error.Cancelled;
         }
-        g = try next(g, s, p.request.max_tokens - (used + s.len));
+        g = try next(g, s, p.request.max_tokens - (used + s.len), p.thinking);
         g.base = m.ids.items.len; // the runner records' token indices count every segment and result before it
         filter.nextSegment();
         try g.loop(gone);
@@ -88,13 +101,14 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
 }
 
 fn finish(g: *Generation, cx: *Cx, p: chat.Prepared) chat.Failure!chat.Reply {
-    return g.finish(cx, p.prompt_len, p.received, p.thinking, p.reasoning, p.effort, p.sampled, p.drafts);
+    // a close turn's answer segment counts no reasoning tokens: its think block closed in the forced rows
+    return g.finish(cx, p.prompt_len, p.received, p.thinking, p.reasoning and g.thinking, p.effort, p.sampled, p.drafts);
 }
 
-/// The segment after an inserted result: the same reply, its first tokens the result's, its own text and calls.
-fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Generation {
+/// The segment after inserted rows: the same reply, its first tokens those rows, its own text and calls.
+fn next(g: *Generation, inserted: []const u32, left: usize, thinking: bool) chat.Failure!*Generation {
     const n = try g.a.create(Generation);
-    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .resumed = true, .consumed = g.consumed, .chunk_index = g.chunk_index, .cells_sent = g.cells_sent, .cells_sig = g.cells_sig, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
+    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .resumed = true, .consumed = g.consumed, .chunk_index = g.chunk_index, .cells_sent = g.cells_sent, .cells_sig = g.cells_sig, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
     if (g.calls != null) n.calls = try tool_stream.Streamer.init(g.a, g.tools);
     return n;
 }
@@ -106,14 +120,33 @@ fn builtInOnly(calls: ?[]Value, n: []const u8) []Value {
     return all;
 }
 
-const Answer = struct { prose: []const u8, reasoning: ?[]const u8, calls: ?[]Value };
+const Answer = struct { prose: []const u8, reasoning: ?[]const u8, calls: ?[]Value, unclosed: bool };
 
 /// The segment's answer as `Generation.finish` reads it, then its calls parsed out of the answer.
 fn segmentAnswer(g: *Generation) chat.Failure!Answer {
     const tokens = reply_text.stripTrailing(g.collected.items, g.srv.eos);
     const read = try g.readText(try g.srv.text.decode(g.a, tokens), tokens);
     const parsed = try tool_parse.parse(g.a, read.content, g.tools, null);
-    return .{ .prose = parsed.content, .reasoning = read.reasoning, .calls = parsed.calls };
+    return .{ .prose = parsed.content, .reasoning = read.reasoning, .calls = parsed.calls, .unclosed = read.unclosed };
+}
+
+/// After an EOS: the template's close, then its next turn with thinking off (a probe chat's); null if it has none.
+fn closeTurn(srv: *Server, cx: *Cx) chat.Failure!?[]const u32 {
+    const probe = switch (try json.parseText(cx.a, "[{\"role\":\"user\",\"content\":\".\"},{\"role\":\"assistant\",\"content\":\".\"}]")) {
+        .ok => |v| v,
+        .err => return null,
+    };
+    const turn = prompt_mod.renderIds(srv, cx, probe, &.{}, false, null, false) catch |e| return unrendered(e);
+    const with_next = prompt_mod.renderIds(srv, cx, probe, &.{}, false, null, true) catch |e| return unrendered(e);
+    const end = try callEnd(srv, cx.a, turn) orelse return null;
+    if (with_next.len <= turn.len or !std.mem.eql(u32, with_next[0..turn.len], turn)) return null;
+    return try std.mem.concat(cx.a, u32, &.{ turn[end..], with_next[turn.len..] });
+}
+
+fn unrendered(e: anyerror) chat.Failure!?[]const u32 {
+    if (e == error.OutOfMemory) return error.OutOfMemory;
+    log.line("warning: compute lane: the thinking-off turn did not render ({t}); an unclosed answer stays as it is", .{e});
+    return null;
 }
 
 /// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls an executor ran.

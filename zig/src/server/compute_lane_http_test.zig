@@ -14,6 +14,7 @@ pub const Script = struct {
     a: Allocator,
     call: []const u32, // the call segment, its EOS last
     answer: []const u32, // the answer segment, its EOS last
+    answers: []const []const u32 = &.{}, // the model's tokens after the first resumes, in order; past them `answer`
     sink: ?api.Sink = null,
     id: api.Id = 0,
     held_asked: bool = false,
@@ -43,7 +44,8 @@ pub const Script = struct {
         if (r.tokens.len == 0) return sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
         // the forced rows come back as committed tokens, then the model's own
         sink.event(sink.ctx, id, &.{ .tokens = r.tokens });
-        sink.event(sink.ctx, id, &.{ .tokens = s.answer });
+        const n = s.resumes.items.len - 1;
+        sink.event(sink.ctx, id, &.{ .tokens = if (n < s.answers.len) s.answers[n] else s.answer });
     }
     fn cancel(_: *anyopaque, _: api.Id) void {}
     fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
