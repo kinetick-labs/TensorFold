@@ -9,6 +9,7 @@ pub const Family = struct {
     quiet: []const [2][]const u8 = &.{}, // opener and closer of text no cell is read in: tool calls, tool results
     never: []const []const u8 = &.{}, // markup an owned result may not spell (it would read as a call or a think end)
     trust: ?[]const u8 = null, // the compute default's guide, measured on this family; null: none yet, chats get none
+    reasoning_only: bool = false, // with no PREFIX_SPANS: cells only in the think block, and thinking chats only (server/chat.zig)
 
     /// Whether `out` spells any of the family's markup: such a result is the model's to write, never owned.
     pub fn unsafe(f: Family, out: []const u8) bool {
@@ -33,20 +34,22 @@ pub const Binding = struct {
     /// The runner's config under the prefix whose switch the boot set; both switches set is error.BadKnob.
     pub fn parse(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!?runner.Config {
         // by the switch alone: TF_RUNNER_CIRCUIT, _CLANG and _LLD also name tools for tests and image checks
-        const old = b.alias orelse return b.of(try runner.Config.parse(get, b.prefix));
-        if (!set(get(old))) return b.of(try runner.Config.parse(get, b.prefix));
+        const old = b.alias orelse return b.of(get, b.prefix, try runner.Config.parse(get, b.prefix));
+        if (!set(get(old))) return b.of(get, b.prefix, try runner.Config.parse(get, b.prefix));
         if (set(get(b.prefix))) {
             log.warn("turn the in-model runner on with {s} or {s}, not both", .{ b.prefix, old });
             return error.BadKnob;
         }
-        return b.of(try runner.Config.parse(get, old));
+        return b.of(get, old, try runner.Config.parse(get, old));
     }
 
-    fn of(comptime b: Binding, parsed: ?runner.Config) ?runner.Config {
+    fn of(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8, parsed: ?runner.Config) ?runner.Config {
         comptime for (b.family.quiet) |s| std.debug.assert(s[0].len > 0 and s[0].len <= quiet_max and s[1].len <= quiet_max);
         var c = parsed orelse return null;
         c.family = b.family;
         c.scan.quiet = b.family.quiet;
+        // the family's own scope unless the boot names one (PREFIX_SPANS=all keeps every span)
+        if (b.family.reasoning_only and !set(get(prefix ++ "_SPANS"))) c.scan.reasoning_only = true;
         return c;
     }
 
@@ -107,6 +110,7 @@ test "runner binding: the generic names or the family's alias, never both switch
     const generic = (try dsv41.parse(&Env.get)).?;
     try t.expectEqualStrings("/g.tfpc", generic.circuit);
     try t.expect(generic.scan.inline_math and !generic.scan.fence);
+    try t.expect(!generic.scan.reasoning_only and !old.scan.reasoning_only); // DeepSeek-V4.1 keeps every span by default
     try t.expectEqualStrings("TF_RUNNER", dsv41.active(&Env.get));
     const plain: Binding = .{ .family = .{ .quiet = &.{.{ "<a>", "</a>" }}, .never = &.{"</a>"} } };
     const fam = (try plain.parse(&Env.get)).?;
