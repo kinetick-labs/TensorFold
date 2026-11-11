@@ -129,6 +129,19 @@ test "Server recovery: token staging allocation failure ends the loop without co
     }
 }
 
+/// Whether a reply gets a runner session (and the runner guide): with the spans `reasoning`, thinking chats only.
+fn runsCells(srv: *Server, thinking: bool) bool {
+    const rn = srv.info.runner orelse return false;
+    return thinking or !rn.cfg.scan.reasoning_only;
+}
+
+/// Python's ``bool(fields.get(key))`` on the sampling fields.
+fn flag(f: Value, key: []const u8) ?bool {
+    const v = f.get(key) orelse return null;
+    if (v == .null) return null;
+    return v.truthy();
+}
+
 /// A request rendered and checked but not submitted; it holds the preparing count until generate or release.
 pub const Prepared = struct {
     input: Input,
@@ -155,7 +168,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     // the runner guide (runner_guide.zig) with the runner on: the request's, or the boot's under the compute default
     const thinks = input.prompt == null and (flag(input.fields, "enable_thinking") orelse srv.config.enable_thinking);
     const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields, thinks);
-    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
+    const guided = @import("runner_guide.zig").apply(a, if (input.prompt == null and runsCells(srv, thinks)) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
         error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -246,7 +259,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     // the compute lane: a reply offered the built-in tool holds at each EOS for its results (not with stop strings)
     request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
     // the in-model runner (runner_binding.zig): code cells this reply writes run, their results owned in place
-    request.run_cells = srv.info.runner != null;
+    request.run_cells = runsCells(srv, thinking);
     if (request.run_cells and thinking and srv.think_close.len > 0) request.think_end = srv.think_close_end;
     if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
         return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_check a boolean, runner_trace_repeat 0 to 3");
