@@ -382,7 +382,7 @@ pub const Streamer = struct {
         return s.feed(text, out);
     }
 
-    /// ``feed`` of the reply's final text; a value it cuts sends the bytes held back for a closer that never came.
+    /// ``feed`` of the reply's final text; a cut value sends its held bytes less the start of a closer they end with.
     pub fn finishCut(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
         try s.finish(text, out);
         if (s.state == .glm) return tool_glm_stream.cut(s, text, out); // a GLM value's held bytes
@@ -390,6 +390,8 @@ pub const Streamer = struct {
         if (s.state != .value) return;
         var cut = try std.mem.concat(s.a, u8, &.{ if (s.typed) s.buffer.items else "", s.held, text[@min(s.pos, text.len)..] });
         if (s.lead and cut.len > 0 and cut[0] == '\n') cut = cut[1..];
+        cut = cut[0 .. cut.len - reply_text.partialTag(cut, "</parameter>")];
+        if (std.mem.endsWith(u8, cut, "\n")) cut = cut[0 .. cut.len - 1]; // the framing newline, as a closed value drops it
         s.lead = false;
         s.pos = text.len;
         s.held = "";

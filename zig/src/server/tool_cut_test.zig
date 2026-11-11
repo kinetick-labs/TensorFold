@@ -1,5 +1,6 @@
 //! A reply that max_tokens cuts inside a tool call: the whole reply gives what the stream gave (#1238).
 const std = @import("std");
+const api = @import("engine_api");
 const pre = @import("stream_preflight_test.zig");
 const TestText = pre.TestText;
 const CallEngine = pre.CallEngine;
@@ -133,4 +134,113 @@ test "a chunked XML cut drops only the pending framing newline" {
         try expectCut(cut, 1, "{\"path\":\"notes.txt\",\"content\":\"The histor", "", "");
     }
     try expectCut(before ++ "\n\nThe histor", 1, "{\"path\":\"notes.txt\",\"content\":\"\\nThe histor", "", "");
+}
+
+test "tool cut: an XML cut inside a value's closer drops the closer's bytes, as a GLM or DSML cut does" {
+    const args = "{\"path\":\"notes.txt\",\"content\":\"The history of";
+    inline for (.{ "\n</", "\n</param", "\n</parameter", "</par", "\n<", "\n" }) |tail| try expectCut(opened ++ tail, 1, args, "", "");
+    // bytes the value wrote stay, and a value its schema types is JSON up to the closer
+    try expectCut(opened ++ " a<b", 1, args ++ " a<b", "", "");
+    try expectCut(opened ++ "\n\n</", 1, args ++ "\\n", "", "");
+    try expectCut("<tool_call>\n<function=write_file>\n<parameter=limit>\n12\n</", 1, "{\"limit\":12", "", "");
+}
+
+/// The receipt's answer tokens as written, one engine event per token, then ``after``: the bytes it never reached.
+const PieceEngine = struct {
+    pieces: []const []const u8,
+    after: []const u8,
+
+    fn engine(e: *@This()) api.Engine {
+        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+    }
+
+    fn info(_: *anyopaque) api.Info {
+        return .{ .context_window = 4096 };
+    }
+
+    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
+        const e: *PieceEngine = @ptrCast(@alignCast(ctx));
+        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+        var ids: [64]u32 = undefined;
+        for (e.pieces) |piece| send(sink, id, piece, &ids);
+        send(sink, id, e.after, &ids);
+        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
+    }
+
+    fn send(sink: api.Sink, id: api.Id, piece: []const u8, ids: *[64]u32) void {
+        for (piece, ids[0..piece.len]) |byte, *t| t.* = byte;
+        sink.event(sink.ctx, id, &.{ .tokens = ids[0..piece.len] });
+    }
+
+    fn cancel(_: *anyopaque, _: api.Id) void {}
+
+    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
+        out.* = .{};
+    }
+
+    fn memory(_: *anyopaque, _: bool) ?api.Memory {
+        return null;
+    }
+};
+
+// agentshape2 mixed12k-s0-t1's answer as 188d9c63c cut it at max_tokens 384 (done line sha=cf988c151b1a): its tokens
+const receipt_ids = [_]u32{ 248058, 198, 27, 1628, 21402, 956, 29, 198, 27, 15704, 28, 5454, 29, 198, 24751, 976, 18997, 471, 4120, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 198, 248058, 198, 27, 1628, 21402, 956, 29, 198, 27, 15704, 28, 5454, 29, 198, 4577, 471, 4120, 593, 1715, 220, 17, 17566, 3464, 18710, 1321, 1627, 328, 2083, 593, 1715, 1, 198, 510 };
+// ...as the Flash-Next tokenizer decodes each, the reply's tokens 321..383
+const receipt = [_][]const u8{
+    "<tool_call>", "\n", "<",  "function", "=b", "ash", ">", "\n", "<", "parameter", "=", "command", ">", "\n", "pwd", " &&", " ls", " -", "la",   "\n", "</", "parameter", ">",   "\n",    "</",  "function", ">",   "\n", "</tool_call>", "\n",
+    "<tool_call>", "\n", "<",  "function", "=b", "ash", ">", "\n", "<", "parameter", "=", "command", ">", "\n", "ls",  " -",  "la",  " /", "work", " ",  "2",  ">/",        "dev", "/null", " ||", " echo",    " \"", "no", " /",           "work",
+    "\"",          "\n", "</",
+};
+comptime {
+    if (receipt.len != receipt_ids.len) @compileError("one piece per receipt token");
+}
+const bash = "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"," ++
+    "\"properties\":{\"command\":{\"type\":\"string\"}}}}}]";
+
+/// ``pieces`` then ``after``, max_tokens ``max``: whole and streamed replies give ``calls``, ``arguments``, ``finish``.
+fn expectPieces(pieces: []const []const u8, after: []const u8, max: usize, calls: usize, arguments: []const u8, finish: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],{s},\"max_tokens\":{d}", .{ bash, max });
+    var backend: PieceEngine = .{ .pieces = pieces, .after = after };
+    const whole = try sendWith(backend.engine(), .chat, try std.mem.concat(a, u8, &.{ body, ",\"stream\":false}" }), .{});
+    const streamed = try sendWith(backend.engine(), .chat, try std.mem.concat(a, u8, &.{ body, ",\"stream\":true}" }), .{});
+    try std.testing.expectEqual(@as(?u16, 200), whole.status);
+    for ([_]@TypeOf(whole){ whole, streamed }) |seen| {
+        try std.testing.expectEqual(calls, seen.calls);
+        try std.testing.expectEqualStrings(arguments, seen.arguments[0..seen.arguments_len]);
+        try std.testing.expectEqualStrings(finish, @tagName(seen.finish.?));
+    }
+}
+
+fn byteLen(pieces: []const []const u8) usize {
+    var n: usize = 0;
+    for (pieces) |p| n += p.len;
+    return n;
+}
+
+const first_call = "{\"command\":\"pwd && ls -la\"}";
+
+test "tool cut: the agentshape2 receipt's cut call ends at the bytes the value wrote, with finish length" {
+    // 188d9c63c sent ``...echo \"no /work\"\n</``: the framing newline and the closer's first token
+    try expectPieces(&receipt, "parameter>\n</function>\n</tool_call>", byteLen(&receipt), 2, first_call ++ "{\"command\":\"ls -la /work 2>/dev/null || echo \\\"no /work\\\"", "length");
+}
+
+test "tool cut: complete calls stay byte for byte: the receipt's calls closed, and values that hold closer-like bytes" {
+    const closed = "parameter>\n</function>\n</tool_call>";
+    try expectPieces(&receipt, closed, 1024, 2, first_call ++ "{\"command\":\"ls -la /work 2>/dev/null || echo \\\"no /work\\\"\"}", "tool_calls");
+    // a value whose own bytes end like a closer's start, or in newlines before its framing one, keeps them
+    const values = [_]struct { []const u8, []const u8 }{
+        .{ "echo \"</\"\n", "echo \\\"</\\\"\\n" },
+        .{ "a <", "a <" },
+        .{ "x\n\n", "x\\n\\n" },
+        .{ "  \n", "  \\n" },
+    };
+    for (values) |v| {
+        const call = [_][]const u8{ "<tool_call>\n<function=bash>\n<parameter=command>\n", v[0], "\n</parameter>\n</function>\n</tool_call>" };
+        var buf: [96]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "{{\"command\":\"{s}\"}}", .{v[1]});
+        try expectPieces(&call, "", 1024, 1, want, "tool_calls");
+    }
 }
