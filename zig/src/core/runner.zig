@@ -29,7 +29,7 @@ pub const Config = struct {
     guide_max_bytes: usize = 512, // PREFIX_GUIDE_MAX_BYTES: request guide cap, opt-in up to 2048 bytes
     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
     inline_mark: bool = false, // PREFIX_INLINE_MARK: tag owned inline values; off preserves their bytes
-    digit_stop: lanes.runner_stop.Limits = .{}, // PREFIX_DIGIT_STOP / _DIGIT_RUN_MAX: no runaway after a value
+    digit_stop: lanes.runner_stop.Limits = .{}, // PREFIX_DIGIT_STOP / _RUN_MAX / _HOLD_MAX: no runaway
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
     abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
@@ -62,6 +62,7 @@ pub const Config = struct {
         c.inline_mark = try knob(u1, get, prefix ++ "_INLINE_MARK", 0, 0, 1) == 1;
         c.digit_stop.after_value = try knob(u1, get, prefix ++ "_DIGIT_STOP", 1, 0, 1) == 1;
         c.digit_stop.run_max = try knob(u32, get, prefix ++ "_DIGIT_RUN_MAX", c.digit_stop.run_max, 0, 1 << 20);
+        c.digit_stop.hold_max = try knob(u32, get, prefix ++ "_DIGIT_HOLD_MAX", c.digit_stop.hold_max, 0, 1 << 20);
         c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
@@ -181,7 +182,8 @@ pub const Session = struct {
         if (s.broken) return null;
         const tx = s.r.text.?;
         const hit = s.digits.stop(.{ .ctx = tx.ctx, .of = tx.bytes }, tokens, forced) orelse return null;
-        log.info("reply {d}: digit stop ({t}): a drawn token replaced by a newline", .{ s.id, hit.why });
+        s.digits.fired();
+        log.info("reply {d}: digit stop ({t}): a drawn token replaced by a newline; later runs cap at {d}", .{ s.id, hit.why, s.digits.cap() });
         return hit;
     }
 
