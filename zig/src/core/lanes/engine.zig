@@ -349,7 +349,16 @@ pub const Engine = struct {
         const loop_cut = sm.loopCut(s, committed.items);
         const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
         var cut: ?usize = null;
-        if (loop_wins) {
+        const never = std.math.maxInt(usize);
+        // the runner's digit stop (reasoning rows only) wins ties with the loop guard and yields to the budget
+        const digit = @import("runner_stop.zig").cut(s, committed.items);
+        if (digit != null and digit.?.at <= (loop_cut orelse never) and digit.?.at < (budget_cut orelse never)) {
+            const hit = digit.?;
+            cut = hit.at;
+            path = path[0 .. hit.at + 1];
+            committed.shrinkRetainingCapacity(hit.at);
+            try committed.append(a, hit.token);
+        } else if (loop_wins) {
             cut = loop_cut;
             path = path[0 .. loop_cut.? + 1];
             committed.shrinkRetainingCapacity(loop_cut.? + 1);
@@ -468,6 +477,7 @@ pub const Engine = struct {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        try @import("runner_stop.zig").pipelined(e, s, &current); // the runner's digit stop reads a watched draw
         var token: u32 = undefined;
         if (mode == .drain) {
             token = try e.readFeed(current); // the last queued step: no new one
@@ -494,6 +504,7 @@ pub const Engine = struct {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        try @import("runner_stop.zig").pipelined(e, s, &current); // the runner's digit stop reads a watched draw
         const token = try e.readFeed(current);
         s.rounds += 1;
         const landed = try s.commit(e.gpa, &.{token}, &.{});
