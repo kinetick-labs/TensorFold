@@ -134,6 +134,35 @@ test "runner digit stop: a reasoning digit run stops at the cap, and runs on wit
     try std.testing.expect(off.stop(text, &.{ 7, 8, 9 }, 0) == null);
 }
 
+test "runner digit stop: once a stop fired, later runs hold at hold_max; before it, and with no hold, they run on" {
+    var st = state(.{ .run_max = 100, .hold_max = 5 });
+    landAll(&st, &.{ 1, 2, 3, 4, 5 });
+    // negative control: before any stop a sixth digit lands (the cap is still run_max)
+    try std.testing.expectEqual(@as(u32, 100), st.cap());
+    try std.testing.expect(st.stop(text, &.{6}, 0) == null);
+    st.fired();
+    try std.testing.expectEqual(@as(u32, 5), st.cap());
+    const hit = st.stop(text, &.{ 6, 7 }, 0).?;
+    try std.testing.expectEqual(@as(usize, 0), hit.at);
+    try std.testing.expectEqual(stop.Why.run_cap, hit.why);
+    try std.testing.expect(st.watching());
+    // a new run after the newline holds at the short cap too, and forced rows still pass
+    landAll(&st, &.{ nl, 1, 2, 3 });
+    try std.testing.expectEqual(@as(usize, 2), st.stop(text, &.{ 4, 5, 6 }, 0).?.at);
+    try std.testing.expect(st.stop(text, &.{ 4, 5, 6 }, 3) == null);
+    // with no run cap the hold still applies once fired
+    var uncapped = state(.{ .run_max = 0, .hold_max = 3 });
+    uncapped.fired();
+    landAll(&uncapped, &.{ 1, 2, 3 });
+    try std.testing.expectEqual(stop.Why.run_cap, uncapped.stop(text, &.{4}, 0).?.why);
+    // negative control: hold_max 0 keeps run_max after a stop
+    var nohold = state(.{ .run_max = 100, .hold_max = 0 });
+    nohold.fired();
+    landAll(&nohold, &.{ 1, 2, 3, 4, 5 });
+    try std.testing.expectEqual(@as(u32, 100), nohold.cap());
+    try std.testing.expect(nohold.stop(text, &.{ 6, 7 }, 0) == null);
+}
+
 test "runner digit stop: the newline is asked for only near the cap or at an arm, once" {
     var st: stop.State = .{ .limits = .{ .run_max = 1024 } };
     landAll(&st, &.{ 1, 2, 3 });
@@ -175,7 +204,9 @@ const Hook = struct {
 
     fn onStop(ptr: *anyopaque, tokens: []const u32, forced: usize) ?stop.Stop {
         const h: *Hook = @ptrCast(@alignCast(ptr));
-        return h.st.stop(.{ .of = sevens }, tokens, forced);
+        const hit = h.st.stop(.{ .of = sevens }, tokens, forced) orelse return null;
+        h.st.fired(); // as the runner's onStop
+        return hit;
     }
 
     fn onWatching(ptr: *anyopaque) bool {
@@ -227,9 +258,9 @@ fn longestRun(tokens: []const u32) usize {
 
 test "runner digit stop on the fake target: the draw after an owned value is a newline, MTP and pipelined rounds" {
     for ([_]bool{ true, false }) |mtp| for ([_]bool{ true, false }) |drafts| {
-        const on = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .run_max = 0 } });
+        const on = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .run_max = 0, .hold_max = 0 } });
         defer gpa.free(on.tokens);
-        const off = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .after_value = false, .run_max = 0 } });
+        const off = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .after_value = false, .run_max = 0, .hold_max = 0 } });
         defer gpa.free(off.tokens);
         const at = on.value_at.?;
         try std.testing.expectEqual(at, off.value_at.?);
@@ -268,4 +299,26 @@ test "runner digit stop on the fake target: outside reasoning the reply is the s
         defer gpa.free(open.tokens);
         try std.testing.expect(!std.mem.eql(u32, bare.tokens, open.tokens));
     }
+}
+
+fn longestFrom(tokens: []const u32, from: usize) usize {
+    return longestRun(tokens[@min(from, tokens.len)..]);
+}
+
+test "runner digit stop on the fake target: after the stop past a value the runaway holds at hold_max, not with no hold" {
+    for ([_]bool{ true, false }) |mtp| for ([_]bool{ true, false }) |drafts| {
+        const on = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .run_max = 0, .hold_max = 6 } });
+        defer gpa.free(on.tokens);
+        const off = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .run_max = 0, .hold_max = 0 } });
+        defer gpa.free(off.tokens);
+        const after = on.value_at.? + value.len;
+        try std.testing.expectEqual(nl, on.tokens[after]);
+        try std.testing.expectEqual(nl, off.tokens[after]); // both stop the first draw after the value
+        try std.testing.expect(longestFrom(on.tokens, after) <= 6);
+        try std.testing.expect(std.mem.count(u32, on.tokens[after..], &.{nl}) >= 2); // the hold cut again
+        // negative control: with no hold the model's restarted run goes on past 6
+        try std.testing.expect(longestFrom(off.tokens, after) > 6);
+        // everything up to the value and its stop is untouched by the hold
+        try std.testing.expectEqualSlices(u32, off.tokens[0 .. after + 1], on.tokens[0 .. after + 1]);
+    };
 }

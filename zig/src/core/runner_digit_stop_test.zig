@@ -120,7 +120,7 @@ test "runner digit stop: outside reasoning an owned value leaves nothing armed" 
     try std.testing.expect(!seen.digit and !seen.space);
 }
 
-test "runner digit stop: TF_R_DIGIT_STOP and TF_R_DIGIT_RUN_MAX parse, on with a 1024-digit cap unless set" {
+test "runner digit stop: TF_R_DIGIT_STOP, _RUN_MAX and _HOLD_MAX parse: on, a 1024 cap, a 64 hold unless set" {
     const K = struct {
         var set: []const [2][]const u8 = &.{};
         fn get(name: []const u8) ?[]const u8 {
@@ -130,10 +130,14 @@ test "runner digit stop: TF_R_DIGIT_STOP and TF_R_DIGIT_RUN_MAX parse, on with a
     };
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" } };
     const d = (try runner.Config.parse(&K.get, "TF_R")).?;
-    try std.testing.expect(d.digit_stop.after_value and d.digit_stop.run_max == 1024);
+    try std.testing.expect(d.digit_stop.after_value and d.digit_stop.run_max == 1024 and d.digit_stop.hold_max == 64);
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_STOP", "0" }, .{ "TF_R_DIGIT_RUN_MAX", "0" } };
     const off = (try runner.Config.parse(&K.get, "TF_R")).?;
     try std.testing.expect(!off.digit_stop.after_value and off.digit_stop.run_max == 0);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_HOLD_MAX", "0" } };
+    try std.testing.expectEqual(@as(u32, 0), (try runner.Config.parse(&K.get, "TF_R")).?.digit_stop.hold_max);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_HOLD_MAX", "x" } };
+    try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
     for ([_][]const u8{ "2", "x" }) |v| {
         K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_STOP", v } };
         try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
