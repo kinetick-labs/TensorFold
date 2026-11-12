@@ -438,10 +438,11 @@ pub const Stream = struct {
         return s.budgetActive() and s.emitted().len + 1 >= s.think_budget;
     }
 
-    /// Begin the budget's close: its first token now, the rest forced; callers cut only with no forced row queued.
+    /// Begin the budget's close: its first token now, the rest forced; a result's rows still landing keep their count.
     pub fn startClose(s: *Stream, gpa: Allocator) !u32 {
-        try s.force.ensureUnusedCapacity(gpa, s.think_close.len - 1);
+        try s.force.ensureTotalCapacity(gpa, s.think_close.len - 1);
         s.think_open = false;
+        s.force.clearRetainingCapacity();
         s.force.appendSliceAssumeCapacity(s.think_close[1..]);
         return s.think_close[0];
     }
