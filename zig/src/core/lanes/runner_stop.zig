@@ -9,8 +9,8 @@ pub const Stop = struct { at: usize, token: u32, why: Why };
 
 pub const Why = enum { after_value, run_cap };
 
-/// PREFIX_DIGIT_STOP and PREFIX_DIGIT_RUN_MAX (core/runner.zig parses them); run_max 0: no cap.
-pub const Limits = struct { after_value: bool = true, run_max: u32 = 1024 };
+/// PREFIX_DIGIT_STOP, _RUN_MAX, _HOLD_MAX (runner.zig); 0: no cap. hold_max caps runs once a stop fired in the reply.
+pub const Limits = struct { after_value: bool = true, run_max: u32 = 1024, hold_max: u32 = 64 };
 
 /// One token's bytes, as the runner's tokenizer gives them.
 pub const Bytes = struct {
@@ -43,6 +43,7 @@ pub const State = struct {
     looked: bool = false, // `look` asked the tokenizer for it (once: one token or none)
     lead: ?usize = null, // armed: owned tokens still to land; at 0 the next token is the model's first after the value
     run: u32 = 0, // digits ending the reasoning's committed text
+    held: bool = false, // a stop fired in this reply: later runs cap at hold_max
 
     /// The newline token from `text` (its `encode`, as the runner's Text), asked once.
     pub fn look(st: *State, gpa: Allocator, text: anytype) Allocator.Error!void {
@@ -55,7 +56,20 @@ pub const State = struct {
 
     /// Whether the run nears its cap with the newline not yet asked for (the runner then calls `look`).
     pub fn wants(st: *const State) bool {
-        return !st.looked and st.limits.run_max > 0 and st.run +| 64 > st.limits.run_max;
+        const c = st.cap();
+        return !st.looked and c > 0 and st.run +| 64 > c;
+    }
+
+    /// The digit-run cap now (0: none): run_max, or hold_max once a stop fired.
+    pub fn cap(st: *const State) u32 {
+        const h = st.limits.hold_max;
+        if (!st.held or h == 0) return st.limits.run_max;
+        return if (st.limits.run_max == 0) h else @min(st.limits.run_max, h);
+    }
+
+    /// A stop this state returned was applied: the reply's later runs hold at hold_max.
+    pub fn fired(st: *State) void {
+        st.held = true;
     }
 
     /// An owned inline value is forced next: `count` tokens whose text is `value` (armed when it ends in a digit).
@@ -76,12 +90,13 @@ pub const State = struct {
         const nl = st.newline orelse return null;
         var lead = st.lead;
         var run = st.run;
+        const c = st.cap();
         for (tokens, 0..) |t, i| {
             const b = bytes.of(bytes.ctx, t);
             const owned = if (lead) |n| n > 0 else false;
             if (!owned and i >= forced and b.len > 0 and digit(b[0])) {
                 if (lead != null) return .{ .at = i, .token = nl, .why = .after_value };
-                if (st.limits.run_max > 0 and run +| leading(b) > st.limits.run_max) return .{ .at = i, .token = nl, .why = .run_cap };
+                if (c > 0 and run +| leading(b) > c) return .{ .at = i, .token = nl, .why = .run_cap };
             }
             if (lead) |n| lead = if (n > 0) n - 1 else null;
             run = extend(run, b);
@@ -92,7 +107,8 @@ pub const State = struct {
     /// Whether the next draw could be stopped: a pipelined stream reads it before feeding it.
     pub fn watching(st: *const State) bool {
         if (st.newline == null) return false;
-        return st.lead != null or (st.limits.run_max > 0 and st.run +| 16 > st.limits.run_max);
+        const c = st.cap();
+        return st.lead != null or (c > 0 and st.run +| 16 > c);
     }
 };
 
