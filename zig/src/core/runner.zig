@@ -29,6 +29,7 @@ pub const Config = struct {
     guide_max_bytes: usize = 512, // PREFIX_GUIDE_MAX_BYTES: request guide cap, opt-in up to 2048 bytes
     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
     inline_mark: bool = false, // PREFIX_INLINE_MARK: tag owned inline values; off preserves their bytes
+    digit_stop: lanes.runner_stop.Limits = .{}, // PREFIX_DIGIT_STOP / _DIGIT_RUN_MAX: no runaway after a value
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
     abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
@@ -59,6 +60,8 @@ pub const Config = struct {
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
         c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);
         c.inline_mark = try knob(u1, get, prefix ++ "_INLINE_MARK", 0, 0, 1) == 1;
+        c.digit_stop.after_value = try knob(u1, get, prefix ++ "_DIGIT_STOP", 1, 0, 1) == 1;
+        c.digit_stop.run_max = try knob(u32, get, prefix ++ "_DIGIT_RUN_MAX", c.digit_stop.run_max, 0, 1 << 20);
         c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
@@ -93,18 +96,8 @@ pub const Config = struct {
         return c;
     }
 
-    fn knob(comptime T: type, get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8, default: T, min: T, max: T) error{BadKnob}!T {
-        const text = get(name) orelse return default;
-        if (text.len == 0) return default;
-        const v = std.fmt.parseInt(T, text, 10) catch return bad(name, text);
-        if (v < min or v > max) return bad(name, text);
-        return v;
-    }
-
-    fn bad(name: []const u8, value: []const u8) error{BadKnob} {
-        log.warn("{s}={s} is not a valid value", .{ name, value });
-        return error.BadKnob;
-    }
+    const knob = @import("runner_knob.zig").knob;
+    const bad = @import("runner_knob.zig").bad;
 };
 
 /// The engine's tokenizer as the runner needs it: one token's bytes, and text to token ids.
@@ -133,7 +126,7 @@ pub const Runner = struct {
         var cfg = r.cfg.scan;
         if (ask.off) cfg.trace = false;
         cfg.trace_repeat = ask.repeat;
-        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells, .abstains_on = r.cfg.abstains } };
+        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells, .abstains_on = r.cfg.abstains }, .digits = .{ .limits = r.cfg.digit_stop } };
         r.next_id += 1;
         return s;
     }
@@ -177,9 +170,24 @@ pub const Session = struct {
     check: bool = false, // TraceAsk.check
     rec: records.Log = .{}, // the receipt's per-cell records
     commit: answer.State = .{}, // PREFIX_COMMIT: the request's ask (lane_stream), the think state, whether it fired
+    digits: lanes.runner_stop.State = .{}, // the digit stop after owned inline values, in reasoning (lanes/runner_stop.zig)
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
-        return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null, .eos = onEos };
+        return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null, .eos = onEos, .stop = onStop, .watching = onWatching };
+    }
+
+    fn onStop(ptr: *anyopaque, tokens: []const u32, forced: usize) ?lanes.runner_stop.Stop {
+        const s: *Session = @ptrCast(@alignCast(ptr));
+        if (s.broken) return null;
+        const tx = s.r.text.?;
+        const hit = s.digits.stop(.{ .ctx = tx.ctx, .of = tx.bytes }, tokens, forced) orelse return null;
+        log.info("reply {d}: digit stop ({t}): a drawn token replaced by a newline", .{ s.id, hit.why });
+        return hit;
+    }
+
+    fn onWatching(ptr: *anyopaque) bool {
+        const s: *Session = @ptrCast(@alignCast(ptr));
+        return !s.broken and s.digits.watching();
     }
 
     /// The tokens a trigger's run settled with at the token itself (once; null: hold for them as before).
@@ -234,6 +242,8 @@ pub const Session = struct {
             s.sync_ids = &.{};
         }
         const bytes = if (think_end) "" else tx.bytes(tx.ctx, token);
+        s.digits.landed(bytes, think_open);
+        if (s.digits.wants()) try s.digits.look(s.r.gpa, tx);
         try s.rec.token(s.r.gpa, token, bytes, think_open);
         if (answer.skip(&s.commit, think_open)) return false;
         const scanning = if (s.forcing) |*r| output.scanning(&r.inline_bytes_left, bytes) else bytes;
@@ -377,6 +387,7 @@ pub const Session = struct {
             return ids;
         }
         s.owned_n += 1;
+        if (w.inline_space != null) try s.digits.arm(s.r.gpa, s.r.text.?, ids.len, if (s.r.cfg.inline_mark) output.suffix else output.value(res.out));
         c.told = .owned;
         c.owned_tokens = @intCast(ids.len);
         s.rec.owned(s.r.gpa, w.index, ids) catch {
@@ -577,23 +588,5 @@ const Translate = struct {
 };
 
 test {
-    _ = @import("runner_scan.zig");
-    _ = @import("runner_api.zig");
-    _ = @import("runner_trace_test.zig");
-    _ = @import("runner_settle_test.zig");
-    _ = @import("runner_sync_test.zig");
-    _ = @import("runner_probe.zig");
-    _ = @import("runner_graph_table_test.zig");
-    _ = @import("runner_inline_mod_test.zig");
-    _ = @import("runner_inline_arith_test.zig");
-    _ = @import("runner_inline_chain_test.zig");
-    _ = @import("runner_receipt_test.zig");
-    _ = @import("runner_inline_context_test.zig");
-    _ = @import("runner_inline_hex_test.zig");
-    _ = @import("runner_trace_stated_test.zig");
-    _ = @import("runner_trace_divmod_test.zig");
-    _ = @import("runner_trace_named_test.zig");
-    _ = @import("runner_trace_check_test.zig");
-    _ = @import("runner_graph_edit.zig");
-    _ = @import("runner_commit.zig");
+    _ = @import("runner_tests.zig");
 }
