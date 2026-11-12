@@ -420,13 +420,15 @@ pub const Stream = struct {
         return s.think_open and s.think_budget > 0 and s.think_close.len > 0;
     }
 
-    /// The index the thinking budget replaces with `think_close[0]`, or null if the block closed first.
+    /// Where the budget's close replaces a draw (null: block closed); never inside forced rows nor past a drawn EOS.
     pub fn thinkCut(s: *const Stream, tokens: anytype) ?usize {
-        if (!s.budgetActive()) return null;
+        if (!s.budgetActive() or s.force.items.len > 0) return null;
         const done = s.emitted().len;
         for (tokens, 0..) |t, i| {
-            if (done + i + 1 >= s.think_budget) return i;
+            const drawn = i >= s.forced_out;
+            if (drawn and done + i + 1 >= s.think_budget) return i;
             if (@as(i64, t) == s.think_end) return null;
+            if (drawn and s.isEos(t)) return null;
         }
         return null;
     }
@@ -441,13 +443,11 @@ pub const Stream = struct {
         return s.budgetActive() and s.emitted().len + 1 >= s.think_budget;
     }
 
-    /// Begin the thinking budget's close: its first token now, the rest forced after it.
+    /// Begin the budget's close: its first token now, the rest forced; callers cut only with no forced row queued.
     pub fn startClose(s: *Stream, gpa: Allocator) !u32 {
-        try s.force.ensureTotalCapacity(gpa, s.think_close.len - 1);
+        try s.force.ensureUnusedCapacity(gpa, s.think_close.len - 1);
         s.think_open = false;
-        s.force.clearRetainingCapacity();
         s.force.appendSliceAssumeCapacity(s.think_close[1..]);
-        s.resumed_rows = 0;
         return s.think_close[0];
     }
 
