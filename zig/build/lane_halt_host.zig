@@ -26,6 +26,9 @@ pub fn steps(b: *std.Build) void {
     b.step("test-settle-fire-host", "PREFIX_SYNC_GRAPH on the fake target: fires settled at their trigger never hold").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"settled fires:"} })).step);
     b.step("test-forced-rows-host", "A held fire's forced result lands whole on the fake target: no hold inside it").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"forced rows:"} })).step);
     b.step("test-budget-hold-host", "The thinking budget beside a held tool result on the fake target: the result lands whole, then the close").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"budget hold:"} })).step);
+    const digit_stop = b.step("test-digit-stop-host", "The runner's digit stop after owned inline values: its rules, the fake target's rounds, sessions");
+    digit_stop.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"runner digit stop"} })).step);
+    digit_stop.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner digit stop"} })).step);
     b.step("test-runner-host", "The in-model runner: scanner, held results and delivery with a fake circuit backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner"} })).step);
     // proof 2 on the real circuit (TF_RUNNER_CIRCUIT): optimized, since a debug evaluator takes minutes a run
     const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
