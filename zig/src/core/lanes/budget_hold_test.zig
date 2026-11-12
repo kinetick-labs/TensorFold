@@ -10,7 +10,7 @@ const gpa = std.testing.allocator;
 const close = [_]u32{ 90, 91, 92 };
 const think_end: i64 = 91;
 const base_result = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24 };
-const eos_row = 2; // the result's own template EOS (ChatML's <|im_end|> closing the tool turn) sits on this row
+const eos_row = base_result.len - 3; // ChatML's <|im_end|>: in the last rows, which land with the cut
 
 /// The tool result a hold resumes with: its row `eos_row` is the reply's EOS, as a ChatML tool turn's rows hold one.
 fn resultWith(eos: ?u32) [base_result.len]u32 {
