@@ -121,6 +121,7 @@ test "budget hold: a lane call right after the forced close lands its result who
     const ref = try run(.{ .budget = budget, .max_new = 60 });
     defer gpa.free(ref.tokens);
     try std.testing.expectEqualSlices(u32, &close, ref.tokens[budget - 1 ..][0..close.len]);
+    try expectDecoded(&shared.p1, ref.tokens, budget - 1 + close.len); // after the close: the model's own draws
     // an EOS the reply first draws after its close
     var at: ?usize = null;
     for (ref.tokens, 0..) |t, i| if (i >= budget - 1 + close.len and std.mem.indexOfScalar(u32, ref.tokens[0..i], t) == null and t != 96) {
