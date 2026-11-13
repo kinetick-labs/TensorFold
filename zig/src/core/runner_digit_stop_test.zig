@@ -5,7 +5,7 @@ const runner = @import("runner.zig");
 
 const gpa = std.testing.allocator;
 
-fn bytes(_: ?*anyopaque, token: u32) []const u8 {
+pub fn bytes(_: ?*anyopaque, token: u32) []const u8 {
     const all = comptime blk: {
         var t: [128]u8 = undefined;
         for (&t, 0..) |*c, i| c.* = i;
@@ -14,18 +14,18 @@ fn bytes(_: ?*anyopaque, token: u32) []const u8 {
     return if (token < 128) all[token..][0..1] else "";
 }
 
-fn encode(_: ?*anyopaque, a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u32 {
+pub fn encode(_: ?*anyopaque, a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u32 {
     const out = try a.alloc(u32, text.len);
     for (text, out) |c, *t| t.* = c;
     return out;
 }
 
-fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allocator.Error!rapi.Translation {
+pub fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allocator.Error!rapi.Translation {
     return .{ .program = .{ .kind = .graph, .bytes = try a.dupe(u8, std.mem.trim(u8, cell.code, " \n")) } };
 }
 
 /// Every run ends at once: 47*83, 7*6 (REPL) and print(7*6) (a fence) by their values, anything else a fault.
-const Back = struct {
+pub const Back = struct {
     jobs: std.ArrayList([]u8) = .empty,
 
     fn answer(prog: []const u8) rapi.Result {
@@ -33,7 +33,7 @@ const Back = struct {
         for (answers) |x| if (std.mem.eql(u8, x[0], prog)) return .{ .status = .ok, .out = x[1], .steps = 10 };
         return .{ .status = .fault };
     }
-    fn backend(b: *Back) rapi.Backend {
+    pub fn backend(b: *Back) rapi.Backend {
         return .{ .ctx = b, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
     }
     fn start(ctx: *anyopaque, _: u64, p: rapi.Program, _: u64) error{ OutOfMemory, Busy }!rapi.JobId {
@@ -47,7 +47,7 @@ const Back = struct {
     }
     fn cancel(_: *anyopaque, _: rapi.JobId) void {}
     fn release(_: *anyopaque, _: u64) void {}
-    fn deinit(b: *Back) void {
+    pub fn deinit(b: *Back) void {
         for (b.jobs.items) |j| gpa.free(j);
         b.jobs.deinit(gpa);
     }

@@ -8,6 +8,7 @@ pub const schema = 1;
 /// Why a cell abstained, as one stable name; its refusal stage follows from it (`stage`).
 pub const Reason = enum {
     context, // the reply's own number context (exact inline math in a Python-float reply)
+    quoted, // an inline span inside an open quotation: quoted text, not a computation (the runner's hint)
     language, // a `calc` / `exact` cell with exact cells off
     unsupported,
     syntax,
@@ -28,7 +29,7 @@ pub const Reason = enum {
 
 pub fn stage(r: Reason) []const u8 {
     return switch (r) {
-        .context => "context",
+        .context, .quoted => "context",
         .language, .unsupported, .syntax, .name, .too_long, .too_big => "frontend",
         .out_of_memory => "dispatch",
         .backend_abstain, .budget, .fault => "execute",
