@@ -1,4 +1,4 @@
-//! The runner's digit stop in reasoning: no drawn digit right after an owned inline integer, no digit run past a cap.
+//! The runner's reasoning stops: no digit drawn after an owned integer, no word glued to the mark, no endless run.
 const std = @import("std");
 const be = @import("backend.zig");
 const Stream = @import("stream.zig").Stream;
@@ -7,10 +7,11 @@ const Allocator = std.mem.Allocator;
 /// A drawn token the runner replaces (an owned value is whole: a digit after it is a runaway): where, and its newline.
 pub const Stop = struct { at: usize, token: u32, why: Why };
 
-pub const Why = enum { after_value, run_cap };
+/// A digit after an owned integer, a word character glued to an owned span ending in one, a run past the cap.
+pub const Why = enum { after_value, after_mark, run_cap };
 
-/// PREFIX_DIGIT_STOP, _RUN_MAX, _HOLD_MAX (runner.zig); 0: no cap. hold_max caps runs once a stop fired in the reply.
-pub const Limits = struct { after_value: bool = true, run_max: u32 = 1024, hold_max: u32 = 64 };
+/// PREFIX_DIGIT_STOP, _MARK_STOP, _RUN_MAX, _HOLD_MAX (runner.zig); 0: no cap; hold_max: runs after a digit stop.
+pub const Limits = struct { after_value: bool = true, after_mark: bool = true, run_max: u32 = 1024, hold_max: u32 = 64 };
 
 /// One token's bytes, as the runner's tokenizer gives them.
 pub const Bytes = struct {
@@ -20,6 +21,11 @@ pub const Bytes = struct {
 
 fn digit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+
+/// A character that extends a word ("@engine" + "er", "-x" or "/x"); a space, newline or punctuation does not.
+fn wordy(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '/';
 }
 
 fn leading(b: []const u8) u32 {
@@ -42,6 +48,7 @@ pub const State = struct {
     newline: ?u32 = null, // the token put in a stopped token's place (null: the stop is off)
     looked: bool = false, // `look` asked the tokenizer for it (once: one token or none)
     lead: ?usize = null, // armed: owned tokens still to land; at 0 the next token is the model's first after the value
+    word: bool = false, // the armed span ends in a word character (the mark): its guard is `wordy`, not a digit
     run: u32 = 0, // digits ending the reasoning's committed text
     held: bool = false, // a stop fired in this reply: later runs cap at hold_max
 
@@ -67,16 +74,22 @@ pub const State = struct {
         return if (st.limits.run_max == 0) h else @min(st.limits.run_max, h);
     }
 
-    /// A stop this state returned was applied: the reply's later runs hold at hold_max.
-    pub fn fired(st: *State) void {
-        st.held = true;
+    /// A stop was applied: a digit stop holds later runs at hold_max; a mark stop does not, so numbers stay whole.
+    pub fn fired(st: *State, why: Why) void {
+        if (why != .after_mark) st.held = true;
     }
 
-    /// An owned inline value is forced next: `count` tokens whose text is `value` (armed when it ends in a digit).
-    pub fn arm(st: *State, gpa: Allocator, text: anytype, count: usize, value: []const u8) Allocator.Error!void {
-        if (!st.limits.after_value or count == 0 or value.len == 0 or !digit(value[value.len - 1])) return;
+    /// The runner forces an owned span of `count` tokens ending in `tail`; a digit or word end guards the next draw.
+    pub fn arm(st: *State, gpa: Allocator, text: anytype, count: usize, tail: []const u8) Allocator.Error!void {
+        if (count == 0 or tail.len == 0) return;
+        const last = tail[tail.len - 1];
+        const word = !digit(last);
+        if (if (word) !st.limits.after_mark or !wordy(last) else !st.limits.after_value) return;
         try st.look(gpa, text);
-        if (st.newline != null) st.lead = count;
+        if (st.newline != null) {
+            st.lead = count;
+            st.word = word;
+        }
     }
 
     /// A committed token's bytes; outside reasoning there is no run and nothing stays armed.
@@ -94,9 +107,12 @@ pub const State = struct {
         for (tokens, 0..) |t, i| {
             const b = bytes.of(bytes.ctx, t);
             const owned = if (lead) |n| n > 0 else false;
-            if (!owned and i >= forced and b.len > 0 and digit(b[0])) {
-                if (lead != null) return .{ .at = i, .token = nl, .why = .after_value };
-                if (c > 0 and run +| leading(b) > c) return .{ .at = i, .token = nl, .why = .run_cap };
+            if (!owned and i >= forced and b.len > 0) {
+                if (lead != null) {
+                    if (st.word and wordy(b[0])) return .{ .at = i, .token = nl, .why = .after_mark };
+                    if (!st.word and digit(b[0])) return .{ .at = i, .token = nl, .why = .after_value };
+                }
+                if (digit(b[0]) and c > 0 and run +| leading(b) > c) return .{ .at = i, .token = nl, .why = .run_cap };
             }
             if (lead) |n| lead = if (n > 0) n - 1 else null;
             run = extend(run, b);
