@@ -10,7 +10,7 @@ const shared = @import("engine_test.zig");
 const gpa = std.testing.allocator;
 const nl: u32 = 96;
 
-/// Ids 0-9 are their digit, 10 " x", 11 "12" (a two-digit token), 12 "ab", 13 "7)"; `nl` is the newline.
+/// Ids: 0-9 digits, 10 " x", 11 "12", 12 "ab", 13 "7)", 14 " @", 15 "engine", 16 "er", 17 "?", 18 "-mike", 19 "_x".
 fn table(_: ?*anyopaque, t: u32) []const u8 {
     const digits = "0123456789";
     if (t < 10) return digits[t .. t + 1];
@@ -19,6 +19,13 @@ fn table(_: ?*anyopaque, t: u32) []const u8 {
         11 => "12",
         12 => "ab",
         13 => "7)",
+        14 => " @",
+        15 => "engine",
+        16 => "er",
+        17 => "?",
+        18 => "-mike",
+        19 => "_x",
+        20 => "/r",
         nl => "\n",
         else => "?",
     };
@@ -98,13 +105,15 @@ test "runner digit stop: a value over several rounds is armed until its last row
     try std.testing.expect(st.lead == null and st.run == 0);
 }
 
-test "runner digit stop: a value ending in a non-digit, or carrying the inline mark, does not arm" {
+test "runner digit stop: a value ending in a non-word character does not arm, nor the inline mark with the mark stop off" {
     var st = state(.{});
     try st.arm(gpa, enc, 2, "7)");
     try std.testing.expect(st.lead == null);
     try std.testing.expect(st.stop(text, &.{ 13, 4 }, 1) == null);
-    try st.arm(gpa, enc, 3, " @engine");
-    try std.testing.expect(st.lead == null);
+    var nomark = state(.{ .after_mark = false });
+    try nomark.arm(gpa, enc, 3, " @engine");
+    try std.testing.expect(nomark.lead == null);
+    try std.testing.expect(nomark.stop(text, &.{ 14, 15, 16 }, 2) == null);
     // outside reasoning nothing stays armed
     var closed = state(.{});
     try closed.arm(gpa, enc, 1, "5");
@@ -140,7 +149,7 @@ test "runner digit stop: once a stop fired, later runs hold at hold_max; before 
     // negative control: before any stop a sixth digit lands (the cap is still run_max)
     try std.testing.expectEqual(@as(u32, 100), st.cap());
     try std.testing.expect(st.stop(text, &.{6}, 0) == null);
-    st.fired();
+    st.fired(.run_cap);
     try std.testing.expectEqual(@as(u32, 5), st.cap());
     const hit = st.stop(text, &.{ 6, 7 }, 0).?;
     try std.testing.expectEqual(@as(usize, 0), hit.at);
@@ -152,15 +161,173 @@ test "runner digit stop: once a stop fired, later runs hold at hold_max; before 
     try std.testing.expect(st.stop(text, &.{ 4, 5, 6 }, 3) == null);
     // with no run cap the hold still applies once fired
     var uncapped = state(.{ .run_max = 0, .hold_max = 3 });
-    uncapped.fired();
+    uncapped.fired(.run_cap);
     landAll(&uncapped, &.{ 1, 2, 3 });
     try std.testing.expectEqual(stop.Why.run_cap, uncapped.stop(text, &.{4}, 0).?.why);
     // negative control: hold_max 0 keeps run_max after a stop
     var nohold = state(.{ .run_max = 100, .hold_max = 0 });
-    nohold.fired();
+    nohold.fired(.run_cap);
     landAll(&nohold, &.{ 1, 2, 3, 4, 5 });
     try std.testing.expectEqual(@as(u32, 100), nohold.cap());
     try std.testing.expect(nohold.stop(text, &.{ 6, 7 }, 0) == null);
+}
+
+test "runner digit stop: a word character glued to the inline mark is replaced; a space, punctuation or newline lands" {
+    var st = state(.{});
+    try st.arm(gpa, enc, 2, " @engine");
+    try std.testing.expect(st.lead != null and st.word and st.watching());
+    // the mark's own (forced) rows pass; the model's "er" right after them is the stop (@engineer)
+    const hit = st.stop(text, &.{ 14, 15, 16 }, 2).?;
+    try std.testing.expectEqual(@as(usize, 2), hit.at);
+    try std.testing.expectEqual(stop.Why.after_mark, hit.why);
+    // a glued digit, "-", "_" or "/" extends it too
+    for ([_]u32{ 7, 11, 18, 19, 20 }) |t| try std.testing.expectEqual(stop.Why.after_mark, st.stop(text, &.{ 14, 15, t }, 2).?.why);
+    // negative controls: what ends the mark lands as drawn
+    for ([_]u32{ 17, 10, nl }) |t| try std.testing.expect(st.stop(text, &.{ 14, 15, t }, 2) == null);
+    // only the model's first draw after the span is guarded: once it landed, a later letter is the model's own text
+    landAll(&st, &.{ 14, 15, 17 });
+    try std.testing.expect(st.lead == null and !st.watching());
+    try std.testing.expect(st.stop(text, &.{16}, 0) == null);
+}
+
+test "runner digit stop: a mark stop does not hold the reply's later runs; a digit stop does" {
+    var st = state(.{ .run_max = 100, .hold_max = 5 });
+    try st.arm(gpa, enc, 2, " @engine");
+    st.fired(st.stop(text, &.{ 14, 15, 16 }, 2).?.why);
+    try std.testing.expectEqual(@as(u32, 100), st.cap());
+    landAll(&st, &.{ 14, 15, nl, 1, 2, 3, 4, 5, 6 });
+    try std.testing.expect(st.stop(text, &.{ 7, 8 }, 0) == null); // the model's own number goes on past 5
+    // negative control: a digit stop in its place holds at 5
+    st.fired(.run_cap);
+    try std.testing.expectEqual(@as(u32, 5), st.cap());
+    try std.testing.expectEqual(stop.Why.run_cap, st.stop(text, &.{7}, 0).?.why);
+}
+
+// --- recorded TP1 replies (tp1-digitcap.py, 2026-11-13): the model's reasoning with the runner's owned spans marked
+
+const Fixture = struct { about: []const u8, owned: []const [2]usize, text: []const u8 };
+
+/// A reply as tokens: one per digit (as Qwen's), a letter run as one, any other byte as one; owned span ends cut too.
+const Replay = struct {
+    text: []const u8,
+    starts: std.ArrayList(usize) = .empty, // each token's first byte; token i is text[starts[i]..starts[i + 1]]
+
+    fn init(t: []const u8, owned: []const [2]usize) !Replay {
+        var r: Replay = .{ .text = t };
+        var i: usize = 0;
+        while (i < t.len) {
+            try r.starts.append(gpa, i);
+            if (std.ascii.isAlphabetic(t[i])) {
+                i += 1;
+                while (i < t.len and std.ascii.isAlphabetic(t[i]) and !edge(owned, i)) i += 1;
+            } else i += 1;
+        }
+        try r.starts.append(gpa, t.len);
+        return r;
+    }
+    fn edge(owned: []const [2]usize, at: usize) bool {
+        for (owned) |o| if (o[0] == at or o[1] == at) return true;
+        return false;
+    }
+    fn deinit(r: *Replay) void {
+        r.starts.deinit(gpa);
+    }
+    fn of(ctx: ?*anyopaque, t: u32) []const u8 {
+        const r: *const Replay = @ptrCast(@alignCast(ctx.?));
+        if (t == replay_nl) return "\n";
+        return r.text[r.starts.items[t]..r.starts.items[t + 1]];
+    }
+    fn token(r: *const Replay, at: usize) usize {
+        return std.mem.indexOfScalar(usize, r.starts.items, at).?;
+    }
+};
+const replay_nl: u32 = 1 << 30;
+
+fn encReplay(_: ?*anyopaque, a: std.mem.Allocator, t: []const u8) std.mem.Allocator.Error![]u32 {
+    std.debug.assert(std.mem.eql(u8, t, "\n"));
+    return try a.dupe(u32, &.{replay_nl});
+}
+
+/// The recorded reply's first stop and its offset: owned spans armed and forced as the runner does, the rest drawn.
+fn replay(fixture: []const u8, limits: stop.Limits) !?struct { at: usize, why: stop.Why } {
+    const parsed = try std.json.parseFromSlice(Fixture, gpa, fixture, .{});
+    defer parsed.deinit();
+    const f = parsed.value;
+    var r = try Replay.init(f.text, f.owned);
+    defer r.deinit();
+    const bytes: stop.Bytes = .{ .ctx = &r, .of = Replay.of };
+    var st: stop.State = .{ .limits = limits };
+    const e: Enc = .{ .encode = encReplay };
+    var i: usize = 0;
+    const n = r.starts.items.len - 1;
+    while (i < n) {
+        const at = r.starts.items[i];
+        var span: ?[2]usize = null;
+        for (f.owned) |o| if (o[0] == at) {
+            span = o;
+        };
+        if (span) |o| {
+            const end = r.token(o[1]);
+            var ids: [256]u32 = undefined;
+            for (i..end, 0..) |t, k| ids[k] = @intCast(t);
+            try st.arm(gpa, e, end - i, f.text[o[0]..o[1]]);
+            try std.testing.expect(st.stop(bytes, ids[0 .. end - i], end - i) == null); // forced rows are never cut
+            for (ids[0 .. end - i]) |t| st.landed(Replay.of(&r, t), true);
+            i = end;
+            continue;
+        }
+        if (st.wants()) try st.look(gpa, e);
+        if (st.stop(bytes, &.{@intCast(i)}, 0)) |hit| return .{ .at = at, .why = hit.why };
+        st.landed(Replay.of(&r, @intCast(i)), true);
+        i += 1;
+    }
+    return null;
+}
+
+const s13 = @embedFile("testdata/runner-stop-13p150-s13.json"); // failed the gate: @engineer-mike/secret-repo! then 1,024 digits
+const s12 = @embedFile("testdata/runner-stop-13p150-s12.json"); // passed: marks end in '"' or a newline, one copy unmarked
+
+test "runner digit stop on a recorded TP1 reply: the glued @engineer is stopped where base let a 1,024-digit run start" {
+    // negative control: base (no mark stop) lets the served reply land whole, its 1,024-digit run included
+    try std.testing.expect(try replay(s13, .{ .after_mark = false }) == null);
+    // the mark stop replaces the model's first draw after the first owned span: "er" of "@engineer", before any digit
+    const on = (try replay(s13, .{})).?;
+    try std.testing.expectEqual(stop.Why.after_mark, on.why);
+    try std.testing.expectEqual(@as(usize, 229), on.at);
+    const parsed = try std.json.parseFromSlice(Fixture, gpa, s13, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(on.at, parsed.value.owned[0][1]);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.value.text[on.at..], "er-mike/secret-repo!"));
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.text, "secret-repo!8437").? > on.at); // before the run
+}
+
+test "runner digit stop on a recorded TP1 reply: a reply that passed, with a model-written copy of the value, is untouched" {
+    try std.testing.expect(try replay(s12, .{}) == null);
+    try std.testing.expect(try replay(s12, .{ .after_mark = false }) == null);
+}
+
+test "runner digit stop: after a mark stop the model can still write a number of the value's digits in full" {
+    const parsed = try std.json.parseFromSlice(Fixture, gpa, s13, .{});
+    defer parsed.deinit();
+    const o = parsed.value.owned[0];
+    const v = parsed.value.text[o[0] .. o[1] - " @engine".len]; // 13^150, the 168 digits the runner owned
+    try std.testing.expectEqual(@as(usize, 168), v.len);
+    var st = state(.{});
+    try st.arm(gpa, enc, 2, " @engine");
+    st.fired(st.stop(text, &.{ 14, 15, 16 }, 2).?.why);
+    landAll(&st, &.{ 14, 15, nl });
+    for (0..168) |k| {
+        const d: u32 = v[k] - '0';
+        try std.testing.expect(st.stop(text, &.{d}, 0) == null);
+        landAll(&st, &.{d});
+    }
+    try std.testing.expectEqual(@as(u32, 168), st.run);
+    // negative control: after a digit stop the same number is cut at the hold (64)
+    var held = state(.{});
+    held.fired(.run_cap);
+    const ones: [64]u32 = @splat(1);
+    landAll(&held, &ones);
+    try std.testing.expectEqual(stop.Why.run_cap, held.stop(text, &.{2}, 0).?.why);
 }
 
 test "runner digit stop: the newline is asked for only near the cap or at an arm, once" {
@@ -205,7 +372,7 @@ const Hook = struct {
     fn onStop(ptr: *anyopaque, tokens: []const u32, forced: usize) ?stop.Stop {
         const h: *Hook = @ptrCast(@alignCast(ptr));
         const hit = h.st.stop(.{ .of = sevens }, tokens, forced) orelse return null;
-        h.st.fired(); // as the runner's onStop
+        h.st.fired(hit.why); // as the runner's onStop
         return hit;
     }
 
