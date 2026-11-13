@@ -78,6 +78,7 @@ pub const Config = struct {
         c.scan.inline_mod = try knob(u1, get, prefix ++ "_INLINE_MOD", 1, 0, 1) == 1;
         c.scan.inline_arith = try knob(u1, get, prefix ++ "_INLINE_ARITH", 1, 0, 1) == 1;
         c.scan.inline_chain = try knob(u1, get, prefix ++ "_INLINE_CHAIN", 0, 0, 1) == 1;
+        c.scan.inline_quoted = try knob(u1, get, prefix ++ "_INLINE_QUOTED", 1, 0, 1) == 1;
         c.scan.trace_window = try knob(u32, get, prefix ++ "_TRACE_WINDOW", c.scan.trace_window, 1, 65536);
         c.scan.trace_whole = try knob(u1, get, prefix ++ "_STATED", 0, 0, 1) == 1;
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
@@ -148,6 +149,7 @@ const Cell = struct {
     told: enum { none, owned, abstained } = .none, // what its result header got
     owned_tokens: u32 = 0,
     stated: ?scan.Stated = null, // form trace: the `[exact: …]` line's expression (text in the arena)
+    quoted: bool = false, // its inline span sat inside an open quotation (scan.Closed.quoted): never owned
 };
 
 /// One reply's cells, runs and the trigger it waits on; every method runs on the engine thread.
@@ -300,9 +302,10 @@ pub const Session = struct {
             };
             return;
         }
-        // exact inline math would contradict a reply reasoning in Python floats
-        if (c.own_context) {
+        // exact inline math would contradict a reply reasoning in Python floats; a quoted span is not a computation
+        if (c.own_context or c.quoted) {
             cell.translation = .{ .abstain = .context };
+            cell.quoted = c.quoted;
             cell.translated.store(true, .release);
             return;
         }
@@ -378,7 +381,7 @@ pub const Session = struct {
                 c.abstained = true;
         }
         if (c.abstained) {
-            abstain.told(s, c, w.index, held_ms, null);
+            abstain.told(s, c, w.index, held_ms, if (c.quoted) .quoted else null);
             log.info("reply {d} cell {d} ({s} {t}): abstain ({s}), held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, why(c), held_ms, s.held_ticks });
             return try s.r.gpa.alloc(u32, 0);
         }
@@ -437,7 +440,7 @@ pub const Session = struct {
     }
 
     fn why(c: *const Cell) []const u8 {
-        if (c.translation == .abstain) return @tagName(c.translation.abstain);
+        if (c.translation == .abstain) return if (c.quoted) "quoted" else @tagName(c.translation.abstain);
         const res = c.result orelse return "backend start";
         if (res.status == .abstain) return if (res.abstain) |a| @tagName(a) else "backend";
         if (res.status != .ok) return @tagName(res.status); // inline: budget or fault

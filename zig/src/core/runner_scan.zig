@@ -16,6 +16,7 @@ pub const Config = struct {
     inline_mod: bool = true, // with inline_math: `A mod M =` and `A % M =` on literals, after any earlier `=`
     inline_arith: bool = true, // with inline_math: thousands commas (`147,000+73`), a whole `gcd(a, b)` or `0xFF`
     inline_chain: bool = false, // opt-in, T5 decides: the last `<expr> =` after an earlier `=` statement
+    inline_quoted: bool = true, // PREFIX_INLINE_QUOTED: `<expr> =` inside an open quotation is quoted text, not owned
     float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
     trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts
     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
@@ -36,7 +37,7 @@ const join_cues = [_][]const u8{ "oncatenat", "join", "Join" };
 const join_lines = 2;
 
 /// A closed cell; `lang` and `code` live in the scanner until the next `feed`.
-pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, own_context: bool = false, trace: ?Stated = null }; // own_context: the reply keeps its value
+pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, own_context: bool = false, quoted: bool = false, trace: ?Stated = null }; // own_context, quoted: the reply keeps its value
 
 /// A trace cell's line text: what `[exact: … = value]` shows, and whether the value is a (quotient, remainder) pair.
 pub const Stated = struct { display: []const u8, divmod: bool };
@@ -141,6 +142,7 @@ pub const Scanner = struct {
                 ev.closed = s.close(.inline_expr);
                 // Python reads 1e9 as a float: a reply reasoning in floats keeps its own value
                 ev.closed.?.own_context = floats and std.mem.indexOfScalar(u8, m.modulus, 'e') != null;
+                ev.closed.?.quoted = s.cfg.inline_quoted and inline_scan.quoted(s.line.items, m.left);
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = m.space };
             } else if (inline_scan.inlineExpr(s.line.items, s.cfg.inline_arith, s.cfg.inline_chain)) |x| {
                 s.lang.clearRetainingCapacity();
@@ -158,6 +160,7 @@ pub const Scanner = struct {
                 const joined = s.join_line != null and s.lines - s.join_line.? <= join_lines and lead.len == 0 and
                     inline_scan.twoInts(x.expr);
                 ev.closed.?.own_context = joined or (floats and std.mem.indexOfAny(u8, x.expr, "./") != null);
+                ev.closed.?.quoted = s.cfg.inline_quoted and inline_scan.quoted(s.line.items, x.expr);
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = x.space };
             } else if (if (s.cfg.trace_whole) inline_scan.stacked(s.line.items, s.above[2].items, s.above[1].items, s.above[0].items) else null) |c| {
                 // STATED: a stacked column (`264,278,…` / `+771,565,…` / `= ?`), the `=` alone on its line

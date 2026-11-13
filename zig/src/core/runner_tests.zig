@@ -20,4 +20,5 @@ test {
     _ = @import("runner_graph_edit.zig");
     _ = @import("runner_commit.zig");
     _ = @import("runner_digit_stop_test.zig");
+    _ = @import("runner_inline_quoted_test.zig");
 }
