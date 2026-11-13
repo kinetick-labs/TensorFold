@@ -134,6 +134,20 @@ pub fn inlineExpr(line: []const u8, arith: bool, chain: bool) ?struct { expr: []
     return .{ .expr = expr, .space = space };
 }
 
+/// Whether `line` opens a quotation before `expr` (a slice of it) and has not closed it: `"` or a curly pair.
+pub fn quoted(line: []const u8, expr: []const u8) bool {
+    const lead = line[0 .. @intFromPtr(expr.ptr) - @intFromPtr(line.ptr)];
+    var straight: usize = 0;
+    var curly: isize = 0;
+    for (lead, 0..) |c, i| {
+        if (c == '"') straight += 1;
+        if (c == 0xE2 and i + 2 < lead.len and lead[i + 1] == 0x80) {
+            if (lead[i + 2] == 0x9C) curly += 1 else if (lead[i + 2] == 0x9D) curly -= 1;
+        }
+    }
+    return straight % 2 == 1 or curly > 0;
+}
+
 /// A modular step closing a line: `A` as the model wrote it, its literal modulus, and the space flag as inlineExpr.
 pub const Mod = struct {
     left: []const u8,
