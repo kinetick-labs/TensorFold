@@ -14,6 +14,7 @@ venv/
 *.log
 .zig-toolchain
 .zig-cache/
+.zig-cache-test/
 zig-out/
 
 # Native Qwen CPU-only Metal compiler receipts.
