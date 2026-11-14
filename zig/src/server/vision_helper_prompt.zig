@@ -159,7 +159,9 @@ pub fn splitMedia(cx: *Cx, list_in: ?Value, limits: MediaLimits, sources: *std.A
                 } else if (!limits.allow_urls) {
                     return cx.refuse("image URLs are off on this server; send the image as a data URL, or start the server with --vision-urls");
                 } else if (url.?.len > limits.max_url_chars) return cx.refuse("image URL is too long");
-                try sources.append(cx.a, .{ .kind = .image, .url = url.?, .detail = detail });
+                // a camera's multi-picture JPEG (MPO) is its primary picture: the helper's Pillow refuses it as multipage
+                const one = try @import("mpo.zig").dataUrl(cx.a, url.?);
+                try sources.append(cx.a, .{ .kind = .image, .url = one orelse url.?, .detail = detail });
                 images += 1;
                 const o = try json.newObject(cx.a);
                 try o.put(cx.a, "type", .{ .string = "image" });
