@@ -19,7 +19,7 @@ fn add(l: *std.ArrayList(Lin), gpa: std.mem.Allocator, field: *u64, n: usize, k:
 fn addProj(l: *std.ArrayList(Lin), gpa: std.mem.Allocator, p: *projection.Proj, n: usize, k: usize) !void {
     switch (p.*) {
         .bf16 => |*w| try add(l, gpa, w, n, k),
-        .fp8g, .mxfp8 => {},
+        .fp8g, .mxfp8, .exl3 => {},
     }
 }
 
@@ -52,7 +52,7 @@ fn layerLinears(gpa: std.mem.Allocator, l: *Layer, list: *std.ArrayList(Lin)) !v
                 try add(list, gpa, &b.gu, 2 * x.width, x.dims);
                 try add(list, gpa, &b.down, x.dims, x.width);
             },
-            .nvfp4, .mxfp8 => {},
+            .nvfp4, .mxfp8, .exl3 => {},
         },
         .moe => |*x| {
             try addProj(list, gpa, &x.shared_gu, 2 * x.shared, x.routed.dims);

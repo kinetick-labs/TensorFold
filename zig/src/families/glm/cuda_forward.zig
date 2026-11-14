@@ -43,6 +43,8 @@ pub const Modules = struct {
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
     experts: experts.Kernels,
     exl3: exl3.Kernels, // an EXL3 checkpoint's routed experts
+    /// A REXL3 pack's EXL3 projections: [0] decode windows' stream, [1] prompt chunks' (cuda_proj.Exl3Run each).
+    x3run: [2]*projection.Exl3Run,
     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
     dsel: bool, // TF_GLM_DSEL (default on): a decode window's DSA select on many CTAs (cuda_sparse.decodeSelect)
@@ -79,6 +81,19 @@ pub const Modules = struct {
         m.glue = try glue.Kernels.load(m.mods[6]);
         m.exl3 = try exl3.Kernels.load(d);
         errdefer m.exl3.unload();
+        var runs: usize = 0;
+        errdefer for (m.x3run[0..runs]) |r| {
+            r.unload();
+            std.heap.page_allocator.destroy(r);
+        };
+        for (&m.x3run) |*r| {
+            r.* = try std.heap.page_allocator.create(projection.Exl3Run);
+            r.*.* = projection.Exl3Run.load(d) catch |err| {
+                std.heap.page_allocator.destroy(r.*);
+                return err;
+            };
+            runs += 1;
+        }
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
         m.index = null;
         errdefer if (m.index) |*x| x.unload();
@@ -106,6 +121,10 @@ pub const Modules = struct {
     pub fn deinit(m: *Modules) void {
         if (m.index) |*x| x.unload();
         m.exl3.unload();
+        for (m.x3run) |r| {
+            r.unload();
+            std.heap.page_allocator.destroy(r);
+        }
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
         m.prompt.unload();
@@ -163,7 +182,7 @@ pub const Forward = struct {
     }
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel };
+        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .dsel = f.m.dsel, .exl3 = f.m.x3run[@intFromBool(f.ranks[0].b.prefill)] };
     }
 
     /// The layer sums' boundary (cuda_boundary.zig): every rank's fp32 partial into every gathered buffer.

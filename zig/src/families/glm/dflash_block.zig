@@ -14,7 +14,7 @@ fn go(f: cuda.Function, grid: cuda.Dim3, threads: u32, e: anytype, a: *cuda.Args
 }
 
 fn set(e: anytype) glue.Set {
-    return .{ .glue = &e.m.glue, .mm = &e.m.mm };
+    return .{ .glue = &e.m.glue, .mm = &e.m.mm, .exl3 = e.m.x3run[0] };
 }
 
 /// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm only): 4 bits 16 rows a launch, or glm_mm.

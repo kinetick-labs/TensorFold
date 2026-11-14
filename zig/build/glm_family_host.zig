@@ -35,6 +35,9 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const startup_run = b.addRunArtifact(b.addTest(.{ .root_module = startup }));
     b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
     step.dependOn(&startup_run.step);
+    const rexl3_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM REXL3:"} }));
+    b.step("test-glm-rexl3-host", "A REXL3/SAGE pack's EXL3 groups: admission, widths, host dequantization, without a GPU").dependOn(&rexl3_run.step);
+    step.dependOn(&rexl3_run.step);
     const thin_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM thin weights:"} }));
     b.step("test-glm-thin-weights-host", "TF_GLM_LAYERS's admission bytes by tensor from synthetic shard headers").dependOn(&thin_run.step);
     step.dependOn(&thin_run.step);
