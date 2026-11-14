@@ -78,6 +78,7 @@ const Sources = struct {
         switch (w) {
             .bf16 => |p| s.add(p),
             .fp8g, .mxfp8 => |q| s.lane(q),
+            .exl3 => |e| for (e.members()) |m| s.add(m.trellis),
         }
     }
 };
@@ -90,7 +91,7 @@ fn sources(l: weights.Layer, site: Site) Sources {
             .kda => |k| switch (k.proj) {
                 .bf16 => |p| s.add(p),
                 .split => |sp| {
-                    s.lane(sp.qkv);
+                    s.proj(sp.qkv);
                     s.add(sp.rest);
                 },
             },
@@ -111,6 +112,7 @@ fn sources(l: weights.Layer, site: Site) Sources {
                 },
                 .bf16 => |x| s.add(x.gu),
                 .mxfp8 => |x| s.lane(x.gu),
+                .exl3 => |x| s.proj(x.gu),
             },
         },
         .o => switch (l.mixer) {
@@ -305,7 +307,7 @@ test "the table: each site's sources in its matmuls' order, site n from the next
     const kda_block = @import("cuda_kda_block.zig");
     const lane: cuda.qmmf.Weight = .{ .mode = .mxfp8, .codes = 0x2000_0000, .scales = 0x1000_0000, .n = 64, .k = 64, .npad = 64 };
     var k: kda_block.Layer = undefined;
-    k.proj = .{ .split = .{ .qkv = lane, .rest = 0x3000_0000 } };
+    k.proj = .{ .split = .{ .qkv = .{ .mxfp8 = lane }, .rest = 0x3000_0000 } };
     k.o = .{ .bf16 = 0x4000_0000 };
     var d: weights.Layer = undefined; // layer 0: DSA and a dense bf16 MLP
     d.mixer = .{ .mla = undefined };

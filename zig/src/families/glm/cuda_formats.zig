@@ -1,6 +1,7 @@
 //! Which stored format a GLM CUDA projection is read in (its recipe against its tensors), and how: csf, FP8 cuts.
 
 const std = @import("std");
+const rexl3 = @import("cuda_rexl3.zig");
 const core = @import("core");
 const cuda = @import("cuda");
 const fp8 = cuda.fp8;
@@ -60,7 +61,8 @@ fn fromTensors(s: Stored) Refusal!Format {
     const k = if (w.dtype == .u8) try checked(std.math.mul(usize, 2, w.shape[1])) else w.shape[1]; // two FP4 codes a byte
     _ = try checked(std.math.mul(usize, n, k));
     switch (w.dtype) {
-        .bf16 => return if (s.scale == null and !s.csf and s.csf0 == null) .bf16 else error.FormatMismatch,
+        // fp16 (a REXL3 pack's small linears) reads through the bf16 path, rounded to bf16 by the loader
+        .bf16, .f16 => return if (s.scale == null and !s.csf and s.csf0 == null) .bf16 else error.FormatMismatch,
         .u8 => {
             if (s.csf0) |c| {
                 if (s.csf or s.scale != null or k % 64 != 0) return error.FormatMismatch;
@@ -198,6 +200,15 @@ pub fn cutProj(L: anytype, comptime prefix: []const u8, i: u32, parts: []const P
 
 /// Modules `mods` of `ck` cut as `parts`, stacked as `name`: bf16, or FP8 kinds packed for the lane; else refused.
 pub fn cut(L: anytype, ck: *core.Checkpoint, mods: []const []const u8, parts: []const Part, wants: []const Format, comptime name: []const u8, args: anytype) !projection.Proj {
+    var trellises: usize = 0; // a REXL3 pack's EXL3 linears: every part a trellis group, read as the dense kernels take it
+    for (mods) |m| {
+        if (rexl3.has(ck, m)) trellises += 1;
+    }
+    if (trellises == mods.len) return rexl3.proj(L, ck, mods, parts, name, args);
+    if (trellises != 0) {
+        std.log.err("{s}: EXL3 and non-EXL3 parts stacked in one projection", .{mods[0]});
+        return error.UnreadableFormat;
+    }
     var got: ?Format = null;
     for (mods) |m| {
         const f = try L.formatOne(ck, m, wants);

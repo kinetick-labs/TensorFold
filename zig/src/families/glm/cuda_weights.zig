@@ -43,6 +43,7 @@ pub const Weights = struct {
     norm: glue.Norm = .{ .bf16 = 0 },
     head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
     mtp: ?Mtp = null,
+    exl3_mixed: bool = false, // EXL3: some layer's experts mix widths (a SAGE pack), so its prompts take the compacted path
     exl3_shx: bool = true, // EXL3: every layer's gate and up share one input rotation (a prompt rotates each row once)
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
@@ -84,6 +85,10 @@ const Loader = struct {
     last: []const u8 = "", // the tensor `get` read last, named when its values are refused
     staging: @import("cuda_load_pack.zig").Staging = .{}, // the packed experts' mapped pinned memory, piece to piece
     recipes: ?*const core.modelopt.Recipes = null, // MIXED_PRECISION's table; null: the tensors decide (NVFP4)
+    /// A REXL3 pack (EXL3 beyond the routed experts): fp32 tensors whose kernels read bf16 (hyper-connections) are
+    /// rounded to nearest even rather than refused, and counted; fp16 ones are always rounded (and counted).
+    round_bf16: bool = false,
+    rounded: usize = 0, // values the bf16 rounding changed
 
     pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
         L.last = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
@@ -160,13 +165,18 @@ const Loader = struct {
             const v: f32 = switch (t.dtype) {
                 .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
                 .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
+                .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)))),
                 else => return error.UnexpectedTensor,
             };
             switch (to) {
                 .f32 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&v)),
-                .bf16 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&(narrow(v) orelse {
-                    std.log.err("{s}: a float32 value bf16 does not hold, and its kernels read bf16", .{L.last});
-                    return error.InexactBf16;
+                .bf16 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&(narrow(v) orelse r: {
+                    if (t.dtype != .f16 and !L.round_bf16) {
+                        std.log.err("{s}: a float32 value bf16 does not hold, and its kernels read bf16", .{L.last});
+                        return error.InexactBf16;
+                    }
+                    L.rounded += 1;
+                    break :r toBf16(v);
                 }))),
                 else => return error.UnexpectedTensor,
             }
@@ -202,6 +212,7 @@ const Loader = struct {
 
     /// weights.load's kda(i): [q | k | v | f_a | g_a | b], f_b/g_b by heads, o by columns, conv taps, A_log, dt_bias.
     fn kda(L: *Loader, i: u32) !kda_block.Layer {
+        if (L.has("layers.{d}.self_attn.qkv_proj.trellis", .{i})) return L.kdaRexl3(i);
         const c = &L.w.config;
         const h = L.w.share.kda;
         const dk = c.kda_dim;
@@ -216,7 +227,7 @@ const Loader = struct {
         } else inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), hr[0], hr[1], all, .bf16);
         inline for (.{ "f_a", "g_a" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
         try L.rows(try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), h.lo, h.hi, c.kda_heads, .bf16);
-        const proj: kda_block.In = if (qkv) |q| .{ .split = .{ .qkv = q, .rest = try L.put("layers.{d}.kda.rest", .{i}) } } else .{ .bf16 = try L.put("layers.{d}.kda.proj", .{i}) };
+        const proj: kda_block.In = if (qkv) |q| .{ .split = .{ .qkv = .{ .mxfp8 = q }, .rest = try L.put("layers.{d}.kda.rest", .{i}) } } else .{ .bf16 = try L.put("layers.{d}.kda.proj", .{i}) };
         try L.rows(try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
         const fb = try L.put("layers.{d}.kda.fb", .{i});
         try L.rows(try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
@@ -231,6 +242,47 @@ const Loader = struct {
         const o_norm = try L.put("layers.{d}.kda.norm", .{i});
         const o = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = hr }}, &.{ .bf16, .mxfp8 }, "layers.{d}.kda.o");
         return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = o_norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+    }
+
+    /// Whether the tensor `fmt` exists under the prefix.
+    pub fn has(L: *Loader, comptime fmt: []const u8, args: anytype) bool {
+        const name = std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args) catch return false;
+        return L.ck.has(name);
+    }
+
+    /// A REXL3 pack's KDA layer (vcruz305's SAGE GLM-5.3-Flash): fused EXL3 [q | k | v] (qkv_proj), fp16 f_a, g_a, b,
+    /// f_b, g_b, one fused conv1d [3 heads 128][1][4], EXL3 o. Served whole (TP=1): the fused groups cut by heads
+    /// would need per-rank row views of three blocks of one trellis.
+    fn kdaRexl3(L: *Loader, i: u32) !kda_block.Layer {
+        const c = &L.w.config;
+        const h = L.w.share.kda;
+        const dk = c.kda_dim;
+        const all = c.kda_heads * dk;
+        if (h.lo != 0 or h.hi != c.kda_heads) {
+            std.log.err("layer {d}: a REXL3 pack's fused KDA qkv_proj is read whole (TP=1), not heads [{d}, {d})", .{ i, h.lo, h.hi });
+            return error.Exl3RankCut;
+        }
+        const qkv = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.qkv_proj" }}, &.{.bf16}, "layers.{d}.kda.qkv");
+        if (qkv != .exl3 or qkv.exl3.n != 3 * all or qkv.exl3.k() != c.hidden) return error.UnexpectedTensor;
+        inline for (.{ "f_a", "g_a" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
+        try L.whole(try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), .bf16);
+        const rest = try L.put("layers.{d}.kda.rest", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), .bf16);
+        const fb = try L.put("layers.{d}.kda.fb", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), .bf16);
+        const gb = try L.put("layers.{d}.kda.gb", .{i});
+        const conv = try L.get("layers.{d}.self_attn.conv1d.weight", .{i});
+        if (conv.dim(0) != 3 * all or conv.numel() != 3 * all * c.conv) return error.UnexpectedTensor;
+        try L.whole(conv, .f32); // [q | k | v] taps, as the three convs stacked
+        const conv_w = try L.put("layers.{d}.kda.conv", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.A_log", .{i}), .f32);
+        const a_log = try L.put("layers.{d}.kda.a_log", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.dt_bias", .{i}), .f32);
+        const dt = try L.put("layers.{d}.kda.dt_bias", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
+        const o_norm = try L.put("layers.{d}.kda.norm", .{i});
+        const o = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.o_proj" }}, &.{.bf16}, "layers.{d}.kda.o");
+        return .{ .proj = .{ .split = .{ .qkv = qkv, .rest = rest } }, .fb = fb, .gb = gb, .o = o, .conv_w = conv_w, .a_log = a_log, .dt_bias = dt, .norm_w = o_norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
     /// weights.load's dsa(i) (latent): [q_a | kv_a], norms, q_b by heads, kv_b as wk/wv (AbsorbW), o by cols, indexer.
@@ -334,6 +386,12 @@ const Loader = struct {
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
+        if (L.has("layers.{d}.mlp.gate_proj.trellis", .{i})) { // a REXL3 pack's: [gate | up] and down as EXL3 groups
+            const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
+            const gu = try formats.cutProj(L, prefix, i, &parts, &.{.bf16}, "layers.{d}.mlp.gu");
+            const down = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.bf16}, "layers.{d}.mlp.down");
+            return .{ .w = .{ .exl3 = .{ .gu = gu, .down = down } }, .width = s.len(), .dims = d, .limit = c.swiglu_limit };
+        }
         const mx = !c.exl3 and (try L.get("layers.{d}.mlp.gate_proj.weight", .{i})).dtype == .f8_e4m3; // FP4-Local's
         const want: formats.Format = if (c.exl3) .bf16 else if (mx) .mxfp8 else .nvfp4;
         inline for (.{ "gate_proj", "up_proj", "down_proj" }) |x| try L.format("layers.{d}.mlp." ++ x, .{i}, want);
@@ -442,6 +500,7 @@ const Loader = struct {
         if (c.exl3) { // the MTP layer's experts too
             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
             if (!x3.?.shx) L.w.exl3_shx = false;
+            if (x3.?.uniform != 8 or x3.?.codebook != .mcg) L.w.exl3_mixed = true; // the prompt kernels read mcg 4 bits only
         } else routed = try L.nvfp4Experts(i);
         const sh = L.w.share.shared;
         const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
@@ -547,6 +606,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     var recipes = try formats.readRecipes(gpa, io, dir);
     defer if (recipes) |*r| r.deinit();
     if (recipes) |*r| L.recipes = recipeTable(r);
+    // a REXL3 pack (vcruz305's SAGE: every linear EXL3, the small ones fp16, hyper-connections fp32): served whole
+    L.round_bf16 = ck.has(prefix ++ "layers.0.self_attn.qkv_proj.trellis") or ck.has(prefix ++ "layers.0.mlp.gate_proj.trellis");
+    if (L.round_bf16 and share.world > 1) {
+        std.log.err("a REXL3 pack's EXL3 projections are read whole: serve it at TP=1 (this rank is one of {d})", .{share.world});
+        return error.Exl3RankCut;
+    }
     w.layers = try gpa.alloc(Layer, layers.len);
     try @import("cuda_load_ahead.zig").layers(&L, prefix, layers, w.layers);
     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
@@ -555,6 +620,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
     w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
     if (with_mtp and c.mtp > 0) w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
+    if (L.rounded > 0) std.log.info("glm: {d} fp16/fp32 values rounded to the bf16 their kernels read (REXL3 pack)", .{L.rounded});
     return w;
 }
 
@@ -572,6 +638,7 @@ test "the loader narrows a float32 to bf16 only when bf16 holds it, unlike FP4-L
 }
 
 test {
+    _ = @import("cuda_rexl3.zig");
     _ = @import("cuda_formats.zig");
     _ = @import("cuda_proj.zig");
     _ = @import("cuda_fp8pb.zig");

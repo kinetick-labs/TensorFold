@@ -6,6 +6,13 @@ const formats = @import("cuda_formats.zig");
 const weights = @import("cuda_weights.zig");
 const quant = @import("cuda_quant.zig");
 const q4 = @import("cuda_q4.zig");
+const rexl3 = @import("cuda_rexl3.zig");
+
+/// Host threads a load's dequantization takes: every core but two (the stream's and the readers' own).
+fn hostThreads() usize {
+    const n = std.Thread.getCpuCount() catch 4;
+    return @max(1, n -| 2);
+}
 
 const prefix = "model.language_model.";
 
@@ -20,7 +27,15 @@ pub fn load(L: anytype, head_ck: *core.Checkpoint) !weights.Mtp {
     L.ck.release();
     var out: [4]u64 = undefined;
     for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
-        try L.whole(try L.get("layers.{d}.{s}", .{ i, name }), .bf16);
+        if (std.mem.eql(u8, what, "eh") and L.has("layers.{d}.eh_proj.trellis", .{i})) {
+            // a REXL3 pack's eh_proj is an EXL3 group: its bf16 rows dequantized here, as the head reads them
+            var nb: [96]u8 = undefined;
+            const g = try rexl3.read(L.ck, try std.fmt.bufPrint(&nb, prefix ++ "layers.{d}.eh_proj", .{i}));
+            const rows = try L.gpa.alloc(u16, g.shape.n * g.shape.k);
+            defer L.gpa.free(rows);
+            try rexl3.dequantRows(L.gpa, g, 0, g.shape.n, rows, hostThreads());
+            try L.host.appendSlice(L.gpa, std.mem.sliceAsBytes(rows));
+        } else try L.whole(try L.get("layers.{d}.{s}", .{ i, name }), .bf16);
         p.* = try L.put("mtp.{s}", .{what});
     }
     return .{ .enorm = out[0], .hnorm = out[1], .eh = out[2], .norm = out[3], .layer = layer_w, .draft = try draft(L, head_ck) };
@@ -51,6 +66,14 @@ pub fn draft(L: anytype, head_ck: *core.Checkpoint) !q4.Q4 {
             break :r wide.?.ptr;
         },
         .fp8g => return error.UnreadableFormat, // weights.load reads a head as bf16 or MXFP8 only
+        .exl3 => r: { // a REXL3 pack's EXL3 head: the rank's rows dequantized to bf16 on the host, then quantized as any
+            const g = try rexl3.read(head_ck, "lm_head");
+            const host = try L.gpa.alloc(u16, n * k);
+            defer L.gpa.free(host);
+            try rexl3.dequantRows(L.gpa, g, L.w.share.vocab.lo, L.w.share.vocab.hi, host, hostThreads());
+            wide = try cuda.DeviceBuffer.fromHost(L.d, std.mem.sliceAsBytes(host));
+            break :r wide.?.ptr;
+        },
     };
     try quant.q4(qk, L.stream, rows, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
     var tiled: [3]u64 = undefined;

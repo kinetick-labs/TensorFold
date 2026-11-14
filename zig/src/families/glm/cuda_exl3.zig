@@ -23,7 +23,9 @@ pub fn isExl3(gpa: std.mem.Allocator, config_json: []const u8) bool {
     return m == .string and std.mem.eql(u8, m.string, "exl3");
 }
 
-/// The EXL3 checkpoints the kernels read: 4-bit routed experts on the "mcg" codebook (everything else bf16).
+/// The EXL3 checkpoints the kernels read: Mia-AiLab's 4-bit routed experts on the "mcg" codebook (everything else
+/// bf16), or a per-tensor mixed pack (vcruz305's SAGE/REXL3: no average `bits`, or the "mul1" codebook), whose every
+/// group states its own width and codebook and is checked as it loads.
 pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
     defer parsed.deinit();
@@ -32,18 +34,26 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
         return error.UnsupportedQuant;
     };
     const bits = q.get("bits") orelse std.json.Value{ .null = {} };
+    const book = q.get("codebook") orelse std.json.Value{ .null = {} };
+    if (mixed(bits, book)) return;
     if (bits != .integer or bits.integer != 4) {
         why.set("EXL3 at {f} bits: the CUDA family reads 4-bit EXL3 experts", .{std.json.fmt(bits, .{})});
         return error.UnsupportedQuant;
     }
-    const book = q.get("codebook") orelse std.json.Value{ .null = {} };
     if (book != .string or !std.mem.eql(u8, book.string, "mcg")) {
         why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\"", .{std.json.fmt(book, .{})});
         return error.UnsupportedQuant;
     }
 }
 
-/// One layer's EXL3 experts on a rank: trellis words [E][K/16][N/16][32] and fp16 scales (suh [E][K], svh [E][N]).
+/// A per-tensor mixed pack: neither an average width nor a codebook stated, or the "mul1" codebook (any width).
+fn mixed(bits: std.json.Value, book: std.json.Value) bool {
+    if (bits == .null and book == .null) return true;
+    return book == .string and std.mem.eql(u8, book.string, "mul1");
+}
+
+/// One layer's EXL3 experts on a rank: trellis pointers [E] per projection, fp16 scales (suh [E][K], svh [E][N]),
+/// and each projection's widths int32 [E] in half-bits (a SAGE pack mixes 2, 3 and 4 bits within one layer).
 pub const Experts = struct {
     gt: u64,
     ut: u64,
@@ -54,43 +64,82 @@ pub const Experts = struct {
     svh_u: u64,
     suh_d: u64,
     svh_d: u64,
-    k2: u64, // independent per-expert projection widths in the common module
+    k2: u64, // gate's widths (the field Mia's uniform 4-bit layers shared across gate, up and down)
+    k2u: u64 = 0, // up's and down's widths; 0: k2's
+    k2d: u64 = 0,
     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
+    codebook: cuda.exl3.Codebook = .mcg,
+    uniform: u32 = 8, // the half-bit width every projection shares, 0 when they mix
 };
 
-const tile = 128; // a 16 x 16 tile's bytes at 4 bits
+/// Bytes of one 16 x 16 tile at `halves` half-bits a value: 256 values, 16 * bits int16 words.
+fn tileBytes(halves: usize) usize {
+    return 16 * halves;
+}
 
 /// Layer `i`'s EXL3 experts through `L` (cuda_weights' loader): gate, up by `cut`'s tile columns, down by its rows.
+/// Every group's width is its trellis's (last dim / 16 bits); the codebook its marker's, one for the whole layer.
 pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Span) !Experts {
     if (dims % 128 != 0 or cut.lo % 128 != 0 or cut.hi % 128 != 0) return error.NotExl3Mcg4;
     const width = cut.len();
     var out: Experts = undefined;
     out.shx = true;
+    out.uniform = 0;
+    var book: ?cuda.exl3.Codebook = null;
+    var first_halves: ?usize = null;
+    var uniform = true;
     const Mat = struct { k: usize, n: usize, by_cols: bool };
     const mats = [_]Mat{
         .{ .k = dims, .n = inter, .by_cols = true },
         .{ .k = dims, .n = inter, .by_cols = true },
         .{ .k = inter, .n = dims, .by_cols = false },
     };
+    const k2s = try L.gpa.alloc(i32, count);
+    defer L.gpa.free(k2s);
     var first_suh: ?[]const u8 = null;
-    inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }) |m, proj, tw, su, sv| {
+    inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }, .{ "k2", "k2u", "k2d" }) |m, proj, tw, su, sv, kw| {
         const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
         const nt = (if (m.by_cols) width else m.n) / 16;
+        const offsets = try L.gpa.alloc(u64, count);
+        defer L.gpa.free(offsets);
+        var at: u64 = 0;
         for (0..count) |e| {
             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
-            if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16 or t.dim(2) != 64) return error.NotExl3Mcg4;
-            const marker = L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg", .{ i, e }) catch return error.NotExl3Mcg4;
-            if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
-                std.mem.readInt(u32, marker.bytes[0..4], .little) != @import("core").exl3_load.markers[0].value)
-                return error.NotExl3Mcg4;
+            if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16 or t.dim(2) % 8 != 0) return error.NotExl3Mcg4;
+            const halves = t.dim(2) / 8;
+            if (halves < 2 or halves > 16) return error.NotExl3Mcg4;
+            var cb: ?cuda.exl3.Codebook = null;
+            for (@import("core").exl3_load.markers) |mk| {
+                var nb: [192]u8 = undefined;
+                const name = try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.mlp.experts.{d}." ++ proj ++ ".{s}", .{ i, e, mk.name });
+                if (!L.ck.has(name)) continue;
+                const marker = try L.ck.get(name);
+                if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or std.mem.readInt(u32, marker.bytes[0..4], .little) != mk.value)
+                    return error.NotExl3Mcg4;
+                cb = switch (mk.codebook) {
+                    .mcg => .mcg,
+                    .mul1 => .mul1,
+                    .inst3 => .inst3,
+                };
+            }
+            const c = cb orelse return error.NotExl3Mcg4; // 3inst experts: no checkpoint of this family has them
+            if (book) |b| (if (b != c) return error.MixedExl3Codebooks) else book = c;
+            if (halves % 2 == 1 and c != .mul1) return error.NotExl3Mcg4;
+            if (first_halves) |f| (if (f != halves) {
+                uniform = false;
+            }) else first_halves = halves;
+            k2s[e] = @intCast(halves);
+            const tb = tileBytes(halves);
+            offsets[e] = at;
             if (m.by_cols) { // every tile row, the rank's tile columns
-                const row = (m.n / 16) * tile;
-                for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
-            } else try L.host.appendSlice(L.gpa, t.bytes[(cut.lo / 16) * nt * tile ..][0 .. kt * nt * tile]); // its tile rows
+                const row = (m.n / 16) * tb;
+                for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tb ..][0 .. nt * tb]);
+            } else try L.host.appendSlice(L.gpa, t.bytes[(cut.lo / 16) * nt * tb ..][0 .. kt * nt * tb]); // its tile rows
+            at += kt * nt * tb;
         }
         const base = try L.put("layers.{d}.moe.exl3." ++ tw, .{i});
         for (0..count) |e| {
-            const ptr = base + e * kt * nt * tile;
+            const ptr = base + offsets[e];
             try L.host.appendSlice(L.gpa, std.mem.asBytes(&ptr));
         }
         @field(out, tw) = try L.put("layers.{d}.moe.exl3." ++ tw ++ "_ptrs", .{i});
@@ -112,12 +161,11 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
             try L.host.appendSlice(L.gpa, if (m.by_cols) t.bytes[cut.lo * 2 .. cut.hi * 2] else t.bytes);
         }
         @field(out, sv) = try L.put("layers.{d}.moe.exl3." ++ sv, .{i});
+        try L.host.appendSlice(L.gpa, std.mem.sliceAsBytes(k2s));
+        @field(out, kw) = try L.put("layers.{d}.moe.exl3." ++ kw, .{i});
     }
-    for (0..count) |_| {
-        const bits: i32 = 8;
-        try L.host.appendSlice(L.gpa, std.mem.asBytes(&bits));
-    }
-    out.k2 = try L.put("layers.{d}.moe.exl3.k2", .{i});
+    out.codebook = book orelse return error.NotExl3Mcg4;
+    out.uniform = if (uniform) @intCast(first_halves.?) else 0;
     return out;
 }
 
@@ -131,7 +179,9 @@ pub const chunk_rows = 1024;
 /// The prompt item plan has no decode grouper's shared-memory cap; one call covers a supported whole prompt pass.
 pub const prompt_rows = 4096;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
+    const up = if (w.k2u != 0) w.k2u else w.k2;
+    const down = if (w.k2d != 0) w.k2d else w.k2;
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = up, .down_k2 = down, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.codebook, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .shared_input = w.shx };
 }
 fn shape(dims: usize, width: usize) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
@@ -143,10 +193,15 @@ fn picksBytes(rows: usize) usize {
     return std.mem.alignForward(usize, cap * top_k * 4, 256);
 }
 pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
+    return scratchFor(rows, dims, width, prefill, shx, true);
+}
+/// scratchBytes for a pack whose experts' widths are `uniform` (Mia-AiLab's 4 bits) or mix (a SAGE pack: its prompt
+/// chunks take the compacted path, the prompt kernels reading one width only).
+pub fn scratchFor(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, uniform: bool) [4]usize {
     var l = shape(dims, width);
     l.shared_input = shx;
-    if (prefill and common.prompt.eligible(l)) return .{ common.prompt.bytes(l, @min(rows, prompt_rows), top_k + 1) catch unreachable, 4, 4, 4 };
     const n: usize = @min(rows, chunk_rows);
+    if (uniform and prefill and common.prompt.eligible(l)) return .{ common.prompt.bytes(l, @min(rows, prompt_rows), top_k + 1) catch unreachable, 4, 4, 4 };
     return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
 }
 /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
@@ -187,7 +242,7 @@ fn compact(k: *const Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, x: u
     }
 }
 
-test "EXL3 admission: Mia-AiLab's block passes; other widths and codebooks are refused by name" {
+test "GLM REXL3: EXL3 admission: Mia-AiLab's block and per-tensor mixed packs pass; other uniform blocks are refused by name" {
     const gpa = std.testing.allocator;
     const mia =
         \\{"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "mcg", "head_bits": 16}}
@@ -199,8 +254,11 @@ test "EXL3 admission: Mia-AiLab's block passes; other widths and codebooks are r
     try std.testing.expect(!isExl3(gpa, "{}"));
     try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3, \"codebook\": \"mcg\"}}", &why));
     try std.testing.expectEqualStrings("EXL3 at 3 bits: the CUDA family reads 4-bit EXL3 experts", why.text());
-    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1\"}}}", &why));
-    try std.testing.expectEqualStrings("EXL3 codebook \"mul1\": the CUDA family reads \"mcg\"", why.text());
+    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"3inst\"}}}", &why));
+    try std.testing.expectEqualStrings("EXL3 codebook \"3inst\": the CUDA family reads \"mcg\"", why.text());
+    // per-tensor mixed packs (vcruz305's SAGE/REXL3): the groups state their widths and codebooks, checked at load
+    try admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\"}}", &why);
+    try admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1\"}}}", &why);
 }
 
 test "a chunk's compacted picks end before the common scratch at every row count" {
