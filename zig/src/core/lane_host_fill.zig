@@ -48,7 +48,7 @@ fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
         // an unstarted job's cache hit is known at admission; a rejected restore leaves the whole prompt
         @max(j.stream.cached, j.stream.reuse.at)
     else
-        @max(j.stream.cached, j.stream.reuse.at);
+        j.stream.cached;
     return j.stream.prompt_len -| completed;
 }
 
@@ -308,8 +308,10 @@ fn srptStep(h: *LaneHost, at: usize, decoding: bool) u64 {
 
 /// A prompt whose whole pass is at most `short_rows` rows (a long prompt's last rows are not).
 fn short(j: *const LaneHost.Job) bool {
-    // a prompt not begun yet counts from the cache's match (reuse.at), so a resumed turn is short before its begin
-    return j.stream.prompt_len -| @max(j.stream.cached, j.stream.reuse.at) <= Share.short_rows;
+    // a prompt not begun yet counts from the cache's match (reuse.at), so a resumed turn is short before its begin;
+    // a rejected restore (reuse_failed) leaves the whole prompt, as remaining() reads it
+    const from = if (!j.fill_began and !j.stream.reuse_failed) @max(j.stream.cached, j.stream.reuse.at) else j.stream.cached;
+    return j.stream.prompt_len -| from <= Share.short_rows;
 }
 
 /// Fill chunks' cap: only the flag, a chunk-invariant family and live decoders together; else 0 (the engine's own cut).
