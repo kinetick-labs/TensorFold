@@ -190,6 +190,8 @@ pub const Engine = struct {
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        const x3 = try @import("cuda_rexl3.zig").reserve(&e.w, &e.m.x3run, stream); // a REXL3 pack's EXL3 projections
+        if (x3 > 0 and rank == 0) std.log.info("glm: {d} EXL3 projections (REXL3 pack) on the common dense kernels", .{x3});
         if (o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
         errdefer if (e.l2pf) |*p| p.deinit();
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it

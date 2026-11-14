@@ -16,6 +16,8 @@ pub const Set = struct {
     copy_rows: ?cuda.Function = null,
     /// A decode window's DSA select on many CTAs (cuda_sparse.decodeSelect; TF_GLM_DSEL, default on).
     dsel: bool = false,
+    /// A REXL3 pack's EXL3 projections on this set's stream (cuda_proj.Exl3Run); null when none are loaded.
+    exl3: ?*@import("cuda_proj.zig").Exl3Run = null,
 };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
