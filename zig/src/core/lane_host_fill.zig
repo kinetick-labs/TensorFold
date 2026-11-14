@@ -98,7 +98,7 @@ pub const Share = struct {
         return s;
     }
 
-    /// `fcfs`; anything else is the default order.
+    /// `fcfs` or `srf`; anything else is the default order.
     pub fn policyOf(text: []const u8) Policy {
         const t = std.mem.trim(u8, text, " \t");
         if (std.mem.eql(u8, t, "fcfs")) return .fcfs;
