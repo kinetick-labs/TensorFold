@@ -61,9 +61,10 @@ fn rope(d: anytype, x: u64, w: u64, out: u64, rows: usize, heads: usize) !void {
 }
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
-    const partial = .{ d.q, d.kb, d.vb, d.segments, @as(c_int, @intCast(c.block)), @as(c_int, @intCast(c.heads)), @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.ringRows())), @as(c_int, @intCast(c.window)), @as(c_int, @intCast(layer)), d.pm, d.pl, d.po };
+    // the shared kernels take the chunk count and causal (upstream 67711a6aa, DSpine): DFlash2's rows see the whole block
+    const partial = .{ d.q, d.kb, d.vb, d.segments, @as(c_int, @intCast(c.block)), @as(c_int, @intCast(c.heads)), @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.ringRows())), @as(c_int, @intCast(c.window)), @as(c_int, @intCast(layer)), @as(c_int, chunks), @as(c_int, 0), d.pm, d.pl, d.po };
     try launch(d, d.fns.attn_partial, .{ rows, c.heads, chunks }, .{ 128, 1, 1 }, partial);
-    const merge = .{ d.pm, d.pl, d.po, @as(c_int, @intCast(c.heads)), d.att };
+    const merge = .{ d.pm, d.pl, d.po, @as(c_int, @intCast(c.heads)), @as(c_int, chunks), d.att };
     try launch(d, d.fns.attn_merge, .{ rows, c.heads, 1 }, .{ 32, 1, 1 }, merge);
 }
 pub fn publish(d: anytype, items: []const Hold, contexts: []const *draft.Ctx) !void {
