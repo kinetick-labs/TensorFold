@@ -47,7 +47,7 @@ pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
         return error.ComputeLaneUnavailable;
     };
     std.log.info("compute lane: {s} in a sandbox, {d} at a time, {d} ms, {d} MiB, results up to {d} tokens, {d} calls a reply", .{ cfg.python, cfg.workers, cfg.max_ms, cfg.mem_mb, cfg.max_result_tokens, cfg.max_calls });
-    if (cfg.default) std.log.info("compute default: every thinking chat gets the built-in tool, whatever it sends", .{});
+    if (cfg.default) std.log.info("compute default: every thinking chat gets the built-in tool{s}", .{if (cfg.with_tools) ", whatever it sends" else " unless it brings tools of its own"});
     return pool;
 }
 
@@ -86,7 +86,7 @@ pub fn requestTools(srv: *Server, cx: *Cx, body: Value, input: *chat.Input, logp
     input.lane_own = ownedByServer(srv, body.get("tools"), input.tools);
 }
 
-/// The request's tools, `{"type": "code_interpreter"}` as the built-in tool (the default's: every chat that `fit`s).
+/// The request's tools, `{"type": "code_interpreter"}` as the built-in tool (the default's: every tool-less chat that `fit`s).
 pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value, fit: Fit) errors.Refused![]Value {
     const always = forced(srv);
     const tool = srv.info.compute_tool;
@@ -98,7 +98,11 @@ pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value, fit: Fit) error
         const kind = if (t == .object) t.strField("type") orelse "" else "";
         if (std.mem.eql(u8, kind, tool.opt_in)) listed = true else try rest.append(cx.a, t);
     };
-    if (!listed and (!always or !fits(fit, tool.min_tokens))) return active(srv, cx, raw, choice);
+    // unasked, the default offers it only to a chat with no tools of its own (_DEFAULT_WITH_TOOLS: to any):
+    // an agent with its own tools renders and runs as with the lane off
+    const own = rest.items.len > 0 or (list != .array and list != .null);
+    const offered = always and fits(fit, tool.min_tokens) and (!own or srv.info.compute.?.with_tools);
+    if (!listed and !offered) return active(srv, cx, raw, choice);
     if (srv.compute == null) return cx.other(try std.fmt.allocPrint(cx.a, "{s} is not enabled on this server", .{tool.opt_in}));
     var specs = try active(srv, cx, if (list == .array) .{ .array = rest.items } else raw, choice);
     // a client's own copy of the built-in definition is the same tool: one declaration, not a refusal (default only)
