@@ -243,6 +243,8 @@ pub const Info = struct {
     admit: ?Admit = null,
     /// A byte budget each request promises its caches from as it is admitted (null: none); never beside `admit`.
     ledger: ?Ledger = null,
+    /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
+    media: bool = false,
 
     pub const Capability = @import("engine_capabilities.zig").Capability;
 
@@ -250,8 +252,6 @@ pub const Info = struct {
     pub inline fn capability(i: Info, comptime key: Capability) bool {
         return @import("engine_capabilities.zig").read(i, key);
     }
-    /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
-    media: bool = false,
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
