@@ -21,7 +21,7 @@ const Run = struct { code: u16, body: json.Value, prompt: []const u32, held: boo
 /// The model's first segment: a python call, one with no code, a bash call, or a plain answer; then "It is 42.".
 const Model = enum { python_call, no_code, bash_call, answer };
 
-const Ask = struct { default: bool, tools: ?[]const u8 = null, choice: ?[]const u8 = null, model: Model = .answer, max_calls: u32 = 8, think: bool = true };
+const Ask = struct { default: bool, tools: ?[]const u8 = null, choice: ?[]const u8 = null, model: Model = .answer, max_calls: u32 = 8, think: bool = true, with_tools: bool = false };
 
 fn chat(a: Allocator, ask: Ask) !Run {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
@@ -58,7 +58,7 @@ fn chat(a: Allocator, ask: Ask) !Run {
     script.* = .{ .a = a, .call = called[asked.len..], .answer = answer };
     const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
     defer srv.deinit();
-    const cfg: lane.Config = .{ .python = python, .default = ask.default, .max_calls = ask.max_calls };
+    const cfg: lane.Config = .{ .python = python, .default = ask.default, .max_calls = ask.max_calls, .with_tools = ask.with_tools };
     srv.info.compute = cfg;
     srv.compute = lane.Pool.init(cfg, &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner });
     var reply: h.Reply = .{ .a = a };
@@ -126,17 +126,43 @@ test "compute lane: under the default a chat that runs nothing counts 0" {
     try t.expectEqual(@as(i64, 0), try count(r, "total"));
 }
 
-test "compute lane: under the default a client's own tools stay, the built-in joins once, their calls go back" {
+test "compute lane: under the default a chat with its own tools renders and runs as with the default off" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const tools = "[" ++ bash_tool ++ "]";
     const r = try chat(a, .{ .default = true, .tools = tools });
+    const off = try chat(a, .{ .default = false, .tools = tools });
+    try t.expectEqual(@as(u16, 200), r.code);
+    try t.expectEqualSlices(u32, off.prompt, r.prompt);
+    try t.expect(!r.held);
+    // tool_choice none hides them as it does with the default off: no built-in tool either
+    const none = try chat(a, .{ .default = true, .tools = tools, .choice = "\"none\"" });
+    const none_off = try chat(a, .{ .default = false, .tools = tools, .choice = "\"none\"" });
+    try t.expectEqualSlices(u32, none_off.prompt, none.prompt);
+    try t.expect(!none.held);
+    // the client's call goes back to it
+    const c = try chat(a, .{ .default = true, .tools = tools, .model = .bash_call });
+    try t.expectEqual(@as(u16, 200), c.code);
+    try t.expectEqualStrings("tool_calls", c.body.get("choices").?.array[0].get("finish_reason").?.string);
+    // listing code_interpreter next to them still opts in
+    const listed = try chat(a, .{ .default = true, .tools = "[" ++ bash_tool ++ ",{\"type\":\"code_interpreter\"}]" });
+    const opted = try chat(a, .{ .default = false, .tools = "[" ++ bash_tool ++ ",{\"type\":\"code_interpreter\"}]" });
+    try t.expectEqualSlices(u32, opted.prompt, listed.prompt);
+    try t.expect(listed.held);
+}
+
+test "compute lane: under the default with tools a client's own tools stay, the built-in joins once, their calls go back" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = "[" ++ bash_tool ++ "]";
+    const r = try chat(a, .{ .default = true, .with_tools = true, .tools = tools });
     const opted = try chat(a, .{ .default = false, .tools = "[" ++ bash_tool ++ ",{\"type\":\"code_interpreter\"}]" });
     try t.expectEqualSlices(u32, opted.prompt, r.prompt);
     try t.expect(r.held);
     // the client's call ends the reply for the client: nothing runs in the engine
-    const c = try chat(a, .{ .default = true, .tools = tools, .model = .bash_call });
+    const c = try chat(a, .{ .default = true, .with_tools = true, .tools = tools, .model = .bash_call });
     try t.expectEqual(@as(u16, 200), c.code);
     const choice = c.body.get("choices").?.array[0];
     try t.expectEqualStrings("tool_calls", choice.get("finish_reason").?.string);
@@ -205,11 +231,11 @@ test "compute lane: the executed counter skips a call with no code and a call pa
     try t.expectEqual(@as(i64, 0), try count(capped, "total"));
 }
 
-test "compute lane: under the default tool_choice none hides the client's tools but not the built-in" {
+test "compute lane: under the default with tools tool_choice none hides the client's tools but not the built-in" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const r = try chat(a, .{ .default = true, .tools = "[" ++ bash_tool ++ "]", .choice = "\"none\"" });
+    const r = try chat(a, .{ .default = true, .with_tools = true, .tools = "[" ++ bash_tool ++ "]", .choice = "\"none\"" });
     const opted = try chat(a, .{ .default = false, .tools = "[{\"type\":\"code_interpreter\"}]" });
     try t.expectEqual(@as(u16, 200), r.code);
     try t.expectEqualSlices(u32, opted.prompt, r.prompt);
