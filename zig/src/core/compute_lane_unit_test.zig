@@ -49,6 +49,12 @@ test "compute lane config: _DEFAULT is off unless 1, needs the lane and refuses 
     try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "0" }, .{ "TF_X_DEFAULT", "1" } }));
 }
 
+test "compute lane config: _DEFAULT_WITH_TOOLS is off unless 1 and refuses other values" {
+    try expect(!(try parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT", "1" } })).?.with_tools);
+    try expect((try parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT", "1" }, .{ "TF_X_DEFAULT_WITH_TOOLS", "1" } })).?.with_tools);
+    try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "1" }, .{ "TF_X_DEFAULT_WITH_TOOLS", "yes" } }));
+}
+
 test "compute lane binding: generic names or the family's alias, not both; the tool is python" {
     const dsv41 = lane.bindings.dsv41;
     knobs = &.{};

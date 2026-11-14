@@ -20,10 +20,11 @@ pub const Config = struct {
     mem_mb: u32 = 1024, // RLIMIT_AS
     python: []const u8 = "/usr/bin/python3",
     cpus: []const u8 = "", // optional affinity list like "16-19" or "1,3,5-7"
-    default: bool = false, // PREFIX_DEFAULT=1: every thinking chat gets the built-in tool, whatever it sends
+    default: bool = false, // PREFIX_DEFAULT=1: every thinking chat that brings no tools of its own gets the built-in tool
+    with_tools: bool = false, // PREFIX_DEFAULT_WITH_TOOLS=1: the default offers it next to a client's own tools too
 
     /// The knobs `parse` reads, after the prefix.
-    pub const knobs = [_][]const u8{ "", "_DEFAULT", "_WORKERS", "_MAX_MS", "_MAX_RESULT_TOKENS", "_MAX_CALLS", "_MEM_MB", "_PYTHON", "_CPUS" };
+    pub const knobs = [_][]const u8{ "", "_DEFAULT", "_DEFAULT_WITH_TOOLS", "_WORKERS", "_MAX_MS", "_MAX_RESULT_TOKENS", "_MAX_CALLS", "_MEM_MB", "_PYTHON", "_CPUS" };
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -31,7 +32,7 @@ pub const Config = struct {
         const on = get(prefix) orelse "";
         if (on.len == 0 or std.mem.eql(u8, on, "0")) return if (always) bad(prefix ++ "_DEFAULT", "1 without the lane") else null;
         if (!std.mem.eql(u8, on, "1")) return bad(prefix, on);
-        var c: Config = .{ .default = always };
+        var c: Config = .{ .default = always, .with_tools = try flag(get, prefix ++ "_DEFAULT_WITH_TOOLS") };
         c.workers = try knob(u8, get, prefix ++ "_WORKERS", c.workers, 1, 64);
         c.max_ms = try knob(u32, get, prefix ++ "_MAX_MS", c.max_ms, 1, 3_600_000);
         c.max_result_tokens = try knob(u32, get, prefix ++ "_MAX_RESULT_TOKENS", c.max_result_tokens, 1, 1 << 20);
