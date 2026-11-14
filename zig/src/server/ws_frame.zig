@@ -155,7 +155,7 @@ pub const Step = struct { used: usize, event: ?Event = null };
 /// Joins client frames into messages. It parses a header once its bytes are present and takes payload in any chunks.
 pub const Assembler = struct {
     gpa: Allocator,
-    limit: usize = http_body.limit,
+    limit: usize = http_body.default_limit,
     message: std.ArrayList(u8) = .empty,
     /// A text message has started and its final fragment has not arrived.
     open: bool = false,
