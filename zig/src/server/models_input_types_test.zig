@@ -43,6 +43,7 @@ fn noTemplate(_: *anyopaque) []const u8 {
 /// A server with only discovery's and media's fields set: no engine, model or tokenizer.
 fn server(vision: ?api.Vision, video_decoder: bool) Server {
     var srv: Server = undefined;
+    srv.vision_helper = null; // our --vision-helper: off in these fixtures
     srv.io = t.io;
     srv.info = .{ .vision = vision };
     srv.config = .{ .served_name = "model", .model_ids = &.{ "model", "alias" } };
