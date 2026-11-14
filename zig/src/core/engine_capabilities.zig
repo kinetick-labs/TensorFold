@@ -20,6 +20,7 @@ pub const Capability = enum {
     pictures,
     greedy_only,
     slide_conversations,
+    media, // our Flash Next engine takes Request.media (--vision-helper)
     vision,
     speech,
     embeddings,
