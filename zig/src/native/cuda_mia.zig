@@ -29,6 +29,10 @@ pub const prompt_rows: u32 = N.prompt_rows;
 pub const snap_lookahead: u32 = N.cache_rules.lookahead;
 /// The engine takes --vision-helper's image and video rows (Request.media).
 pub const takes_media = N.media;
+/// The compute lane and the in-model runner as upstream's flashnext binds them (Jay Leaton's 0051 for her engine):
+/// one qwen4_exp checkpoint, one ChatML markup; openWith boots both from TF_COMPUTE_LANE* / TF_RUNNER*.
+pub const compute = @import("flashnext").native.compute;
+pub const runner = @import("flashnext").native.runner;
 
 /// Upstream's serve options plus those cuda_options.zig forwards by name (parallel, prompt_cache_gib, vision_helper).
 pub const Options = struct {
