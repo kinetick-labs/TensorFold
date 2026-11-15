@@ -61,12 +61,15 @@ pub const Kernels = struct {
     rotate: Function,
     gateup: Function,
     down: Function,
+    /// The e4m3 gate/up (exl3_prompt_x8.cuh): rows rotated to e4m3 with a scale a row, then m16n8k32 MMA.
+    rot8: Function = undefined,
+    gateup8: Function = undefined,
     pub fn resolve(mod: Module) !Kernels {
-        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down") };
+        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"), .rot8 = try mod.function("tf_exl3_experts_rot_in8"), .gateup8 = try mod.function("tf_exl3_prompt_gu8") };
     }
     /// `skip` is the shared expert's id, equal to the routed count; its output slot stays owned by the caller.
-    /// `yb`: the slot rows y bf16 (else fp32).
-    pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize, yb: bool) !void {
+    /// `yb`: the slot rows y bf16 (else fp32). `fp8`: gate/up in e4m3 where it applies (mul1 widths, rows per slot).
+    pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize, yb: bool, fp8: bool) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         if (skip) |id| if (id != l.experts or l.experts == grouped.max_experts) return error.Exl3Shape;
@@ -74,6 +77,17 @@ pub const Kernels = struct {
         const skip_id: i32 = if (skip) |id| i(id) else -1;
         const pairs = rows * sc.slots;
         try router.route(s, picks, pairs, count, tile, p);
+        const items_ = grouped.maxItems(pairs, count, tile);
+        if (fp8 and !l.shared_input and l.codebook == .mul1 and l.dims <= 4096) {
+            // e4m3 rows in the first pairs * dims bytes of xg / xu, their scales after (256-aligned)
+            const sg = sc.xg + try aligned(try mul(pairs, l.dims));
+            const su = sc.xu + try aligned(try mul(pairs, l.dims));
+            try go(k.rot8, s, .{ pairs, 2, 1 }, 1024, .{ x, i(stride), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, sg, su, i(l.dims), i(sc.slots), i(l.experts) });
+            try go(k.gateup8, s, .{ l.width / 128, items_, 1 }, 256, .{ sc.xg, sc.xu, sg, su, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), l.limit, l.act_mode, skip_id, l.gate_k2 });
+            const dk8 = k2args(l, false);
+            try go(k.down, s, .{ l.dims / 256, items_, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id, dk8[0], dk8[1], @as(i32, @intFromBool(yb)) });
+            return;
+        }
         if (l.shared_input) {
             try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
         } else {
