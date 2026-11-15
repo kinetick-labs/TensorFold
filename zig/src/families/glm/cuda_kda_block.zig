@@ -103,8 +103,11 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
         .split => |sp| { // each part on its own kernel into its columns of s.p: one row straight there, more through tmp
             // cc-defer: two row copies a window; an output row stride on the lane and glm_mm if a profile flags them
             const one = rows == 1;
-            try projection.matmul(set, stream, sp.qkv, x, x_stride, if (one) s.p else s.tmp, s.mm_part, rows, fa, l.dims, false);
-            if (!one) try columns(set, stream, s.tmp, fa, s.p, w, rows);
+            // a prompt chunk on the fused EXL3 GEMM writes its rows straight into s.p's columns: no copy
+            if (one or !try projection.matmulStrided(set, stream, sp.qkv, x, x_stride, s.p, w, rows, fa, l.dims, false)) {
+                try projection.matmul(set, stream, sp.qkv, x, x_stride, if (one) s.p else s.tmp, s.mm_part, rows, fa, l.dims, false);
+                if (!one) try columns(set, stream, s.tmp, fa, s.p, w, rows);
+            }
             // the bf16 rest (2 * dk + heads wide) tiles with the stack, or stays row-major with it when uneven
             try b16.matmul(selected, stream, x, x_stride, sp.rest, if (one) s.p + fa * 2 else s.tmp, s.mm_part, rows, w - fa, l.dims, false);
             if (!one) try columns(set, stream, s.tmp, w - fa, s.p + fa * 2, w, rows);
