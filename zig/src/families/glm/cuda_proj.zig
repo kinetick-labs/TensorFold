@@ -79,7 +79,14 @@ pub const Exl3Run = struct {
     }
 
     fn fused(r: *Exl3Run, s: cuda.Stream, e: Exl3, x: u64, x_stride: usize, out: u64, m: usize, wide: bool) !void {
-        return fusedRun(r, s, e, x, x_stride, out, m, wide);
+        return fusedRun(r, s, e, x, x_stride, out, e.n, m, wide);
+    }
+
+    /// `run` into rows `o_stride` apart when the call takes the fused GEMM (which writes strided rows); false: not here.
+    pub fn runStrided(r: *Exl3Run, s: cuda.Stream, e: Exl3, x: u64, x_stride: usize, out: u64, o_stride: usize, m: usize, wide: bool) !bool {
+        if (m < Pfd.min_rows or r.pfd == null or !r.pfd.?.strided or !Pfd.covers(e) or o_stride < e.n) return false;
+        try fusedRun(r, s, e, x, x_stride, out, o_stride, m, wide);
+        return true;
     }
 
     /// x [m][k] (rows `x_stride` apart, bf16) through `e` into out [m][e.n]: bf16, or fp32 with `wide`.
@@ -123,7 +130,7 @@ pub const block_rows = 128;
 /// A prompt chunk's rows through `e` on the fused GEMM: each member's input rotated once for all `m` rows
 /// (tf_exl3_rot_in), then pfdense into the member's columns of `out` (row stride e.n), the trellis decoded once
 /// per row tile instead of once per 128-row block's 16- or 32-row group.
-fn fusedRun(r: *Exl3Run, s: cuda.Stream, e: Exl3, x: u64, x_stride: usize, out: u64, m: usize, wide: bool) !void {
+fn fusedRun(r: *Exl3Run, s: cuda.Stream, e: Exl3, x: u64, x_stride: usize, out: u64, o_stride: usize, m: usize, wide: bool) !void {
     const p = &r.pfd.?;
     const k = e.k();
     var xin = x;
@@ -153,7 +160,7 @@ fn fusedRun(r: *Exl3Run, s: cuda.Stream, e: Exl3, x: u64, x_stride: usize, out: 
             }, s, &ra);
             rotated = w.suh;
         }
-        try p.gemm(s, w, xh, out + off * esz, e.n, m, wide);
+        try p.gemm(s, w, xh, out + off * esz, o_stride, m, wide);
         off += w.n;
     }
 }
@@ -167,6 +174,8 @@ pub const Pfd = struct {
     forced: ?usize, // TF_GLM_PFD_CFG: one configuration for every call
     /// The MLA layers' absorb_q / expand_v of prompt chunks on tensor cores (glm_pf_mla.cuh); null: TF_GLM_PF_MLA=0.
     mla: ?[2]cuda.Function = null,
+    /// Strided rows straight into a caller's columns (matmulStrided); false: TF_GLM_STRIDED=0.
+    strided: bool = true,
 
     pub const k2s = [_]u32{ 8, 10, 12, 14, 16 };
     /// glm_pfdense.cu's (BM, WM, WN, KS, NST): pfdense_args.h's configurations 0, 3 and 6, the heuristic's choices.
@@ -225,6 +234,7 @@ pub const Pfd = struct {
         };
         const mla_on = if (std.c.getenv("TF_GLM_PF_MLA")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         if (mla_on) p.mla = .{ try p.mod.function("tf_glm_pf_absorb"), try p.mod.function("tf_glm_pf_expand") };
+        if (std.c.getenv("TF_GLM_STRIDED")) |v| p.strided = !std.mem.eql(u8, std.mem.span(v), "0");
         if (std.c.getenv("TF_GLM_PFD_SMS")) |v| p.sms = std.fmt.parseInt(usize, std.mem.span(v), 10) catch p.sms;
         if (std.c.getenv("TF_GLM_PFD_CFG")) |v| p.forced = std.fmt.parseInt(usize, std.mem.span(v), 10) catch null;
         if (p.forced) |c| if (c >= cfgs.len) {
@@ -361,6 +371,18 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usi
     }
 }
 
+/// `matmul` into rows `out_stride` apart, for the calls that write strided rows (an EXL3 prompt chunk on the fused GEMM);
+/// false: nothing launched, the caller packs through its own copy. TF_GLM_STRIDED=0: always false.
+pub fn matmulStrided(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usize, out: u64, out_stride: usize, m: usize, n: usize, k: usize, wide: bool) !bool {
+    switch (w) {
+        .exl3 => |e| {
+            if (e.n != n or e.k() != k) return error.ShapeMismatch;
+            const r = set.exl3 orelse return false;
+            return r.runStrided(stream, e, x, x_stride, out, out_stride, m, wide);
+        },
+        else => return false,
+    }
+}
 /// error.SlicePartialsNotHeld when `matmul` would refuse `w` on `lane` at some row count: the loader's check.
 pub fn fits(lane: *const cuda.qmmf.Lane, w: cuda.qmmf.Weight) error{SlicePartialsNotHeld}!void {
     // one row stands for all: under qmmf.fused_rows the plan is the same for every row count, and over it none reduces
