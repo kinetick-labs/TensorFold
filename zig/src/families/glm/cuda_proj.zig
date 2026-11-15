@@ -165,6 +165,8 @@ pub const Pfd = struct {
     fns: [k2s.len][cfgs.len]cuda.Function,
     sms: usize,
     forced: ?usize, // TF_GLM_PFD_CFG: one configuration for every call
+    /// The MLA layers' absorb_q / expand_v of prompt chunks on tensor cores (glm_pf_mla.cuh); null: TF_GLM_PF_MLA=0.
+    mla: ?[2]cuda.Function = null,
 
     pub const k2s = [_]u32{ 8, 10, 12, 14, 16 };
     /// glm_pfdense.cu's (BM, WM, WN, KS, NST): pfdense_args.h's configurations 0, 3 and 6, the heuristic's choices.
@@ -221,12 +223,26 @@ pub const Pfd = struct {
             try f.allowDynamicShared(smem(c, k2));
             p.fns[ki][c] = f;
         };
+        const mla_on = if (std.c.getenv("TF_GLM_PF_MLA")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        if (mla_on) p.mla = .{ try p.mod.function("tf_glm_pf_absorb"), try p.mod.function("tf_glm_pf_expand") };
         if (std.c.getenv("TF_GLM_PFD_SMS")) |v| p.sms = std.fmt.parseInt(usize, std.mem.span(v), 10) catch p.sms;
         if (std.c.getenv("TF_GLM_PFD_CFG")) |v| p.forced = std.fmt.parseInt(usize, std.mem.span(v), 10) catch null;
         if (p.forced) |c| if (c >= cfgs.len) {
             p.forced = null;
         };
         return p;
+    }
+
+    /// A prompt chunk's absorb (which 0) or expand (1) on tensor cores: out [rows][heads][n] = in [rows][heads][k] . w
+    /// per head (absorb: wk [heads][256][512]; expand: wv [heads][256][512] transposed). False: not taken here.
+    pub fn latent(p: *const Pfd, s: cuda.Stream, which: usize, in: u64, w: u64, out: u64, rows: usize, heads: usize) !bool {
+        const fns = p.mla orelse return false;
+        if (rows < min_rows) return false;
+        const n: usize = if (which == 0) 512 else 256;
+        var a: cuda.Args = .{};
+        inline for (.{ in, w, out, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)) }) |v| a.add(v);
+        try cuda.launch.launch(fns[which], .{ .grid = .{ .x = @intCast(n / 64), .y = @intCast((rows + 63) / 64), .z = @intCast(heads) }, .block = .{ .x = 128 } }, s, &a);
+        return true;
     }
 
     pub fn unload(p: *Pfd) void {
