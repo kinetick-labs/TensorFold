@@ -65,7 +65,8 @@ pub const Kernels = struct {
         return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down") };
     }
     /// `skip` is the shared expert's id, equal to the routed count; its output slot stays owned by the caller.
-    pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize) !void {
+    /// `yb`: the slot rows y bf16 (else fp32).
+    pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, y: u64, skip: ?usize, yb: bool) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         if (skip) |id| if (id != l.experts or l.experts == grouped.max_experts) return error.Exl3Shape;
@@ -84,6 +85,6 @@ pub const Kernels = struct {
         const gk = k2args(l, true);
         const dk = k2args(l, false);
         try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, skip_id, gk[0], gk[1] });
-        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id, dk[0], dk[1] });
+        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id, dk[0], dk[1], @as(i32, @intFromBool(yb)) });
     }
 };

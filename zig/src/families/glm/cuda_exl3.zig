@@ -219,7 +219,12 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
     const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
     try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
 }
-pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
+/// Whether `run` takes the prompt kernels for these experts (and so can write bf16 slot rows).
+pub fn promptPath(w: Experts, count: usize, dims: usize, width: usize, limit: f32) bool {
+    return dims % 256 == 0 and width % 128 == 0 and common.prompt.eligible(layer(w, count, dims, width, limit));
+}
+/// `yb`: a prompt chunk on the prompt kernels writes bf16 slot rows (promptPath; the compacted path stays fp32).
+pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64, yb: bool) !void {
     _ = xd;
     if (slots != top_k + 1) return error.UnsupportedTopK;
     if (dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
@@ -229,7 +234,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
         var at: usize = 0;
         while (at < rows) : (at += prompt_rows) {
             const n: usize = @min(prompt_rows, rows - at);
-            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
+            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * @as(usize, if (yb) 2 else 4), count, yb);
         }
         return;
     }

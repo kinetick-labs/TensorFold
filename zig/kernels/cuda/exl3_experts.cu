@@ -311,7 +311,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const hal
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int skip, const int* __restrict__ k2s, int cbk) {
+        float* __restrict__ y, int K, int D, int skip, const int* __restrict__ k2s, int cbk, int yb) {   // yb: y bf16
 
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
     __shared__ int rows_sh[TPM];
@@ -344,9 +344,15 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
                 fwht128(v, lane);
-                float* o = y + (size_t)p * D + n;
+                if (yb) {
+                    __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(y) + (size_t)p * D + n;
 #pragma unroll
-                for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+                    for (int j = 0; j < 4; ++j) o[j] = __float2bfloat16_rn(v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]));
+                } else {
+                    float* o = y + (size_t)p * D + n;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+                }
             }
         }
     }
