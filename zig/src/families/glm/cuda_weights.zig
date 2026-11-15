@@ -43,7 +43,7 @@ pub const Weights = struct {
     norm: glue.Norm = .{ .bf16 = 0 },
     head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
     mtp: ?Mtp = null,
-    exl3_mixed: bool = false, // EXL3: some layer's experts mix widths (a SAGE pack), so its prompts take the compacted path
+    exl3_mixed: bool = false, // EXL3: some layer's experts mix widths the prompt kernels do not read, so its prompts take the compacted path
     exl3_shx: bool = true, // EXL3: every layer's gate and up share one input rotation (a prompt rotates each row once)
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
@@ -500,7 +500,7 @@ const Loader = struct {
         if (c.exl3) { // the MTP layer's experts too
             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
             if (!x3.?.shx) L.w.exl3_shx = false;
-            if (x3.?.uniform != 8 or x3.?.codebook != .mcg) L.w.exl3_mixed = true; // the prompt kernels read mcg 4 bits only
+            if ((x3.?.uniform != 8 or x3.?.codebook != .mcg) and !x3.?.prompt_k2) L.w.exl3_mixed = true; // the prompt kernels read mcg 4 bits or a REXL3 mul1 mix
         } else routed = try L.nvfp4Experts(i);
         const sh = L.w.share.shared;
         const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
