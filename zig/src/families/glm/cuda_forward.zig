@@ -94,6 +94,7 @@ pub const Modules = struct {
             };
             runs += 1;
         }
+        m.x3run[1].prompt_rows = prefill_rows; // the prompt stream's runner: its fused GEMM's rows held from the start
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
         m.index = null;
         errdefer if (m.index) |*x| x.unload();
