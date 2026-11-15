@@ -39,6 +39,7 @@ pub const Modules = struct {
     glue: glue.Kernels,
     mods: [8]cuda.Module,
     kda: kda.Kernels,
+    kda_chunk: ?kda_block.Chunk = null, // TF_GLM_KDA_CHUNK: prompt chunks' chains in chunks
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
     experts: experts.Kernels,
@@ -71,6 +72,7 @@ pub const Modules = struct {
         m.prompt = try cuda.nvfp4.Prompt.load(d);
         errdefer m.prompt.unload();
         m.kda = try kda.Kernels.load(m.mods[0]);
+        m.kda_chunk = try kda_block.Chunk.load(m.mods[0]);
         m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)), block32);
         errdefer m.experts.unload();
         m.copy_rows = try m.mods[1].function("tf_glm_copy_rows");
@@ -222,6 +224,7 @@ pub const Forward = struct {
                 var s = b.kda;
                 s.p = if (b.prefill) b.kproj else st.proj + li * st.proj_layer * 2;
                 s.saves.state_out = st.recAt(1 - cur, li);
+                if (b.prefill) s.chunk = f.m.kda_chunk; // a prompt chunk keeps no replay rows
                 if (!b.prefill) { // a window's saved rows stay with the layer until its commit
                     const kv = li * window_rows * st.heads * kda.dk;
                     s.saves.k = st.save_k + kv * 4;
