@@ -59,6 +59,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 const conv = st.conv + li * 3 * st.conv_c * 2;
                 if (b.prefill) { // a whole prompt: its rows in place, the layer committed now (as Forward.mixer)
                     v.p = b.kproj + g.row0 * w * 2;
+                    v.chunk = f.m.kda_chunk;
                     try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false);
                     try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, 3 * n);
                     st.cur[li] = 1 - cur;

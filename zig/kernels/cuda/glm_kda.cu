@@ -1,5 +1,6 @@
 // GLM keeps its existing image, entry points, bounds and compiler flags.
 #include "common/kda.cuh"
+#include "glm_kda_chunk.cuh"
 
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_chain(
         int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A,
@@ -43,6 +44,23 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step(
         const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
         int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
     step_kernel_body<8, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+}
+
+// A prompt chunk's prep + step in chunks of 32 rows (glm_kda_chunk.cuh): one-term tf32 products, or three (chunk3).
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_chunk(
+        int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A,
+        int a_stride, const __nv_bfloat16* __restrict__ cs, const float* __restrict__ cw,
+        const float* __restrict__ state_in, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+        float lower, int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    chunk_kernel_body<false>(H, P, p_stride, b_off, A, a_stride, cs, cw, state_in, a_log, dt_bias, lower, rows, y_out, state_out);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_chunk3(
+        int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A,
+        int a_stride, const __nv_bfloat16* __restrict__ cs, const float* __restrict__ cw,
+        const float* __restrict__ state_in, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+        float lower, int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    chunk_kernel_body<true>(H, P, p_stride, b_off, A, a_stride, cs, cw, state_in, a_log, dt_bias, lower, rows, y_out, state_out);
 }
 
 extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
