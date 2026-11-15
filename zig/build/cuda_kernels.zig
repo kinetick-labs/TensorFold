@@ -153,6 +153,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+    .{ .name = "glm_pfdense", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // GLM prompt chunks' dense EXL3 projections on pfdense.cuh
     .{ .name = "exl3_candidate", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // #806's EXL3 tiles: Dense's candidate
     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
     .{ .name = "glm_mm", .flags = &.{"-O3"} }, // ours: GLM's bf16 linears on tensor cores, weights tiled at load, row-stable
