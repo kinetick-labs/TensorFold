@@ -357,3 +357,4 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
         }
     }
 }
+#include "exl3_prompt_x8.cuh"
