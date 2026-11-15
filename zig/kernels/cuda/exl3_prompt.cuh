@@ -4,12 +4,14 @@
 #include "common/qmm_frag.cuh"
 namespace tf_exl3_prompt {
 using namespace tf_exl3;
+// K2: half-bits a value (8: 4 bits); a tile's 4 * K2 words sit at the start of its 32-word stage slot.
+template <int K2 = 8, int CB = CB_MCG>
 __device__ __forceinline__ void decode_tile_p(const uint32_t* tile, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
-    uint32_t w[lane_words<8>()];
+    uint32_t w[lane_words<K2>()];
     int word, offset;
-    lane_start<8>(lane, word, offset);
-    for (int i = 0; i < lane_words<8>(); ++i) w[i] = tile[(word + i) % tile_words<8>()];
-    decode_lane<8, CB_MCG>(w, lane, b0, b1);
+    lane_start<K2>(lane, word, offset);
+    for (int i = 0; i < lane_words<K2>(); ++i) w[i] = tile[(word + i) % tile_words<K2>()];
+    decode_lane<K2, CB>(w, lane, b0, b1);
 }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
     tf_common::cp16z(dst, src, valid);
@@ -40,7 +42,8 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
 }
 
 // Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
-template <int MATS, int XR>
+// K2 <= 8 (a stage slot holds 32 words a tile) and CB: the expert's width and codebook (REXL3 packs: mul1, 2-4 bits).
+template <int MATS, int XR, int K2 = 8, int CB = CB_MCG>
 __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
         const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
         half* stage, float (&acc)[TMT][TNB][4]) {
@@ -69,11 +72,12 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
             cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
         }
         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
-        for (int idx = threadIdx.x; idx < 16 * TKT * 8; idx += TT) {   // 16-byte pieces of the 128-byte tile words
-            const int q = idx / (TKT * 8), kk = (idx / 8) % TKT, part = idx % 8;
+        static_assert(K2 >= 2 && K2 <= 8, "a stage slot holds 32 words a tile");
+        for (int idx = threadIdx.x; idx < 16 * TKT * K2; idx += TT) {   // 16-byte pieces of the 16 * K2-byte tiles
+            const int q = idx / (TKT * K2), kk = (idx / K2) % TKT, part = idx % K2;
             int wm, nt;
             ttile<MATS>(q, cb, wm, nt);
-            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * 32 + part * 4;
+            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * tile_words<K2>() + part * 4;
             cp_async16(wdst + ((size_t)q * TKT + kk) * 32 + part * 4, src, true);
         }
     };
@@ -96,7 +100,7 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
 #pragma unroll
             for (int i = 0; i < TMT; ++i) {
                 uint32_t b0[2], b1[2];
-                decode_tile_p(ws + ((size_t)(warp * TMT + i) * TKT + kk) * 32, lane, b0, b1);
+                decode_tile_p<K2, CB>(ws + ((size_t)(warp * TMT + i) * TKT + kk) * 32, lane, b0, b1);
                 a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
             }
 #pragma unroll
@@ -135,7 +139,7 @@ __device__ __forceinline__ void tspill(float* E, int ES, int col0, const float (
         }
 }
 
-template <int XR>
+template <int XR, int K2 = 8, int CB = CB_MCG>
 __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
         const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
@@ -147,7 +151,7 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
-    tmain<2, XR>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+    tmain<2, XR, K2, CB>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
     ttile<2>(warp * TMT, cb, mat, nt);
