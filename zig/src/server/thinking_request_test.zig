@@ -250,7 +250,9 @@ test "thinking request: internal lesson askIn keeps main behavior without an off
     try checkSource(plain, true, true, "", 200, &.{0}, .ask_in);
 }
 
-fn checkpoint(source: []const u8, config: []const u8, kind: []const u8, expected: []const u8) !void {
+/// expected: the template's render with thinking off and no effort; expected_off: the served off prompt, with the
+/// template's off default effort (prompt.offEffort) when it has one.
+fn checkpoint(source: []const u8, config: []const u8, kind: []const u8, expected: []const u8, expected_off: []const u8) !void {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -268,8 +270,10 @@ fn checkpoint(source: []const u8, config: []const u8, kind: []const u8, expected
     const raw_ids = try raw.encode(text, a, &problem);
     try t.expectEqualStrings(expected, try text.decode(a, raw_ids));
     try t.expectEqual(@as(u32, 300), raw_ids[raw_ids.len - 1]);
-    const closed_ids = try std.mem.concat(a, u32, &.{ raw_ids, &.{301} });
-    try t.expectEqualStrings(try std.mem.concat(a, u8, &.{ expected, "</think>" }), try text.decode(a, closed_ids));
+    const off_raw = try text.render(a, messages, .{ .enable_thinking = false, .reasoning_effort = @import("prompt.zig").offEffort(source) }, &problem);
+    try t.expectEqualStrings(expected_off, off_raw.text);
+    const closed_ids = try std.mem.concat(a, u32, &.{ try off_raw.encode(text, a, &problem), &.{301} });
+    try t.expectEqualStrings(try std.mem.concat(a, u8, &.{ expected_off, "</think>" }), try text.decode(a, closed_ids));
     for ([_]bool{ false, true }) |default| {
         var script: Script = .{};
         const srv = try Server.init(t.allocator, t.io, script.engine(), text, .{
@@ -319,15 +323,16 @@ fn checkpointReply(srv: *Server, a: Allocator, script: *Script, extra: []const u
     try std.testing.expectEqual(@as(?i64, 2), tokens[0].int64());
 }
 
-test "thinking request: checkpoint GLM 5.3 off closes its generation prefix and preserves main ids" {
-    try checkpoint(@embedFile("fixtures/thinking/glm53.jinja"), @embedFile("fixtures/thinking/glm53-tokenizer_config.json"), "glm5_next", "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>H<|assistant|><think>");
+test "thinking request: checkpoint GLM 5.3 off closes its generation prefix at its Low off default" {
+    try checkpoint(@embedFile("fixtures/thinking/glm53.jinja"), @embedFile("fixtures/thinking/glm53-tokenizer_config.json"), "glm5_next", "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>H<|assistant|><think>", "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>H<|assistant|><think>");
 }
 
 test "thinking request: checkpoint LFM2 off closes its generation prefix and preserves main ids" {
-    try checkpoint(@embedFile("fixtures/thinking/lfm2.jinja"), @embedFile("fixtures/thinking/lfm2-tokenizer_config.json"), "lfm2_moe", "<|startoftext|><|im_start|>user\nH<|im_end|>\n<|im_start|>assistant\n<think>");
+    try checkpoint(@embedFile("fixtures/thinking/lfm2.jinja"), @embedFile("fixtures/thinking/lfm2-tokenizer_config.json"), "lfm2_moe", "<|startoftext|><|im_start|>user\nH<|im_end|>\n<|im_start|>assistant\n<think>", "<|startoftext|><|im_start|>user\nH<|im_end|>\n<|im_start|>assistant\n<think>");
 }
 
-/// GLM 5.3's template with thinking off, served: the prompt carries `word` from `effort`, which the reply reports.
+/// GLM 5.3's template with thinking off, served: the prompt carries `word` from `effort` (none named: the Low off
+/// default, prompt.offEffort), which the reply reports.
 fn effortOff(server_effort: ?[]const u8, extra: []const u8, effort: ?[]const u8, word: []const u8) !void {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -341,7 +346,8 @@ fn effortOff(server_effort: ?[]const u8, extra: []const u8, effort: ?[]const u8,
     defer hf.deinit();
     const text = hf.text();
     const messages = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"H\"}]")).ok;
-    const raw = try text.render(a, messages, .{ .enable_thinking = false, .reasoning_effort = effort }, &problem);
+    const heard = effort orelse "low";
+    const raw = try text.render(a, messages, .{ .enable_thinking = false, .reasoning_effort = heard }, &problem);
     try t.expect(std.mem.indexOf(u8, raw.text, word) != null);
     const ids = try std.mem.concat(a, u32, &.{ try raw.encode(text, a, &problem), &.{301} });
     var script: Script = .{};
@@ -354,20 +360,19 @@ fn effortOff(server_effort: ?[]const u8, extra: []const u8, effort: ?[]const u8,
     defer srv.deinit();
     const whole = try post(srv, a, &script, extra);
     try t.expectEqualSlices(u32, ids, script.prompt[0..script.count]);
-    try t.expectEqualStrings(effort orelse "none", whole.get("tensorfold").?.strField("reasoning_effort").?);
+    try t.expectEqualStrings(heard, whole.get("tensorfold").?.strField("reasoning_effort").?);
 }
 
-test "thinking request: GLM 5.3 off renders a named effort, and main's Max when none is named" {
+test "thinking request: GLM 5.3 off renders a named effort, and Low (not the template's Max) when none is named" {
     try effortOff(null, off ++ ",\"reasoning_effort\":\"high\"", "high", "Reasoning Effort: High");
     try effortOff(null, ",\"thinking\":false,\"reasoning_effort\":\"low\"", "low", "Reasoning Effort: Low");
-    try effortOff(null, off, null, "Reasoning Effort: Max");
-    try effortOff(null, ",\"reasoning_effort\":\"none\"", null, "Reasoning Effort: Max");
+    try effortOff(null, off, null, "Reasoning Effort: Low");
+    try effortOff(null, ",\"reasoning_effort\":\"none\"", null, "Reasoning Effort: Low");
 }
 
-test "thinking request: --reasoning-effort never reaches a thinking-off prompt, which keeps main's bytes" {
-    // effortOff's expected prompt is the template's render with no effort and thinking off: main's ids
-    try effortOff("high", off, null, "Reasoning Effort: Max");
-    try effortOff("high", ",\"thinking\":false", null, "Reasoning Effort: Max");
+test "thinking request: --reasoning-effort never reaches a thinking-off prompt, which takes the template's off default" {
+    try effortOff("high", off, null, "Reasoning Effort: Low");
+    try effortOff("high", ",\"thinking\":false", null, "Reasoning Effort: Low");
     try effortOff("high", off ++ ",\"reasoning_effort\":\"low\"", "low", "Reasoning Effort: Low"); // the request's own
 }
 

@@ -33,6 +33,21 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
     return renderRequest(srv, cx, messages, tools, thinking, effort, generation, false);
 }
 
+/// The effort a template hears with thinking off when the request names none. GLM-5.3's template maps any effort but
+/// "low" and "high" to "Reasoning Effort: Max", and Max ahead of a closed `<think></think>` derails its replies
+/// (malformed JSON, "capital": "Germany"); "low" keeps the closed block an answer. Null for every other template.
+pub fn offEffort(source: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, source, "effective_reasoning_effort") != null and std.mem.indexOf(u8, source, "Reasoning Effort: ") != null) return "low";
+    return null;
+}
+
+test "thinking off asks GLM-5.3's template for Low effort, and leaves other templates without one" {
+    const glm = "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}";
+    try std.testing.expectEqualStrings("low", offEffort(glm).?);
+    try std.testing.expect(offEffort("{% if enable_thinking %}<think>{% endif %}") == null);
+    try std.testing.expect(offEffort("Reasoning: {{ reasoning_effort }}") == null);
+}
+
 pub fn renderRequest(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, require_off: bool) errors.Refused![]const u32 {
     const messages_in = if (srv.text.vtable.format == .kimi) messages else try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.media());
     const normalized = if (srv.text.vtable.format == .kimi or srv.text.native_deepseek) messages_in else try messages_mod.toolArguments(cx, messages_in);
@@ -41,7 +56,7 @@ pub fn renderRequest(srv: *Server, cx: *Cx, messages: Value, tools: []const Valu
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
         .add_generation_prompt = generation,
         .enable_thinking = thinking,
-        .reasoning_effort = if (thinking) effort else cx.named_effort, // off: only an effort the request named
+        .reasoning_effort = if (thinking) effort else cx.named_effort orelse offEffort(srv.text.templateSource()), // off: an effort the request named, else the template's off default
         .clear_thinking = cx.clear_thinking,
         .tool_choice = cx.template_fields.get("tool_choice"),
         .response_format = cx.template_fields.get("response_format"),

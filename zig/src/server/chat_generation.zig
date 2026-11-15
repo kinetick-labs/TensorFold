@@ -406,7 +406,7 @@ pub const Generation = struct {
         const runtime = try json.newObject(a);
         try runtime.put(a, "enable_thinking", .{ .bool = thinking });
         // the effort the template heard: with thinking off, only one the request named
-        try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = cx.named_effort orelse "none" } else if (effort) |e| .{ .string = e } else .null);
+        try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = cx.named_effort orelse @import("prompt.zig").offEffort(g.srv.text.templateSource()) orelse "none" } else if (effort) |e| .{ .string = e } else .null);
         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
         try runtime.put(a, "tokens_per_second", .{ .float = if (decode_s > 0) @as(f64, @floatFromInt(decode_tokens)) / decode_s else 0 });
         try runtime.put(a, "seconds", .{ .float = @max(0, decode_s) }); // the reply's decode seconds, as tokens_per_second divides them
