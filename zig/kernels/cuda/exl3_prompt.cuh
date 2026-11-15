@@ -55,6 +55,7 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
     const uint32_t* T0 = reinterpret_cast<const uint32_t*>(tp0[e]);
     const uint32_t* T1 = reinterpret_cast<const uint32_t*>(tp1[e]);
     const int nblocks = (cnt + 15) >> 4;   // 16-member blocks in use
+    const int nhalves = (cnt + 7) >> 3;    // and 8-member halves: a last block's empty half gets no mma
 #pragma unroll
     for (int i = 0; i < TMT; ++i)
 #pragma unroll
@@ -111,9 +112,10 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
                     ldmatrix4(r, xs + (size_t)row * TXS + kk * 16 + ((lane >> 3) & 1) * 8);
                     const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
 #pragma unroll
-                    for (int i = 0; i < TMT; ++i) {
-                        mma16816(acc[i][2 * jb], a[i], bl);
-                        mma16816(acc[i][2 * jb + 1], a[i], bh);
+                    for (int i = 0; i < TMT; ++i) mma16816(acc[i][2 * jb], a[i], bl);
+                    if (2 * jb + 1 < nhalves) {
+#pragma unroll
+                        for (int i = 0; i < TMT; ++i) mma16816(acc[i][2 * jb + 1], a[i], bh);
                     }
                 }
             }
