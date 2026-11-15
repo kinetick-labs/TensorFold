@@ -285,23 +285,33 @@ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
-        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int skip) {
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int skip, const int* __restrict__ k2s, int cbk) {
 
     const int item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item];
     if (e == skip) return;
 
-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];   // one buffer for either instantiation
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];   // one buffer for every instantiation
     __shared__ int rows_sh[TPM];
-    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
-    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh);
+    // k2s null: mcg 4 bits (Mia-AiLab's packs); else this expert's gate (= up) half-bits on mul1 (REXL3: 4, 6 or 8)
+    const int k2 = k2s ? k2s[e] : 8;
+#define TF_PGU(K2_, CB_) do { \
+        if (xdiv > 1) tgateup<TPM, K2_, CB_>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh); \
+        else tgateup<2 * TPM, K2_, CB_>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh); \
+    } while (0)
+    if (!k2s || cbk != CB_MUL1) TF_PGU(8, CB_MCG);
+    else if (k2 == 4) TF_PGU(4, CB_MUL1);
+    else if (k2 == 6) TF_PGU(6, CB_MUL1);
+    else if (k2 == 8) TF_PGU(8, CB_MUL1);
+    else __trap();
+#undef TF_PGU
 }
 
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int skip) {
+        float* __restrict__ y, int K, int D, int skip, const int* __restrict__ k2s, int cbk) {
 
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
     __shared__ int rows_sh[TPM];
@@ -314,7 +324,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
-    tmain<1, TPM>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    const int k2 = k2s ? k2s[e] : 8;   // as tf_exl3_prompt_gu: null is mcg 4 bits, else the expert's down half-bits on mul1
+    if (!k2s || cbk != CB_MUL1) tmain<1, TPM>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    else if (k2 == 4) tmain<1, TPM, 4, CB_MUL1>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    else if (k2 == 6) tmain<1, TPM, 6, CB_MUL1>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    else if (k2 == 8) tmain<1, TPM, 8, CB_MUL1>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    else __trap();
     float* Ed = reinterpret_cast<float*>(smem_raw);
     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
         if (hf) __syncthreads();

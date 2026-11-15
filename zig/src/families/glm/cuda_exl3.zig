@@ -70,6 +70,7 @@ pub const Experts = struct {
     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
     codebook: cuda.exl3.Codebook = .mcg,
     uniform: u32 = 8, // the half-bit width every projection shares, 0 when they mix
+    prompt_k2: bool = false, // mul1, gate = up per expert, every width 4, 6 or 8: the prompt kernels take the mix
 };
 
 /// Bytes of one 16 x 16 tile at `halves` half-bits a value: 256 values, 16 * bits int16 words.
@@ -96,6 +97,9 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     };
     const k2s = try L.gpa.alloc(i32, count);
     defer L.gpa.free(k2s);
+    const gk2 = try L.gpa.alloc(i32, count); // gate's widths, to check up's against
+    defer L.gpa.free(gk2);
+    var prompt_widths = true;
     var first_suh: ?[]const u8 = null;
     inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }, .{ "k2", "k2u", "k2d" }) |m, proj, tw, su, sv, kw| {
         const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
@@ -129,6 +133,11 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
                 uniform = false;
             }) else first_halves = halves;
             k2s[e] = @intCast(halves);
+            if (halves != 4 and halves != 6 and halves != 8) prompt_widths = false;
+            if (comptime std.mem.eql(u8, proj, "gate_proj")) gk2[e] = @intCast(halves);
+            if (comptime std.mem.eql(u8, proj, "up_proj")) (if (gk2[e] != halves) {
+                prompt_widths = false;
+            });
             const tb = tileBytes(halves);
             offsets[e] = at;
             if (m.by_cols) { // every tile row, the rank's tile columns
@@ -166,6 +175,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     }
     out.codebook = book orelse return error.NotExl3Mcg4;
     out.uniform = if (uniform) @intCast(first_halves.?) else 0;
+    out.prompt_k2 = out.codebook == .mul1 and prompt_widths;
     return out;
 }
 
@@ -181,7 +191,7 @@ pub const prompt_rows = 4096;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
     const up = if (w.k2u != 0) w.k2u else w.k2;
     const down = if (w.k2d != 0) w.k2d else w.k2;
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = up, .down_k2 = down, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.codebook, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .shared_input = w.shx };
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = up, .down_k2 = down, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = w.codebook, .limit = limit, .act_mode = 0, .uniform_k2 = w.uniform, .prompt_k2 = w.prompt_k2, .shared_input = w.shx };
 }
 fn shape(dims: usize, width: usize) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
@@ -195,8 +205,8 @@ fn picksBytes(rows: usize) usize {
 pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
     return scratchFor(rows, dims, width, prefill, shx, true);
 }
-/// scratchBytes for a pack whose experts' widths are `uniform` (Mia-AiLab's 4 bits) or mix (a SAGE pack: its prompt
-/// chunks take the compacted path, the prompt kernels reading one width only).
+/// scratchBytes for a pack whose prompt chunks take the prompt kernels (`uniform`: Mia-AiLab's 4 bits, or a REXL3 pack
+/// whose every layer's mix they read) or the compacted path (any other mix).
 pub fn scratchFor(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, uniform: bool) [4]usize {
     var l = shape(dims, width);
     l.shared_input = shx;

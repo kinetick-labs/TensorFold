@@ -34,6 +34,7 @@ pub const Layer = struct {
     width: usize, // I (expert width)
     codebook: Codebook,
     uniform_k2: u32 = 0, // nonzero only when the loader verified this half-bit width for every projection
+    prompt_k2: bool = false, // mul1, the loader verified gate = up per expert and every width 4, 6 or 8: the prompt kernels read gate_k2/down_k2
     shared_input: bool = false, // the loader verified identical gate/up input scales across every expert
     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
     limit: f32 = 0, // the SwiGLU clamp (0: none)

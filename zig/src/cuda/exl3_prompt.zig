@@ -10,7 +10,16 @@ const Stream = @import("stream.zig").Stream;
 pub const tile = 64;
 pub const Scratch = struct { xg: u64, xu: u64, xd: u64, rows: usize, slots: usize };
 pub fn eligible(l: ex.Layer) bool {
-    return l.codebook == .mcg and l.uniform_k2 == 8 and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
+    return widths(l) and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
+}
+/// mcg 4 bits everywhere (Mia-AiLab's packs), or a REXL3 pack's per-expert mul1 widths (prompt_k2: gate = up, 4/6/8 half-bits).
+fn widths(l: ex.Layer) bool {
+    return (l.codebook == .mcg and l.uniform_k2 == 8) or (l.codebook == .mul1 and l.prompt_k2);
+}
+/// The prompt kernels' trailing width arguments: null and 0 for mcg 4 bits (their compiled default), else the per-expert tables.
+fn k2args(l: ex.Layer, gate: bool) struct { u64, i32 } {
+    if (l.codebook == .mcg and l.uniform_k2 == 8) return .{ 0, 0 };
+    return .{ if (gate) l.gate_k2 else l.down_k2, 2 };
 }
 fn mul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.Exl3Shape;
@@ -72,7 +81,9 @@ pub const Kernels = struct {
             try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
         }
         const items = grouped.maxItems(pairs, count, tile);
-        try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, skip_id });
-        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id });
+        const gk = k2args(l, true);
+        const dk = k2args(l, false);
+        try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, skip_id, gk[0], gk[1] });
+        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), skip_id, dk[0], dk[1] });
     }
 };
