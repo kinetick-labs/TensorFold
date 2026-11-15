@@ -71,7 +71,7 @@ fn run(rows: usize, prompt: bool, shared: bool, count: usize) !void {
     const w = glm.exl3.Experts{ .gt = 101, .ut = 102, .dt = 103, .k2 = 104, .suh_g = 105, .suh_u = 106, .svh_g = 107, .svh_u = 108, .suh_d = 109, .svh_d = 110, .shx = shared };
     const sc = glm.exl3.Scratch{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
     const plan = cuda.grouped.Plan{ .members = 201, .items = 202, .counts = 203, .rank = 204, .hist = 205 };
-    try glm.exl3.run(&k, &ek, .{ .d = &d, .handle = null }, w, sc, plan, 0x200000000, 512, 0x300000000, 9, rows, count, 512, 256, 7, prompt, 0x400000000, 0);
+    try glm.exl3.run(&k, &ek, .{ .d = &d, .handle = null }, w, sc, plan, 0x200000000, 512, 0x300000000, 9, rows, count, 512, 256, 7, prompt, 0x400000000, 0, false);
 }
 
 test "GLM EXL3 prompt: a whole pass makes one expert call and no 2D copies" {
