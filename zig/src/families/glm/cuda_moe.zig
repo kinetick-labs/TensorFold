@@ -62,11 +62,20 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
     defer if (k.prof) |p| p.mark(stream, .routed);
-    if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact);
+    if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact, bf16Slots(l, prompt));
     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt, .fact = !prompt and k.experts.fact and l.routed.format == .nvfp4 };
     try experts.route(k.experts, stream, s.pick, rows * slots, plan);
     try experts.run(k.experts, stream, .gate_up, l.routed, plan, x, x_stride, rows, s.eact, shared_id);
     try experts.run(k.experts, stream, if (prompt) .down else .down_f32, l.routed, plan, s.eact, l.routed.width, rows, s.ey, shared_id);
+}
+
+/// The slot rows' format: bf16 in an NVFP4 prompt chunk, and in an EXL3 one on the prompt kernels (TF_GLM_X3_B16=0:
+/// fp32 there, as before); fp32 otherwise.
+fn bf16Slots(l: Layer, prompt: bool) bool {
+    if (!prompt) return false;
+    const w = l.exl3 orelse return true;
+    if (std.c.getenv("TF_GLM_X3_B16")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
+    return exl3.promptPath(w, l.count, l.routed.dims, l.routed.width, l.routed.limit);
 }
 
 /// moe_block's fill of rows lo..hi: shared expert into the last slot, slot sum into out fp32 (any range, same bits).
@@ -76,7 +85,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const n = hi - lo;
-    const bf16_slots = prompt and l.exl3 == null; // the slot rows: bf16 in an NVFP4 prompt chunk, else fp32
+    const bf16_slots = bf16Slots(l, prompt); // the slot rows: bf16 in a prompt chunk on the prompt kernels, else fp32
     const eb: usize = if (bf16_slots) 2 else 4;
     try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
