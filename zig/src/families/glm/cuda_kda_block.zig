@@ -172,6 +172,8 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
             if (!one) try columns(set, stream, s.tmp, w - fa, s.p + fa * 2, w, rows);
         },
     }
+    // TF_GLM_KDA_FG_PAIR: a decode window's f_b and g_b in one launch (bit-identical); else two
+    if (try b16.pair(selected, stream, s.p + fa * 2, w, kda.dk, l.fb, l.gb, s.ka, s.kg, rows, n, kda.dk)) return;
     try b16.matmul(selected, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
     try b16.matmul(selected, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
 }
