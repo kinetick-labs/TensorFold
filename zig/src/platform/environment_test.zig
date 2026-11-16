@@ -109,6 +109,8 @@ const valid = [_]Case{
     .{ .name = "TF_DSV41_ENGRAM_DIR", .raw = "engram-rows", .n = 0 },
     .{ .name = "TF_DSV41_ENGRAM_VERIFY", .raw = "full", .n = 1 },
     .{ .name = "TF_DSV41_ENGRAM_CACHE", .raw = "0", .n = 0 },
+    .{ .name = "TF_KV_SHARE_MIN_PROMPT", .raw = "4096", .n = 4096 },
+    .{ .name = "TF_THINK_CLOSE_ONCE", .raw = "0", .n = 0 },
 };
 
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
