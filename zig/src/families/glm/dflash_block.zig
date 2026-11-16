@@ -146,7 +146,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
         }
         if (dr.split) { // each rank's share of down's K as fp32 partials, gathered and summed in rank order
             const bytes = M * D * 4;
-            try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
+            try lin(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
             try gather(e, dr.sums, bytes);
             var a: cuda.Args = .{};
             a.add(dr.sums);
@@ -154,7 +154,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
             a.add(@as(i32, @intCast(M)));
             a.add(@as(i32, @intCast(dr.world)));
             try go(dr.k.sumn, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
-        } else try linB(dr, e, dr.act, l.down, dr.a, M, false);
+        } else try lin(dr, e, dr.act, l.down, dr.a, M, false);
         try conv(dr, e, dr.a, 1, l.m_base + 2 * D * 2, dr.x, true, M);
     }
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
