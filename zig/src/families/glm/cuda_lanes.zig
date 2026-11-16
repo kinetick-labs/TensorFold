@@ -27,6 +27,7 @@ const Lane = struct {
     first: ?u64 = null,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
     marks: []const u32 = &.{}, // TF_KV_SHARE: where the shared prompt store keeps this stream's pass (owned)
+    landed: f64 = -1, // TF_GLM_DRAFT_ADAPT: the drafts its recent verifies kept, averaged (-1: none yet)
 };
 pub const Lanes = struct {
     x: follow.Leader,
@@ -540,10 +541,15 @@ pub const Lanes = struct {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;
         var held: [dflash.MAX_S]*Lane = undefined;
+        const adapt = try dflash.adapt();
         for (requests, 0..) |r, i| {
+            const verified: ?usize = if (self.lanes.getPtr(r.stream)) |pre| pre.pending_rows else null;
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
             if (r.lanes != null) return error.TreesNotBuilt;
+            if (adapt) if (verified) |v| if (r.rows) |rows| if (v > 1) {
+                l.landed = dflash.landed(l.landed, v - 1, rows.len - 1);
+            };
             var n: usize = 0;
             const anchor = if (r.rows) |rows| a: {
                 for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
@@ -557,6 +563,7 @@ pub const Lanes = struct {
         const cut = try dflash.confidence();
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);
+            if (adapt) l.held_n = @min(l.held_n, dflash.adaptDepth(l.landed, max_held));
             var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
             for (l.chances[0..l.held_n], 0..) |*c, j| {
                 chain *= c.*;
