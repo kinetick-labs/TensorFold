@@ -83,7 +83,7 @@ pub const Kernels = struct {
 pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
 
 /// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
-pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
+pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: Lin, a_proj: Lin, m_proj: Lin };
 
 /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
 pub const Slot = struct {
