@@ -136,7 +136,12 @@ pub const Experts = struct {
         e.group = try e.mod.function("tf_exl3_group");
         try e.group.allowDynamicShared(64 * 1024);
         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
-        e.grouped = .{
+        const staged = if (std.c.getenv("TF_EXL3_GROUPED_STAGED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        e.grouped = if (staged) .{ // each k step's tiles staged by cp.async: the same bits, ~10% faster decode experts
+            try e.mod.function("tf_exl3_grouped_staged_0"),
+            try e.mod.function("tf_exl3_grouped_staged_1"),
+            try e.mod.function("tf_exl3_grouped_staged_2"),
+        } else .{
             try e.mod.function("tf_exl3_grouped_0"),
             try e.mod.function("tf_exl3_grouped_1"),
             try e.mod.function("tf_exl3_grouped_2"),
