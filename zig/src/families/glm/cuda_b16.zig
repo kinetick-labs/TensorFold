@@ -54,6 +54,15 @@ pub fn partBytes(m: usize, n: usize, k: usize) usize {
 }
 
 /// qmm.matmul for a B16 weight: out [m][n] bf16 (fp32 with `wide`) = x . w; 128+ rows sum in registers, else `part`.
+/// TF_GLM_KDA_FG_PAIR: two tiled bf16 linears of one shape, the second's input `x2` columns on, in one launch
+/// (mm.matmulPair); false when it does not apply, and the caller runs two matmul calls.
+pub fn pair(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, x2: usize, w: u64, w2: u64, out: u64, out2: u64, m: usize, n: usize, k: usize) !bool {
+    const mk = set.mm orelse return false;
+    const t: mm.Tiled = if (set.packs) |p| p.tiled(w, n, k) else .{ .w = w, .n = n, .k = k };
+    const t2: mm.Tiled = if (set.packs) |p| p.tiled(w2, n, k) else .{ .w = w2, .n = n, .k = k };
+    return mm.matmulPair(mk, stream, x, x_stride, x2, t, t2, out, out2, m, false, set.prompt);
+}
+
 pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     if (k % bk != 0) return error.KNotMultipleOf64;
     if (set.mm) |mk| { // tiled weights, packed or bf16

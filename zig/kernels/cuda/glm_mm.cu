@@ -85,7 +85,7 @@ struct Tile {
 };
 
 // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
-template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
+template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false, bool ZPAIR = false>
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
         int f32, int M, int N, int K, int SK) {
@@ -95,7 +95,7 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
     const int wm = warp / T::WN, wn = warp % T::WN;
     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
     const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * T::BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
-    const int slice = blockIdx.z, g0 = slice * per;
+    const int slice = ZPAIR ? 0 : blockIdx.z, g0 = slice * per; // ZPAIR: blockIdx.z picks the problem, one slice
     const int t0 = n0 >> 3;                                   // the block's first column tile
     auto stage = [&](int st) { return buf + st * T::STAGE; };
     auto loadX = [&](int st, int g) {
@@ -247,6 +247,18 @@ extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* _
 extern "C" __global__ void __launch_bounds__(256) glm_mm16_rows(const __nv_bfloat16* __restrict__ x, long long ldx,
     const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
     int f32, int M, int N, int K, int SK) { mm_kernel<16, 128, 2, 3, true>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
+// TF_GLM_KDA_FG_PAIR: two bf16 linears of one shape in one launch (KDA decode's f_b and g_b), blockIdx.z the
+// problem; each block's arithmetic is glm_mm16_16/_32's own, so the outputs are bit-identical to two launches.
+#define GLM_MM_PAIR(BM)                                                                                                \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm16_##BM##_pair(const __nv_bfloat16* __restrict__ x,       \
+        long long ldx, long long x2, const uint32_t* __restrict__ w, const uint32_t* __restrict__ w2,                   \
+        void* __restrict__ out, void* __restrict__ out2, int f32, int M, int N, int K) {                                \
+        const bool second = blockIdx.z != 0;                                                                           \
+        mm_kernel<16, BM, 1, 3, false, true>(second ? x + x2 : x, ldx, second ? w2 : w, nullptr, second ? out2 : out,  \
+            nullptr, f32, M, N, K, 1);                                                                                 \
+    }
+GLM_MM_PAIR(16)
+GLM_MM_PAIR(32)
 GLM_MM_ALL(4)
 GLM_MM_ALL(6)
 GLM_MM_ALL(8)
