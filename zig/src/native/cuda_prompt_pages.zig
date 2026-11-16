@@ -45,6 +45,9 @@ pub const Adapter = struct {
         }
         rules.min_gap = 256;
         rules.tail = true;
+        // TF_KV_SHARE_MIN_PROMPT: prompts shorter than this keep no state, so short requests (vision checks)
+        // never evict a long conversation's few snapshot slots; 0 (default) keeps every prompt as before.
+        rules.min_prompt = @import("sys").environment.read(u32, "TF_KV_SHARE_MIN_PROMPT", 0) catch 0;
         const copies: radix.Snapshots = .{ .ptr = target, .vtable = &snaps.Snaps(F, null).vtable };
         x.* = .{ .gpa = gpa, .pool = pool, .store = try radix.Store.init(gpa, copies, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules), .detach = Detach(F).call, .target = target };
         errdefer x.store.deinit();

@@ -34,6 +34,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_PROMPT_INTERMEDIATE` | Exactly `0` or `1`, checked when the CUDA backend starts; default off. `1` keeps Flash Next's ladder of intermediate prompt-cache checkpoints under a long prompt's history |
 | `TENSORFOLD_LFM2_KV_PAGES` | Exactly `0` or `1`, checked when the CUDA backend starts; unset leases pool pages ([profiles](profiles.md)) |
 | `TENSORFOLD_UNIFIED_HOST_COUNTS` | Exactly `0` or `1`, checked when the CUDA backend starts. An integrated GPU on Linux admits against `/proc/meminfo` with `1` and against the CUDA pool with `0`; unset, it reads the pool under WSL2 (`WSL_DISTRO_NAME` set) and `/proc/meminfo` otherwise ([Windows](WINDOWS.md)) |
+| `TF_KV_SHARE_MIN_PROMPT` | A whole token count, checked when the CUDA backend starts; default `0`. Under `TF_KV_SHARE`, a prompt shorter than this keeps no prompt-cache state, so short requests (vision checks, one-shot questions) never evict a long conversation's few kept states |
 | `TF_THINK_CLOSE_ONCE` | Exactly `0` or `1`; default `1`. After a think block closed (for instance by `--thinking-budget`), a close tag the answer spells again is dropped from the content instead of reaching the client; `0` keeps it |
 | `TF_HEAD_GEOMETRY` | Whole native-size nonnegative geometry count in the head benchmark |
 | `TF_ROCE_GID_INDEX` | Whole index 0 through 2147483647; unset searches for a RoCE v2 IPv4 GID |
