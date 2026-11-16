@@ -160,6 +160,8 @@ const valid = [_]Case{
     .{ .name = "TF_MINIMAX_WORLD", .raw = "2", .n = 2 },
     .{ .name = "TF_HY4_ENGRAM", .raw = "gpu", .n = 2 },
     .{ .name = "TF_HY4_DRAFT_BITS", .raw = "8", .n = 8 },
+    .{ .name = "TF_KV_SHARE_MIN_PROMPT", .raw = "4096", .n = 4096 },
+    .{ .name = "TF_THINK_CLOSE_ONCE", .raw = "0", .n = 0 },
 };
 
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
