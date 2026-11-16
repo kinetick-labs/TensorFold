@@ -9,11 +9,14 @@ The pack is MIT (cite the base model). Drafts are [incoai/GLM-5.3-Flash-DFlash2]
 
 ## Config
 
+Memory: MemAvailable floor accepted ~3.4 GiB (lowest measured with these defaults: 3528 MiB, a 120k
+turn pair then 2 concurrent 247k fills); the 1 GiB host watchdog never tripped.
+
 - `TF_KV_PAGES=on`, `--parallel 2`, `--context 262144`, `TENSORFOLD_MEMORY_RESERVE_GIB=5`
 - `--vision`, `--drafter` DFlash2 (`~/models/glm53-dflash2`)
 - EXL3 prompt experts run on FP8 (build default since 9939ace88; `TF_GLM_X3_FP8=0` gives f16 back).
-- `TF_KV_SHARE=2`, `TF_GLM_KV_LIVE_HALF=1`, `TF_GLM_HOST_CACHE=1`, `--prompt-cache-gib 1`: conversation
-  reuse. A finished prompt keeps its rows as the pool's pages (up to 2 kept states); the KDA snapshot
+- `TF_KV_SHARE=4`, `TF_GLM_KV_LIVE_HALF=1`, `TF_GLM_HOST_CACHE=1`, `--prompt-cache-gib 1`: conversation
+  reuse. A finished prompt keeps its rows as the pool's pages (up to 4 kept states); the KDA snapshot
   of each kept state lives in host RAM, outside the pool, and carries only the live half of the KDA
   state (302 MiB instead of 438 MiB, no precision loss: warm outputs stay bit-identical to cold). A next turn only prefills its new tokens (from the
   last 2048-row mark).
@@ -90,9 +93,11 @@ Build 72d1c64c2 (FP8 default on, KDA f_b/g_b pair launch), same config as above.
   conversations all resumed on turn 2 (cached 26,624–28,672, TTFT 0.5–1.4 s vs 27.8–28.9 s cold,
   outputs identical to cold); a 120k turn 2 resumed 118,784 tokens in 1.20 s (turn 1 116.7 s).
 - Memory with `TF_KV_SHARE=4`: MemAvailable low 3971 MiB (4 × 28k), 3528 MiB (a 120k turn pair, then
-  2 concurrent 247k fills); the 1 GiB watchdog never tripped. The default stays at 2 kept states
-  for margin; `TF_KV_SHARE=4` is opt-in. Two concurrent ~247k conversations are still not reused
-  (the pool fits one 262k window).
+  2 concurrent 247k fills); the 1 GiB watchdog never tripped. `TF_KV_SHARE=4` is the serve.sh
+  default since window 30 (it was 2): the MemAvailable floor accepted for this config is lowered from
+  3.5 GiB to ~3.4 GiB (measured low 3528 MiB); the 1 GiB watchdog is unchanged. `TF_KV_SHARE=2` gives
+  back ~0.4 GiB of margin (window 28 low 4360 MiB). Two concurrent ~247k conversations are still not
+  reused (the pool fits one 262k window).
 
 Measured and not kept:
 
