@@ -84,6 +84,26 @@ fn trimNewlines(s: []const u8) []const u8 {
 
 pub const Split = struct { reasoning: []const u8, answer: []const u8 };
 
+/// A close the answer spells again after the block closed (a thinking budget that closed it early, the model then
+/// closing it itself): dropped with its newlines. The close is one token where it matters (GLM, Qwen), so nothing is
+/// held back while streaming: a reply without a second close streams byte for byte as before. TF_THINK_CLOSE_ONCE=0 keeps it.
+fn extraCloses(a: Allocator, answer: []const u8, m: Markers, finished: bool) Allocator.Error![]const u8 {
+    _ = finished;
+    if (m.open.len > 0 or m.close.len == 0) return answer;
+    if (find(answer, m.close) == null) return answer;
+    if (!(@import("sys").environment.read(bool, "TF_THINK_CLOSE_ONCE", true) catch true)) return answer;
+    var out: std.ArrayList(u8) = .empty;
+    var rest = answer;
+    while (find(rest, m.close)) |i| {
+        try out.appendSlice(a, rest[0..i]); // what streamed before the close stays a prefix of the answer
+        rest = trimNewlines(rest[i + m.close.len ..]);
+        if (out.items.len > 0 and rest.len > 0 and !std.mem.endsWith(u8, out.items, "\n\n"))
+            try out.appendSlice(a, if (std.mem.endsWith(u8, out.items, "\n")) "\n" else "\n\n");
+    }
+    try out.appendSlice(a, rest);
+    return out.items;
+}
+
 /// Where a reply's reasoning ends: the model's own close token, or the text's first spelling of the marker.
 pub const Close = union(enum) {
     /// The close marker is not one token in this tokenizer: the first spelling of it in the text ends the reasoning.
@@ -165,7 +185,7 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
     if (end) |at_end| {
         if (at_end + m.close.len <= text.len and std.mem.startsWith(u8, text[at_end..], m.close)) {
             const reasoning = text[0..at_end];
-            const answer = trimNewlines(text[at_end + m.close.len ..]);
+            const answer = try extraCloses(a, trimNewlines(text[at_end + m.close.len ..]), m, finished);
             if (pyStrip(answer).len == 0) if (@import("reply_tool_tail.zig").start(reasoning, o)) |call_start|
                 return .{ .reasoning = reasoning[0..call_start], .answer = if (finished) reasoning[call_start..] else "" };
             return .{ .reasoning = reasoning, .answer = answer };
@@ -579,4 +599,17 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
+}
+
+test "a close spelled again after the block closed is dropped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const x = arena.allocator();
+    const s1 = try splitThinking(x, "plan</think>\n\nmore plan</think>\n\nHi", true, think_markers);
+    try std.testing.expectEqualStrings("plan", s1.reasoning);
+    try std.testing.expectEqualStrings("more plan\n\nHi", s1.answer);
+    const s2 = try splitThinking(x, "plan</think>\n\nmore</think>\n\nHi", false, think_markers);
+    try std.testing.expectEqualStrings("more\n\nHi", s2.answer);
+    const s3 = try splitThinking(x, "plan</think>\n\nHi", true, think_markers);
+    try std.testing.expectEqualStrings("Hi", s3.answer);
 }
