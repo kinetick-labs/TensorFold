@@ -46,6 +46,8 @@ pub const Kernels = struct {
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
+    pair: [2]?cuda.Function = .{ null, null }, // glm_mm16_16_pair, _32_pair: two bf16 linears of one shape a launch
+    pair_on: bool = true, // TF_GLM_KDA_FG_PAIR (unset or 1): KDA decode's f_b and g_b in one launch
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
@@ -61,6 +63,11 @@ pub const Kernels = struct {
             k.tile_packed[wi] = try m.function(std.fmt.comptimePrint("glm_mm_tile{d}", .{b}));
         }
         try k.prompt.allowDynamicShared(smem(128));
+        inline for (.{ "glm_mm16_16_pair", "glm_mm16_32_pair" }, 0..) |name, i| {
+            k.pair[i] = m.function(name) catch null;
+            if (k.pair[i]) |f| try f.allowDynamicShared(smem(bucket(i)));
+        }
+        k.pair_on = if (std.c.getenv("TF_GLM_KDA_FG_PAIR")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         k.pdl = try @import("sys").environment.value(bool, "TF_GLM_PDL", @import("profile").lookup("TF_GLM_PDL"), true);
         return k;
     }
@@ -95,6 +102,30 @@ pub fn splitK(n: usize, k: usize) usize {
 pub fn partBytes(m: usize, w: Tiled) usize {
     const sk = splitK(w.n, w.k);
     return if (sk > 1) sk * @min(m, 64) * w.n * 4 else 0;
+}
+
+/// TF_GLM_KDA_FG_PAIR: x [m][k] by `w` -> out and (x + `x2` columns) by `w2` -> out2 in one launch, both bf16 tiles
+/// of one shape, to 32 rows, one K slice; false (nothing launched) when the pair does not apply. Each block runs
+/// matmul's own glm_mm16_16/_32 arithmetic, so the outputs are bit-identical to two matmul calls.
+pub fn matmulPair(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, x2: usize, w: Tiled, w2: Tiled, out: u64, out2: u64, m: usize, wide: bool, one: bool) !bool {
+    if (!k.pair_on or one or m == 0 or m > 32 or w.bits != 16 or w2.bits != 16 or w.n != w2.n or w.k != w2.k) return false;
+    if (w.k % 64 != 0 or w.n % 8 != 0 or x % 16 != 0 or ldx % 8 != 0 or x2 % 8 != 0 or splitK(w.n, w.k) != 1) return false;
+    const i: usize = if (m <= 16) 0 else 1;
+    const f = k.pair[i] orelse return false;
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(@as(c_longlong, @intCast(ldx)));
+    a.add(@as(c_longlong, @intCast(x2)));
+    a.add(w.w);
+    a.add(w2.w);
+    a.add(out);
+    a.add(out2);
+    a.add(@as(c_int, @intFromBool(wide)));
+    a.add(@as(c_int, @intCast(m)));
+    a.add(@as(c_int, @intCast(w.n)));
+    a.add(@as(c_int, @intCast(w.k)));
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((w.n + 63) / 64), .y = 1, .z = 2 }, .block = .{ .x = 128 }, .shared = smem(bucket(i)), .pdl = k.pdl }, s, &a);
+    return true;
 }
 
 /// x [m][k] (`ldx` apart) by `w` -> out [m][n] (`wide`: fp32); `one`: prompt blocks at any rows, sums per row alike.
