@@ -23,8 +23,54 @@ struct GroupedArgs {
     int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip;
 };
 
-// How a warp reads its k tiles: main's loop, or a tile ahead (sm_120 up); SKIP and STALE are the contract's faults.
-enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3 };
+// How a warp reads its k tiles: main's loop, or a tile ahead (sm_120 up); SKIP and STALE are the contract's faults;
+// STAGED: a k step's NT tiles (contiguous along n) copied whole by cp.async into the warp's two shared slots.
+enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, STAGED = 4 };
+
+// STAGED's walk: the same words reach the same lanes and the same mma run in the same k order (warp_tiles' bits),
+// the next k step's words in flight in shared memory instead of registers. `sb`: the warp's 2 * NT * TW words.
+template <int CB, int K2, int NT>
+__device__ __forceinline__ void warp_tiles_staged(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
+                                                  const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4],
+                                                  uint32_t* sb) {
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>(), CW = NT * TW;
+    const size_t kstride = (size_t)ntiles * TW;
+    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
+    auto issue = [&](int i) {
+        const uint32_t* src = tb + (size_t)i * kstride;
+        uint32_t* dst = sb + (i & 1) * CW;
+        for (int v = lane; v < CW / 4; v += 32) {
+            const unsigned d = (unsigned)__cvta_generic_to_shared(dst + 4 * v);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src + 4 * v));
+        }
+    };
+    if (nkt > 0) issue(0);
+    asm volatile("cp.async.commit_group;\n" ::);
+    for (int i = 0; i < nkt; ++i) {
+        __syncwarp(); // every lane has read slot (i + 1) & 1 before it is refilled
+        if (i + 1 < nkt) issue(i + 1);
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 1;\n" ::);
+        __syncwarp();
+        const uint32_t* cur = sb + (i & 1) * CW;
+        const int k = (kt0 + i) * 16;
+        const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
+                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
+                               ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u,
+                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u};
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            uint32_t w[LW];
+            load_lane_words<K2>(cur + j * TW, lane, w);
+            uint32_t b0[2], b1[2];
+            decode_lane<K2, CB>(w, lane, b0, b1);
+            mma16816(acc[j][0], a, b0);
+            mma16816(acc[j][1], a, b1);
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncwarp();
+}
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT, int LOAD>
@@ -112,10 +158,19 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
     __shared__ __align__(16) float red[W][16][NT * 16];
+    // STAGED's slots live in `red` until the reduction (2 * NT * 4 * K2 words a warp: 16 KB at 8 bits, W = 4, NT = 8)
+    static_assert(LOAD != STAGED || W * 2 * NT * 64 <= W * 16 * NT * 16, "STAGED slots exceed the reduction buffer");
+    uint32_t* const sb = reinterpret_cast<uint32_t*>(&red[0][0][0]) + warp * 2 * NT * 64;
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        warp_tiles<CB, K2_, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
+        if constexpr (LOAD == STAGED) {                                                                      \
+            if ((reinterpret_cast<uintptr_t>(T) & 15) == 0)                                                  \
+                warp_tiles_staged<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc, sb); \
+            else /* cp.async takes 16-byte aligned sources only */                                           \
+                warp_tiles<CB, K2_, NT, AHEAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+        } else                                                                                               \
+            warp_tiles<CB, K2_, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);      \
         break;
         TF_EXL3X_CASE(2)
         TF_EXL3X_CASE(3)
@@ -136,6 +191,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
         default:
             __trap();
     }
+    if constexpr (LOAD == STAGED) __syncthreads(); // every warp is done with its slots before `red` is written
 
 #pragma unroll
     for (int i = 0; i < NT; ++i)

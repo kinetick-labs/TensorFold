@@ -29,6 +29,19 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// The same programs with each k step's tiles staged by cp.async (TF_EXL3_GROUPED_STAGED, the same bits).
+extern "C" __global__ void tf_exl3_grouped_staged_0(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body<0, 8, 4, tf_exl3::STAGED>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+extern "C" __global__ void tf_exl3_grouped_staged_1(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body<1, 8, 4, tf_exl3::STAGED>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+extern "C" __global__ void tf_exl3_grouped_staged_2(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body<2, 8, 4, tf_exl3::STAGED>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 namespace tf_exl3 {
 
 // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
