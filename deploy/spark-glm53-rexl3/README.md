@@ -11,10 +11,14 @@ The pack is MIT (cite the base model). Drafts are [incoai/GLM-5.3-Flash-DFlash2]
 
 - `TF_KV_PAGES=on`, `--parallel 2`, `--context 262144`, `TENSORFOLD_MEMORY_RESERVE_GIB=5`
 - `--vision`, `--drafter` DFlash2 (`~/models/glm53-dflash2`)
-- `TF_KV_SHARE=2`, `TF_GLM_HOST_CACHE=1`, `--prompt-cache-gib 1`: conversation reuse. A finished
-  prompt keeps its rows as the pool's pages (up to 2 kept states); the 438 MiB KDA snapshot of each
-  kept state lives in host RAM, outside the pool. A next turn only prefills its new tokens (from the
+- EXL3 prompt experts run on FP8 (build default since 9939ace88; `TF_GLM_X3_FP8=0` gives f16 back).
+- `TF_KV_SHARE=2`, `TF_GLM_KV_LIVE_HALF=1`, `TF_GLM_HOST_CACHE=1`, `--prompt-cache-gib 1`: conversation
+  reuse. A finished prompt keeps its rows as the pool's pages (up to 2 kept states); the KDA snapshot
+  of each kept state lives in host RAM, outside the pool, and carries only the live half of the KDA
+  state (302 MiB instead of 438 MiB, no precision loss: warm outputs stay bit-identical to cold). A next turn only prefills its new tokens (from the
   last 2048-row mark).
+- A start refused with "budget fits no stream" (the KV budget can come up ~0.1 GiB short right after
+  another server stops) is retried by serve.sh up to 3 times, 20 s apart.
 - `TENSORFOLD_PREFILL_POLICY=fcfs`: between 2048-row prompt passes a short prompt goes first, so it
   does not wait for a long prefill to finish.
 - Two streams share a 3.45 GiB page pool (554 pages of 512 rows), enough for one full 262,144-token
@@ -72,3 +76,33 @@ cold prefill of the same prompt (sha 1852594d29e5 at 120k, 981cc5c6fe29 at 247k)
 While a long prefill runs, the short stream decodes at ~1.2 tok/s until the long one finishes.
 Memory (window 28, 2 concurrent 247k fills with kept states): MemAvailable low 4360 MiB, the
 1 GiB watchdog never tripped (window 27 low: 4156 MiB).
+
+## FP8 prompt experts, live-half kept states, dropped experiments (16 Nov 2026, windows 29–30)
+
+Build 72d1c64c2 (FP8 default on, KDA f_b/g_b pair launch), same config as above.
+
+- Prefill with FP8 experts: 968 tok/s at 2.9k (968/968/966), 1009 tok/s at 14k (1009/1005);
+  ~960 / ~980 before. ~1000–1026 tok/s on 120k–247k fills.
+- Decode (DFlash2): prose 29.9, code 49.1, math 54.3, structured 63.2, French 33.6 tok/s.
+  FP8 changed no answer on the 64-question bench but adds 9–10 % perplexity on long prose and one
+  known arithmetic drift in the coherence set.
+- Live-half kept states: 302 MiB a snapshot instead of 438 MiB. With `TF_KV_SHARE=4`, four ~28k
+  conversations all resumed on turn 2 (cached 26,624–28,672, TTFT 0.5–1.4 s vs 27.8–28.9 s cold,
+  outputs identical to cold); a 120k turn 2 resumed 118,784 tokens in 1.20 s (turn 1 116.7 s).
+- Memory with `TF_KV_SHARE=4`: MemAvailable low 3971 MiB (4 × 28k), 3528 MiB (a 120k turn pair, then
+  2 concurrent 247k fills); the 1 GiB watchdog never tripped. The default stays at 2 kept states
+  for margin; `TF_KV_SHARE=4` is opt-in. Two concurrent ~247k conversations are still not reused
+  (the pool fits one 262k window).
+
+Measured and not kept:
+
+- `TF_GLM_KDA_FG_PAIR` (default on, bit-identical): no measurable decode gain; the whole KDA decode
+  chain is ~5 % of decode GPU time (EXL3 experts ~43 %, linears ~30 %).
+- `TF_GLM_DRAFT_ADAPT=1` (adaptive DFlash2 draft depth, default off): no gain (prose 29.8, fr 33.2).
+- Power-of-two ladder of kept intermediate states: no TTFT gain on agent replays (186.5 s vs 183.7 s)
+  and it took the kept-state slots, so conversation turn 2 lost its reuse. Not committed.
+- Finer resume grid for short (4.5–6k) agent prompts: GLM resumes only at a cold 2048-row cut, so a
+  finer store grid cannot help, and `TF_GLM_REQUEST_STARTS=1` is refused with `TF_KV_SHARE`. Reuse
+  between cuts would need the engine to resume off the cold grid (losing warm == cold identity).
+- `TF_GLM_CHUNK_SOLO=4096` (4096-row prompt passes): does not boot at 2 × 262,144 with vision and
+  drafts (0.89 GiB left for a 3.19 GiB window); usable only with a smaller context.
