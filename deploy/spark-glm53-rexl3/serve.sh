@@ -2,9 +2,10 @@
 # Kinetick-labs Spark: GLM-5.3-Flash SAGE REXL3 2.48bpw on TensorFold (feat/glm53-rexl3), :8094.
 # 2 streams x 262,144-token windows, paged KV (TF_KV_PAGES=on), 5 GiB memory reserve,
 # vision, DFlash2 drafts, EXL3 prompt experts on FP8 (the build default; TF_GLM_X3_FP8=0: f16),
-# conversation reuse (TF_KV_SHARE=2 kept states, their live-half KDA snapshots, 302 MiB each,
+# conversation reuse (TF_KV_SHARE=4 kept states, their live-half KDA snapshots, 302 MiB each,
 # in host RAM: TF_GLM_KV_LIVE_HALF=1 TF_GLM_HOST_CACHE=1, --prompt-cache-gib 1), short prompts
-# first between 2048-row prompt passes (TENSORFOLD_PREFILL_POLICY=fcfs). Not prod (Qwen on :8083 is unchanged).
+# first between 2048-row prompt passes (TENSORFOLD_PREFILL_POLICY=fcfs). MemAvailable floor accepted: ~3.4 GiB
+# (window 30 low 3528 MiB); the 1 GiB host watchdog stays. Not prod (Qwen on :8083 is unchanged).
 #
 # Layout: $BIN/bin/tensorfold-native (ReleaseFast build of this branch), $LIBS (CUDA/vision
 # runtime libs). Usage: serve.sh            start (replaces the glm53 container)
@@ -31,7 +32,7 @@ ENV=(
   TENSORFOLD_NO_UPDATE_CHECK=1 HF_HUB_OFFLINE=1 LD_LIBRARY_PATH=/tfl
   TF_GLM_RANK=0 TF_GLM_WORLD=1
   TF_KV_PAGES=on TENSORFOLD_MEMORY_RESERVE_GIB=5
-  TF_KV_SHARE=2 TF_GLM_KV_LIVE_HALF=1 TF_GLM_HOST_CACHE=1 TENSORFOLD_PREFILL_POLICY=fcfs
+  TF_KV_SHARE=4 TF_GLM_KV_LIVE_HALF=1 TF_GLM_HOST_CACHE=1 TENSORFOLD_PREFILL_POLICY=fcfs
 )
 E=(); for e in "${ENV[@]}"; do E+=(-e "$e"); done
 CMD=(docker run -d --name "$NAME" --gpus all --ipc=host --network host
