@@ -24,6 +24,7 @@ pub const Kernels = struct {
     prep: cuda.Function,
     step: cuda.Function,
     out: cuda.Function,
+    pdl: bool = false, // the wide chain's prep, step and out as dependent launches (kda.cuh's kda_dep)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -74,14 +75,14 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         a.add(c.lower);
         for ([_]u64{ w.q, s.k, s.v, s.g, s.b }) |v| a.add(v);
         const grid: cuda.launch.Dim3 = .{ .x = @intCast(rows), .y = @intCast(c.heads) };
-        try cuda.launch.launch(ks.prep, .{ .grid = grid, .block = .{ .x = 512 } }, stream, &a);
+        try cuda.launch.launch(ks.prep, .{ .grid = grid, .block = .{ .x = 512 }, .pdl = ks.pdl }, stream, &a);
         var b: cuda.Args = .{};
         b.add(h);
         for ([_]u64{ c.state_in, w.q, s.k, s.v, s.g, s.b }) |v| b.add(v);
         b.add(@as(c_int, @intCast(rows)));
         b.add(w.y);
         b.add(s.state_out);
-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
+        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 }, .pdl = ks.pdl }, stream, &b);
         var o: cuda.Args = .{};
         o.add(h);
         o.add(w.y);
@@ -90,7 +91,7 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         o.add(c.norm_w);
         o.add(c.eps);
         o.add(s.out);
-        return cuda.launch.launch(ks.out, .{ .grid = grid, .block = .{ .x = dv } }, stream, &o);
+        return cuda.launch.launch(ks.out, .{ .grid = grid, .block = .{ .x = dv }, .pdl = ks.pdl }, stream, &o);
     }
     var a: cuda.Args = .{};
     a.add(h);

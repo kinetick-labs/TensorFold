@@ -15,6 +15,14 @@ using tf_common::warp_sum;
 
 using tf_common::sigmoidf_;
 
+// Dependent launches (TF_GLM_KDA_PDL): this kernel waits for the one before it to finish, first thing; a no-op when
+// launched without the attribute. No early trigger: the kernels after it still launch at its end, as before.
+__device__ __forceinline__ void kda_dep() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
 // One delta-rule step on this thread's 4 x 4 block of the state: per-channel decay, read (k), correct toward v.
 __device__ __forceinline__ void update(float (&s)[4][4], const float (&kk)[4], const float (&gg)[4],
                                        const float* vrow, int warp, float beta) {
@@ -212,6 +220,7 @@ __device__ __forceinline__ void prep_kernel_body(
         const float* __restrict__ cw, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
         float lower, float* __restrict__ q_out, float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save,
         float* __restrict__ g_save, float* __restrict__ b_save) {
+    kda_dep();
     const int C = 3 * H * DK;
     const int r = blockIdx.x, h = blockIdx.y;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -299,6 +308,7 @@ __device__ __forceinline__ void step_kernel_body(
         int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
         const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
         int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
+    kda_dep();
     constexpr int NT = WARPS * 32, VR = WARPS * 4;
     const int h = blockIdx.x, v0 = blockIdx.y * VR;
     const int lw = threadIdx.x >> 5, lane = threadIdx.x & 31, warp = blockIdx.y * WARPS + lw;
@@ -362,6 +372,7 @@ __device__ __forceinline__ void step_kernel_body(
 __device__ __forceinline__ void out_kernel_body(
         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
+    kda_dep();
     const int r = blockIdx.x, h = blockIdx.y;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
     __shared__ float rinv;

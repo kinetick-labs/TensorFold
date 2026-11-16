@@ -72,6 +72,8 @@ pub const Modules = struct {
         m.prompt = try cuda.nvfp4.Prompt.load(d);
         errdefer m.prompt.unload();
         m.kda = try kda.Kernels.load(m.mods[0]);
+        m.kda.pdl = kda_block.pdlWanted();
+        kda_block.copy_pdl = m.kda.pdl;
         m.kda_chunk = try kda_block.Chunk.load(m.mods[0]);
         m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)), block32);
         errdefer m.experts.unload();

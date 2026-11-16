@@ -112,6 +112,16 @@ pub const Chunk = struct {
     }
 };
 
+/// TF_GLM_KDA_PDL: unset or 1, a decode window's wide chain (prep, step, out) and its column copies launch dependent
+/// (each waits for the kernel before it, so only the launch gaps go); 0 the plain launches.
+pub fn pdlWanted() bool {
+    const v: []const u8 = if (std.c.getenv("TF_GLM_KDA_PDL")) |e| std.mem.span(e) else "1";
+    return !std.mem.eql(u8, v, "0");
+}
+
+/// Set at load from pdlWanted: the column copies' launches.
+pub var copy_pdl = false;
+
 /// forward.kda_block: out [rows][dims] fp32 partial; `wide`: three-kernel chain; `prompt`: commits the conv window.
 pub fn block(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, out: u64) !void {
     try body(set, ks, stream, l, s, x, x_stride, rows, conv_state, state_in, wide, prompt);
@@ -176,7 +186,7 @@ fn columns(set: glue.Set, stream: cuda.Stream, src: u64, cols: usize, dst: u64, 
     a.add(@as(c_longlong, @intCast(stride * 2)));
     a.add(@as(c_int, @intCast(rows)));
     a.add(@as(c_int, @intCast(cols * 2)));
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((rows * cols * 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((rows * cols * 2 + 255) / 256) }, .block = .{ .x = 256 }, .pdl = copy_pdl }, stream, &a);
 }
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.

@@ -48,6 +48,9 @@ extern "C" __global__ void tf_glm_put_slot(const float* __restrict__ src, void* 
 extern "C" __global__ void tf_glm_copy_rows(const unsigned char* __restrict__ src, long long src_pitch,
                                             unsigned char* __restrict__ dst, long long dst_pitch, int rows,
                                             int row_bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");   // TF_GLM_KDA_PDL launches it dependent; no early trigger
+#endif
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<long long>(rows) * row_bytes) return;
     const long long r = i / row_bytes, c = i % row_bytes;
