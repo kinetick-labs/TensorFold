@@ -230,7 +230,8 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     if (dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
     const l = layer(w, count, dims, width, limit);
     if (prompt and common.prompt.eligible(l)) {
-        const fp8 = if (std.c.getenv("TF_GLM_X3_FP8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        // TF_GLM_X3_FP8: e4m3 gate/up for prompt chunks, on by default (=0: the f16 path)
+        const fp8 = if (std.c.getenv("TF_GLM_X3_FP8")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         const scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
         var at: usize = 0;
         while (at < rows) : (at += prompt_rows) {
