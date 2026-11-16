@@ -44,6 +44,37 @@ pub fn confidence() !f64 {
     return @import("sys").environment.read(f64, "TF_GLM_DRAFT_CONFIDENCE", 0.7);
 }
 
+/// TF_GLM_DRAFT_ADAPT=1: a stream's drafts a round follow the drafts its recent verifies kept (landed), so a
+/// stream whose drafts rarely land (prose) verifies short windows and one whose drafts land (code, JSON) long ones.
+pub fn adapt() !bool {
+    return @import("sys").environment.read(bool, "TF_GLM_DRAFT_ADAPT", false);
+}
+
+/// The kept drafts' running average after a verify that tried `tried` and kept `kept`: a verify that kept all it
+/// tried counts one more, so a short cap can grow again (-1 before the first verify).
+pub fn landed(prev: f64, tried: usize, kept: usize) f64 {
+    const got: f64 = @as(f64, @floatFromInt(kept)) + @as(f64, if (kept >= tried) 1 else 0);
+    return if (prev < 0) got else 0.75 * prev + 0.25 * got;
+}
+
+/// Drafts a round at most for a stream's `avg` landed drafts: one past it, rounded up, from 1 to `most`.
+pub fn adaptDepth(avg: f64, most: usize) usize {
+    if (avg < 0) return most;
+    const d: usize = @intFromFloat(@min(@ceil(avg) + 1, @as(f64, @floatFromInt(most))));
+    return @max(1, d);
+}
+
+test "TF_GLM_DRAFT_ADAPT: the cap follows the landed drafts and can grow back" {
+    try std.testing.expectEqual(@as(usize, 7), adaptDepth(-1, 7));
+    try std.testing.expectEqual(@as(usize, 1), adaptDepth(0, 7));
+    try std.testing.expectEqual(@as(usize, 3), adaptDepth(1.2, 7));
+    try std.testing.expectEqual(@as(usize, 7), adaptDepth(6.5, 7));
+    var a = landed(-1, 6, 0);
+    try std.testing.expectEqual(@as(f64, 0), a);
+    a = landed(a, 1, 1); // everything tried landed: counts two
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), a, 1e-12);
+}
+
 /// The drafter MLP split: two ranks as before; three or more only with `wide` (TF_ROCE=1) and 256-aligned shares of FF.
 pub const MlpSplit = struct { split: bool, ff: usize };
 pub fn mlpSplit(world: usize, wide: bool) MlpSplit {
