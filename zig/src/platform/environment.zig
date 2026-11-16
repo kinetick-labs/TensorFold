@@ -52,6 +52,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_QMMF_HALF_BELOW", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size block count (0 disables half tiles)" },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_PROMPT_INTERMEDIATE", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_KV_SHARE_MIN_PROMPT", .scope = .cuda, .kind = .u32, .forms = "a whole prompt token count from 0 to 4294967295 under which TF_KV_SHARE keeps no state (default 0)" },
     .{ .name = "TF_THINK_CLOSE_ONCE", .scope = .common, .kind = .flag, .forms = "0 or 1 (default 1: a think close the answer spells again is dropped)" },
     .{ .name = "TF_ROCE_GID_INDEX", .scope = .cuda, .kind = .u32, .forms = "a whole GID index from 0 to 2147483647" },
     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .scope = .gemma4, .kind = .size, .forms = "a solo prompt pass's rows, a multiple of 512 up to 4096" },
