@@ -123,6 +123,11 @@ fn layerName(b: *[96]u8, li: usize, s: []const u8) ![]const u8 {
 }
 
 /// The drafter from `dir` (config.json and model.safetensors, bf16) for rank `rank` of `world`, on engine `e`.
+fn down4() bool {
+    const v = std.c.getenv("TF_GLM_DRAFT_DOWN4") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, rank: usize, world: usize, bits: u8) !*Drafter {
     if (bits != 0 and bits != 4) return error.BadDrafterBits;
     try checkConfig(gpa, io, dir);
@@ -188,10 +193,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
         if (split) { // this rank's share of the MLP width: gate and up rows, down columns, at rank * ff
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * ff, ff, 0, D });
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
+            lw.down = .{ .bf16 = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff }) };
         } else {
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, null);
+            // TF_GLM_DRAFT_DOWN4: unset or 1, down at the drafter's bits like its other linears (one rank: no fp32
+            // partials to gather); 0 bf16. Drafts only: the verify keeps what the target draws.
+            lw.down = if (down4()) try l.linear(&.{down}, &.{D}, FF, null) else .{ .bf16 = try l.linearB(&.{down}, &.{D}, FF, null) };
         }
         lw.a_proj = try l.linear(&.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{KVW}, D, null);
         lw.m_proj = try l.linear(&.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{KVW}, D, null);
@@ -238,7 +245,7 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
         for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
             part = @max(part, mm.partBytes(64, w.bf16));
         };
-        part = @max(part, mm.partBytes(64, l.down));
+        if (l.down == .bf16) part = @max(part, mm.partBytes(64, l.down.bf16));
     }
     if (dr.fc == .bf16) part = @max(part, mm.partBytes(64, dr.fc.bf16));
     part = @max(part, mm.partBytes(64, dr.hproj));
