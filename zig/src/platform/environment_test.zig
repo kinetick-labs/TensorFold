@@ -136,6 +136,8 @@ const valid = [_]Case{
     .{ .name = "TF_NEMOTRON_WORLD", .raw = "2", .n = 2 },
     .{ .name = "TF_MINIMAX_RANK", .raw = "1", .n = 1 },
     .{ .name = "TF_MINIMAX_WORLD", .raw = "2", .n = 2 },
+    .{ .name = "TF_KV_SHARE_MIN_PROMPT", .raw = "4096", .n = 4096 },
+    .{ .name = "TF_THINK_CLOSE_ONCE", .raw = "0", .n = 0 },
 };
 
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
