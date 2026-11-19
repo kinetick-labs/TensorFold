@@ -79,6 +79,7 @@ fn open(a: std.mem.Allocator) !?*Gpu {
     g.* = .{ .d = try cuda.Driver.open(), .ctx = undefined, .k = undefined, .s = undefined, .a = a };
     g.ctx = try cuda.Context.init(&g.d, 0);
     g.k = try fwd.Kernels.load(&g.d, image);
+    g.k.tc_min = 0; // the reference comparisons run the fp32 GEMM; the tensor-core one has its own test
     g.s = try cuda.Stream.init(&g.d, true);
     return g;
 }
@@ -128,27 +129,78 @@ fn positions(a: std.mem.Allocator, t: usize) ![]i32 {
     return p;
 }
 
-fn runLayer(g: *Gpu, L: *const gm.Layer, lim: gm.Limits, pos: []const i32, streams: []const f32, chunks: []const u32) ![]f32 {
+fn runLayer(g: *Gpu, L: *const gm.Layer, lim_in: gm.Limits, pos: []const i32, streams: []const f32, chunks: []const u32, dt: gm.CacheDt) ![]f32 {
     const a = g.a;
+    var lim = lim_in;
+    // the chunk the caches are cut for: the largest call, so a sliding ring smaller than T must wrap
+    lim.chunk = 0;
+    for (chunks) |t| lim.chunk = @max(lim.chunk, t);
+    if (L.dims.index) |ix| lim.recall = ix.topk / ix.kpool;
     var w = try gm.Work.init(a, g.c(), lim);
     defer w.deinit();
-    const cache_mem = try g.alloc(gm.cacheBytes(&L.dims, lim.ctx));
-    const cache = gm.cacheAt(&L.dims, lim.ctx, cache_mem);
-    // positions padded to the cache's slots, plane by plane
+    const cache_mem = try g.alloc(gm.cacheBytes(&L.dims, lim.ctx, lim.chunk, dt));
+    const cache = gm.cacheAt(&L.dims, lim.ctx, lim.chunk, dt, cache_mem);
+    // positions padded to the context, plane by plane
     const padded = try a.alloc(i32, 3 * lim.ctx);
     @memset(padded, 0);
     for (0..3) |pl| @memcpy(padded[pl * lim.ctx ..][0..T], pos[pl * T ..][0..T]);
-    try g.c().upload(w.pos, std.mem.sliceAsBytes(padded));
+    const pos_dev = try g.alloc(padded.len * 4);
+    try g.c().upload(pos_dev, std.mem.sliceAsBytes(padded));
     const row = L.dims.hc * L.dims.hidden;
     const out = try a.alloc(f32, streams.len);
     var p0: u32 = 0;
     for (chunks) |t| {
         try g.c().upload(w.streams, std.mem.sliceAsBytes(streams[p0 * row ..][0 .. t * row]));
-        try gm.layer(&w, L, cache, p0, t);
+        try gm.layerOne(&w, L, cache, pos_dev, p0, t, w.emb);
         try g.c().download(std.mem.sliceAsBytes(out[p0 * row ..][0 .. t * row]), w.streams);
         p0 += t;
     }
     try g.s.synchronize();
+    return out;
+}
+
+/// Two sequences side by side in each call (the second one shifted by `lag` rows): every row must match its own
+/// sequence's single-sequence result.
+fn runPair(g: *Gpu, L: *const gm.Layer, lim_in: gm.Limits, pos: []const i32, streams: []const f32, step: u32, lag: u32) ![]f32 {
+    const a = g.a;
+    var lim = lim_in;
+    lim.chunk = 2 * step;
+    lim.lanes = 2;
+    if (L.dims.index) |ix| lim.recall = ix.topk / ix.kpool;
+    var w = try gm.Work.init(a, g.c(), lim);
+    defer w.deinit();
+    var caches: [2]gm.Cache = undefined;
+    for (&caches) |*cc| cc.* = gm.cacheAt(&L.dims, lim.ctx, lim.chunk, .f32, try g.alloc(gm.cacheBytes(&L.dims, lim.ctx, lim.chunk, .f32)));
+    const padded = try a.alloc(i32, 3 * lim.ctx);
+    @memset(padded, 0);
+    for (0..3) |pl| @memcpy(padded[pl * lim.ctx ..][0..T], pos[pl * T ..][0..T]);
+    const pos_dev = try g.alloc(padded.len * 4);
+    try g.c().upload(pos_dev, std.mem.sliceAsBytes(padded));
+    const row = L.dims.hc * L.dims.hidden;
+    // out: sequence 0's rows then sequence 1's
+    const out = try a.alloc(f32, 2 * streams.len);
+    var at = [2]u32{ 0, 0 };
+    var call: u32 = 0;
+    while (at[0] < T or at[1] < T) : (call += 1) {
+        var segs: [2]gm.Seg = undefined;
+        var ns: usize = 0;
+        var r: u32 = 0;
+        for (0..2) |q| {
+            if (q == 1 and call * step < lag) continue;
+            if (at[q] >= T) continue;
+            const rows = @min(step, T - at[q]);
+            segs[ns] = .{ .cache = caches[q], .pos = pos_dev, .p0 = at[q], .row = r, .rows = rows };
+            try g.c().upload(w.streams + 4 * @as(u64, r) * row, std.mem.sliceAsBytes(streams[at[q] * row ..][0 .. rows * row]));
+            r += rows;
+            ns += 1;
+        }
+        try gm.layer(&w, L, segs[0..ns], w.emb);
+        for (segs[0..ns]) |sg| {
+            const q: usize = if (sg.cache.view.lat == caches[0].view.lat) 0 else 1;
+            try g.c().download(std.mem.sliceAsBytes(out[q * streams.len + sg.p0 * row ..][0 .. sg.rows * row]), w.streams + 4 * @as(u64, sg.row) * row);
+            at[q] += sg.rows;
+        }
+    }
     return out;
 }
 
@@ -305,13 +357,73 @@ test "Hy4 CUDA forward: a sliding-window layer with the dense MLP, and an indexe
 
         const want = try a.dupe(f32, streams);
         try layer_ref.forward(a, &d, &w, pos, T, want);
-        const plans = [_][]const u32{ &.{T}, &.{ 23, 17 }, &.{ 13, 24, 1, 1, 1 } };
+        // whole, in chunks, down to decode rows; small chunks make the sliding ring (window + chunk) and the token-key
+        // ring wrap several times over the 40 rows
+        const plans = [_][]const u32{ &.{T}, &.{ 23, 17 }, &.{ 13, 24, 1, 1, 1 }, &.{ 5, 5, 5, 5, 5, 5, 5, 5 }, &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 1 } };
+        const name = if (indexed) "indexed + MoE" else "sliding + dense";
         for (plans) |plan| {
-            const got = try runLayer(g, &L, lim, pos, streams, plan);
+            const got = try runLayer(g, &L, lim, pos, streams, plan, .f32);
             const e = worst(got, want);
-            std.debug.print("hy4 forward layer ({s}) chunks {any}: worst relative error {e}\n", .{ if (indexed) "indexed + MoE" else "sliding + dense", plan, e });
+            std.debug.print("hy4 forward layer ({s}) chunks {any}: worst relative error {e}\n", .{ name, plan, e });
             try std.testing.expect(e <= 2e-3);
         }
+        // narrower caches: bf16 latents and keys, e4m3 latents with a row scale (looser: the cache rounds)
+        for ([_]gm.CacheDt{ .bf16, .fp8 }) |dt| {
+            const got = try runLayer(g, &L, lim, pos, streams, &.{ 13, 24, 1, 1, 1 }, dt);
+            const e = worst(got, want);
+            std.debug.print("hy4 forward layer ({s}) cache {s}: worst relative error {e}\n", .{ name, @tagName(dt), e });
+            try std.testing.expect(e <= @as(f32, if (dt == .bf16) 2e-2 else 8e-2));
+        }
+        // two sequences per call, the second starting later: each matches the reference alone
+        for ([_]u32{ 0, 8 }) |lag| {
+            const got = try runPair(g, &L, lim, pos, streams, 6, lag);
+            const e = @max(worst(got[0..streams.len], want), worst(got[streams.len..], want));
+            std.debug.print("hy4 forward layer ({s}) two sequences, lag {d}: worst relative error {e}\n", .{ name, lag, e });
+            try std.testing.expect(e <= 2e-3);
+        }
+    }
+}
+
+test "Hy4 CUDA forward: the tensor-core GEMM (bf16 and f16 weights) matches the fp32 one on prompt-sized rows (HY4_FWD_FATBIN)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = (try open(a)) orelse return error.SkipZigTest;
+    defer g.deinit();
+    var rng = std.Random.DefaultPrng.init(13);
+    const r = rng.random();
+    // ragged sizes: rows, columns and k off the 64 / 32 tiles; a bias; accumulate on top of existing values
+    const m = 203;
+    const n = 157;
+    const k = 1000;
+    const ldx = k + 8;
+    const ldy = n + 3;
+    const x = try rand(a, r, m * ldx, 1.0);
+    const xd = try g.alloc(x.len * 4);
+    try g.c().upload(xd, std.mem.sliceAsBytes(x));
+    for ([_]fwd.Dt{ .bf16, .f16 }) |dt| {
+        const wv = try rand(a, r, n * k, 0.05);
+        const w = try g.put(wv, dt);
+        const bv = try rand(a, r, n, 0.5);
+        const b = try g.put(bv, .f32);
+        const y0 = try rand(a, r, m * ldy, 1.0);
+        var outs: [2][]f32 = undefined;
+        for (0..2) |pass| {
+            const yd = try g.alloc(y0.len * 4);
+            try g.c().upload(yd, std.mem.sliceAsBytes(y0));
+            g.k.tc_min = if (pass == 0) 0 else 32;
+            try g.k.gemm(g.s, xd, ldx, w, b, yd, ldy, m, n, k, true);
+            outs[pass] = try a.alloc(f32, y0.len);
+            try g.c().download(std.mem.sliceAsBytes(outs[pass]), yd);
+        }
+        g.k.tc_min = 0;
+        var big: f32 = 0;
+        for (outs[0]) |v| big = @max(big, @abs(v));
+        var e: f32 = 0;
+        for (outs[0], outs[1]) |want, got| e = @max(e, @abs(got - want) / big);
+        std.debug.print("hy4 tensor-core GEMM ({s} weights) {d}x{d}x{d}: worst error {e} of the largest |y|\n", .{ @tagName(dt), m, n, k, e });
+        // x rounded to the weight type: bf16 keeps 8 bits, f16 11
+        try std.testing.expect(e <= @as(f32, if (dt == .bf16) 1e-2 else 2e-3));
     }
 }
 
@@ -405,7 +517,7 @@ test "Hy4 CUDA forward: the Engram residual matches engram_ref (HY4_FWD_FATBIN)"
     try g.c().upload(w.streams, std.mem.sliceAsBytes(streams));
     try g.c().upload(w.emb, std.mem.sliceAsBytes(emb));
     try g.c().upload(w.mask, &mask_u8);
-    try gm.engramStep(&w, &ge, H, n, t);
+    try gm.engramStep(&w, &ge, w.emb, H, n, t);
     const got = try a.alloc(f32, streams.len);
     try g.c().download(std.mem.sliceAsBytes(got), w.streams);
     const err = worst(got, want);

@@ -141,3 +141,66 @@ Prefill:
 
 Order: 1 -> 3 -> 4 -> 7 (biggest expected wins: context, per-token syncs, Engram I/O, prefill GEMM), then 6 (DFly2),
 5, 8, 9, 2. Streams at 256k / 512k / 1M are measured after 1 and 2.
+
+### Window 2 (19 Nov 2026, first engine, 32k, one stream)
+
+Text + image smoke 3/3. `bench.py`: short prompt 72 tok, TTFT 1.25 s, decode 9.73 tok/s; 2k prompt (1820 tok) TTFT
+17.6 s (103 tok/s prefill), decode 8.74 tok/s; 8k prompt (7178 tok) TTFT 78 s (92 tok/s prefill), decode 8.15 tok/s.
+Load 94,342 MiB in 170 s; 16.2 GiB of the device free after load with 3.2 GiB of f32 caches at 32k.
+
+## Optimisation status (code; GPU-tested in the next window)
+
+Done in code, host-tested, compiled for sm_121 / aarch64; none of the new kernels has run on a GPU yet:
+
+1. **Caches** (`gpu_model.Shape`, `hy4_cache_store`, `hy4_mla_attn`): the 30 sliding layers keep a ring of
+   `align16(512 + chunk)` rows; the 12 indexed layers keep the full history. Latent + rope rows in f32, bf16 or fp8
+   e4m3 (one f32 scale per row, amax/448) — `HY4_CACHE_DT=f32|bf16|fp8`, default bf16. The indexer's token-key rows are
+   a small ring (`chunk + kpool`), pooled keys (one per 4 tokens) in bf16; top-k returns a compact ascending list of
+   kept groups and attention visits only those (plus the row's own group). Per sequence (host test `capacity.zig`):
+
+   | context | f32 | bf16 | fp8 |
+   |---|---|---|---|
+   | 256k | 7.18 GiB | 3.59 GiB | 2.09 GiB |
+   | 512k | 14.31 GiB | 7.16 GiB | 4.17 GiB |
+   | 1M | 28.56 GiB | 14.29 GiB | 8.32 GiB |
+
+   With ~16 GiB free after load and a 4 GiB reserve (`HY4_RESERVE_MIB`): 1M only in fp8 (1 stream), 512k fp8 ~2-3,
+   256k fp8 ~5-6, 256k bf16 ~3. The serve logs `hy4 capacity:` lines and refuses a `--parallel` that does not fit.
+2. **Several streams** (`serve_engine` lanes, `gpu_model.layer(segs)`): each step packs every lane's decode row, then
+   prompt pieces round-robin up to the chunk; projections, MoE and Engram run over all rows at once, rope / cache store /
+   indexer / attention per segment. Tested on the GPU path by a two-sequence test (lag 0 and 8) against single runs.
+3. **MoE on the device** (`moe_grouped.zig`): the router's picks feed the existing EXL3 grouped-expert kernels
+   (`exl3_experts`, fp32 SwiGLU with the model's clamp) for up to `HY4_MOE_GROUPED_ROWS` rows (default: the chunk), no
+   host sync; the per-expert path stays as fallback (`HY4_MOE_GROUPED=0`) and `HY4_MOE_CHECK=N` compares both on the
+   first N calls.
+4. **Engram** (`engram_batch.zig`): the rows of all four Engram layers for a step are read by a thread pool
+   (`HY4_ENGRAM_THREADS`, default 32) and uploaded once; serial `pread`s were ~2.5 s per 256-row chunk.
+5. **Prefill GEMM**: plain bf16 / f16 projections of >= 32 rows run on tensor cores (`hy4_gemm_tc_*`, wmma 16x16x16,
+   64x64 tiles, fp32 sums; x rounded to the weight type). `HY4_TC_GEMM_ROWS=0` turns it off. Default chunk 256
+   (`HY4_CHUNK`).
+
+Deferred:
+
+- **CUDA graphs** of the decode step: needs positions and segment tables on the device (today `p0`, ring slots and the
+  segment loop are host values baked into launch arguments) and fixed-size grids for top-k / grouped MoE. Plan: a
+  device `Seg` table written by one small upload per step, kernels reading it, then capture one graph per lane count.
+- **Multi-stream CUDA streams** (overlap of Engram reads / uploads with the first layers): after graphs.
+
+### DFly2 drafter (design; implementation next)
+
+Reference: Tencent AngelSpec (`models/draft/dfly2.py`, `dspark.py`, `hy4_mla.py`, config
+`dfly2_hy_v4_flash_draft_config.json`), Apache-2.0 — our implementation follows its published design and credits it.
+The pack carries `model.dfly_layers.0..4.*` (EXL3 q_b / o_proj / MLP, plain q_a / kv_a / kv_b / linear_gate / norms /
+learnable sink) plus `mtp_fusion`, `hidden_correction`, `confidence_head`, `final_norm`.
+
+- Inputs: the target's hidden states of the last accepted row (fused by `mtp_fusion`: enorm(embedding) ‖
+  hnorm(hidden) -> eh_proj, gated), `hidden_correction` on top.
+- 5 gated-MLA layers; layer i attends over the target's KV latents of layer 25 / 29 / 33 / 37 / 41 and reuses that
+  layer's DSA top-2048 picks (no own cache, no own indexer), with a learnable sink and a sigmoid output gate.
+- Drafts a block (SGLang uses 6) with `mask_token_id` 120009 for the not-yet-known positions; `confidence_head`
+  gives a per-position stop score (adaptive k).
+- Verify: the block goes through the multi-row path as one segment (t = k + 1 rows); rollback = lane position reset
+  (ring rows and indexer pools are rewritten from the accepted position; the full-history layers just overwrite).
+- Engine work: a `Draft` struct bound from the pack (bind.zig group `draft`), a forward reusing `hy4_mla_attn` with the
+  target's `CacheView` of the five source layers, and the accept loop in `serve_engine` (greedy first, then
+  sampling with the standard speculative acceptance).

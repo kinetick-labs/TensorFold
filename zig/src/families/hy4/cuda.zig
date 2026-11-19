@@ -133,5 +133,11 @@ test "Hy4 CUDA: load compiles against the runtime and checkpoint it calls" {
 }
 
 test {
-    _ = @import("bind.zig"); // the binder, the GPU model and the vision tower compile against this runtime; the e4m3 table
+    // the binder, the GPU model and the vision tower compile against this runtime; the e4m3 table; the grouped MoE
+    // tables, the parallel Engram reads and the capacity table
+    _ = @import("bind.zig");
+    _ = @import("moe_grouped.zig");
+    _ = @import("engram_batch.zig");
+    _ = @import("capacity.zig");
+    std.testing.refAllDecls(@import("gpu_model.zig"));
 }

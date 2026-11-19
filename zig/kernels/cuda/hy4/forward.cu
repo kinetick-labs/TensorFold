@@ -4,7 +4,9 @@
 // projections run on the shared trellis kernels; everything here is the rest of the model.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
+#include <mma.h>
 
 #define DT_F32 0
 #define DT_BF16 1
@@ -15,6 +17,26 @@ __device__ __forceinline__ float ldw(const void* p, int dt, long long i) {
     if (dt == DT_F16) return __half2float(reinterpret_cast<const __half*>(p)[i]);
     return reinterpret_cast<const float*>(p)[i];
 }
+// Cache element types (gpu_model.CacheDt): f32, bf16, or e4m3 with a per-row f32 scale (the scale applied by the reader).
+#define CDT_F32 0
+#define CDT_BF16 1
+#define CDT_FP8 3
+__device__ __forceinline__ float ldc(const void* p, int dt, long long i) {
+    if (dt == CDT_BF16) return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(p)[i]);
+    if (dt == CDT_FP8) {
+        __nv_fp8_e4m3 v;
+        v.__x = reinterpret_cast<const __nv_fp8_storage_t*>(p)[i];
+        return (float)v;
+    }
+    return reinterpret_cast<const float*>(p)[i];
+}
+__device__ __forceinline__ void stc(void* p, int dt, long long i, float x) {
+    if (dt == CDT_BF16) reinterpret_cast<__nv_bfloat16*>(p)[i] = __float2bfloat16_rn(x);
+    else if (dt == CDT_FP8) reinterpret_cast<__nv_fp8_storage_t*>(p)[i] = __nv_fp8_e4m3(x).__x;
+    else reinterpret_cast<float*>(p)[i] = x;
+}
+// the rotary half of a cache row: f32 with an f32 cache, else bf16
+__device__ __forceinline__ int rot_dt(int dt) { return dt == CDT_F32 ? CDT_F32 : CDT_BF16; }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float silu(float x) { return x * sigm(x); }
 
@@ -28,6 +50,23 @@ __device__ __forceinline__ float block_sum(float v, float* scratch) {
     if (threadIdx.x < 32) {
         float s = threadIdx.x < THREADS / 32 ? scratch[threadIdx.x] : 0.0f;
         for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (threadIdx.x == 0) scratch[0] = s;
+    }
+    __syncthreads();
+    const float r = scratch[0];
+    __syncthreads();
+    return r;
+}
+template <int THREADS>
+__device__ __forceinline__ float block_max(float v, float* scratch) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __syncthreads();
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float s = threadIdx.x < THREADS / 32 ? scratch[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) s = fmaxf(s, __shfl_xor_sync(0xffffffffu, s, o));
         if (threadIdx.x == 0) scratch[0] = s;
     }
     __syncthreads();
@@ -87,6 +126,79 @@ extern "C" __global__ void __launch_bounds__(256) hy4_gemm(const float* __restri
             *o = accumulate ? *o + v : v;
         }
     }
+}
+
+// The same on tensor cores for bf16 or f16 weights (`wdt`), the prompt's many rows: x rounded to the weight's type
+// as it is staged, fp32 accumulation. 64 x 64 tiles, k steps of 32, 4 warps of 32 x 32 (2 x 2 wmma 16 x 16 x 16).
+template <typename T>
+__device__ __forceinline__ T to_t(float x);
+template <>
+__device__ __forceinline__ __nv_bfloat16 to_t<__nv_bfloat16>(float x) { return __float2bfloat16_rn(x); }
+template <>
+__device__ __forceinline__ __half to_t<__half>(float x) { return __float2half_rn(x); }
+
+template <typename T>
+__device__ __forceinline__ void gemm_tc(const float* __restrict__ x, long long ldx, const T* __restrict__ w, const void* __restrict__ b,
+                                        int bdt, float* __restrict__ y, long long ldy, int m, int n, int k, int accumulate) {
+    using namespace nvcuda;
+    __shared__ __align__(32) T xs[64][32 + 8];
+    __shared__ __align__(32) T ws[64][32 + 8];
+    __shared__ __align__(32) float out[4][32][32 + 4];
+    const int warp = threadIdx.x >> 5;
+    const int wr = (warp >> 1) * 32, wc = (warp & 1) * 32;
+    const int row0 = blockIdx.y * 64, col0 = blockIdx.x * 64;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        for (int i = threadIdx.x; i < 64 * 32; i += 128) {
+            const int r = i / 32, kk = i % 32;
+            const int gr = row0 + r, gc = col0 + r, gk = k0 + kk;
+            xs[r][kk] = to_t<T>((gr < m && gk < k) ? x[(long long)gr * ldx + gk] : 0.0f);
+            ws[r][kk] = (gc < n && gk < k) ? w[(long long)gc * k + gk] : to_t<T>(0.0f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> bf[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &xs[wr + 16 * i][kk], 32 + 8);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(bf[j], &ws[wc + 16 * j][kk], 32 + 8);
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], bf[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::store_matrix_sync(&out[warp][16 * i][16 * j], acc[i][j], 32 + 4, wmma::mem_row_major);
+    __syncwarp();
+    const int lane = threadIdx.x & 31;
+    for (int e = lane; e < 32 * 32; e += 32) {
+        const int r = row0 + wr + e / 32, c = col0 + wc + e % 32;
+        if (r >= m || c >= n) continue;
+        const float v = out[warp][e / 32][e % 32] + (b ? ldw(b, bdt, c) : 0.0f);
+        float* o = y + (long long)r * ldy + c;
+        *o = accumulate ? *o + v : v;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) hy4_gemm_tc_bf16(const float* __restrict__ x, long long ldx, const void* __restrict__ w,
+                                                                   int wdt, const void* __restrict__ b, int bdt, float* __restrict__ y,
+                                                                   long long ldy, int m, int n, int k, int accumulate) {
+    gemm_tc<__nv_bfloat16>(x, ldx, reinterpret_cast<const __nv_bfloat16*>(w), b, bdt, y, ldy, m, n, k, accumulate);
+}
+extern "C" __global__ void __launch_bounds__(128) hy4_gemm_tc_f16(const float* __restrict__ x, long long ldx, const void* __restrict__ w,
+                                                                  int wdt, const void* __restrict__ b, int bdt, float* __restrict__ y,
+                                                                  long long ldy, int m, int n, int k, int accumulate) {
+    gemm_tc<__half>(x, ldx, reinterpret_cast<const __half*>(w), b, bdt, y, ldy, m, n, k, accumulate);
 }
 
 // The same for at most 8 rows (decode): a warp per output column, lanes along k, every row at once.
@@ -268,45 +380,64 @@ extern "C" __global__ void hy4_absorb_q(const float* __restrict__ q, const void*
 }
 
 // One query row and head a block: scores over the latent cache (ql . lat_j + q_rot . rot_j) * scale for the keys it may
-// see (causal; `window` > 0: the last `window`; `keep` non-null: only groups keep[t][g] or its own group), a softmax
-// whose denominator also holds exp(sink), and ol = the weights times the latents. Online, 32 keys a tile.
+// see, a softmax whose denominator also holds exp(sink), and ol = the weights times the latents. Online, 32 keys a tile.
+// Keys: causal, the last `window` with `window` > 0; with `list` non-null only the groups list[t][0, count[t]) and the
+// query's own group (each `kpool` keys). Key j lives in slot j % slots (a ring when slots < the context); the cache
+// holds `dt` latents (fp8: times lscale[slot]) and rot_dt(dt) rotary halves.
 #define ATT_THREADS 256
 extern "C" __global__ void __launch_bounds__(ATT_THREADS) hy4_mla_attn(
-    const float* __restrict__ ql, const float* __restrict__ q, int qk, int nope, const float* __restrict__ lat,
-    const float* __restrict__ rot, const float* __restrict__ sinks, float* __restrict__ ol, int heads, int kvl, int rope,
-    long long qpos0, int window, const unsigned char* __restrict__ keep, long long keep_ld, int kpool, float scale) {
+    const float* __restrict__ ql, const float* __restrict__ q, int qk, int nope, const void* __restrict__ lat,
+    const void* __restrict__ rot, const float* __restrict__ lscale, int dt, long long slots, const float* __restrict__ sinks,
+    float* __restrict__ ol, int heads, int kvl, int rope, long long qpos0, int window, const int* __restrict__ list,
+    long long list_ld, const int* __restrict__ count, int kpool, float scale) {
     __shared__ float qsh[640];
     __shared__ float sc[32];
+    __shared__ float ks[32];       // the fp8 row scale of each key in the tile (1 otherwise)
+    __shared__ long long sj[32];   // the tile's key slots, -1: none
     __shared__ float stat[2];
     const long long t = blockIdx.x;
     const int h = blockIdx.y;
     const long long th = t * heads + h;
+    const int rdt = rot_dt(dt);
     for (int c = threadIdx.x; c < kvl; c += ATT_THREADS) qsh[c] = ql[th * kvl + c];
     for (int c = threadIdx.x; c < rope; c += ATT_THREADS) qsh[kvl + c] = q[th * qk + nope + c];
     const long long i = qpos0 + t;
     const long long lo = window > 0 ? (i - window + 1 > 0 ? i - window + 1 : 0) : 0;
-    const long long own = kpool > 0 ? i / kpool : 0;
+    const long long own = i / kpool;
+    const long long picked = list ? (long long)count[t] : 0;
+    const long long nkeys = list ? (picked + 1) * kpool : i - lo + 1;
     const int per = (kvl + ATT_THREADS - 1) / ATT_THREADS;  // channels a thread accumulates (kvl <= 1024)
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float mx = sinks[h], sum = 1.0f;  // the sink: exp(sink - mx) with mx = sink
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     __syncthreads();
-    for (long long j0 = lo; j0 <= i; j0 += 32) {
+    for (long long v0 = 0; v0 < nkeys; v0 += 32) {
+        if (threadIdx.x < 32) {
+            const long long v = v0 + threadIdx.x;
+            long long j = -1;
+            if (v < nkeys) {
+                if (list) {
+                    const long long g = v < picked * kpool ? (long long)list[t * list_ld + v / kpool] : own;
+                    j = g * kpool + v % kpool;
+                    if (j > i) j = -1;
+                } else {
+                    j = lo + v;
+                }
+            }
+            const long long slot = j < 0 ? -1 : j % slots;
+            sj[threadIdx.x] = slot;
+            ks[threadIdx.x] = (slot >= 0 && dt == CDT_FP8) ? lscale[slot] : 1.0f;
+        }
+        __syncthreads();
         // 8 warps score 32 keys, 4 each
         for (int kk = warp; kk < 32; kk += ATT_THREADS / 32) {
-            const long long j = j0 + kk;
+            const long long slot = sj[kk];
             float s = -INFINITY;
-            bool ok = j <= i;
-            if (ok && keep) {
-                const long long g = j / kpool;
-                ok = g == own || keep[t * keep_ld + g];
-            }
-            if (ok) {
+            if (slot >= 0) {
                 float d = 0.0f;
-                const float* lj = lat + j * kvl;
-                for (int c = lane; c < kvl; c += 32) d += qsh[c] * lj[c];
-                const float* rj = rot + j * rope;
-                for (int c = lane; c < rope; c += 32) d += qsh[kvl + c] * rj[c];
+                for (int c = lane; c < kvl; c += 32) d += qsh[c] * ldc(lat, dt, slot * kvl + c);
+                d *= ks[kk];
+                for (int c = lane; c < rope; c += 32) d += qsh[kvl + c] * ldc(rot, rdt, slot * rope + c);
                 s = warp_sum(d) * scale;
             }
             if (lane == 0) sc[kk] = s;
@@ -335,7 +466,7 @@ extern "C" __global__ void __launch_bounds__(ATT_THREADS) hy4_mla_attn(
             float a = acc[e] * corr;
             for (int kk = 0; kk < 32; ++kk) {
                 const float p = sc[kk];
-                if (p != 0.0f) a += p * lat[(j0 + kk) * kvl + c];
+                if (p != 0.0f) a += p * ks[kk] * ldc(lat, dt, sj[kk] * kvl + c);
             }
             acc[e] = a;
         }
@@ -348,6 +479,43 @@ extern "C" __global__ void __launch_bounds__(ATT_THREADS) hy4_mla_attn(
         const int c = threadIdx.x + e * ATT_THREADS;
         if (c < kvl) ol[th * kvl + c] = acc[e] * inv;
     }
+}
+
+// Rows [p0, p0 + rows) of a latent cache: src row r = the normed latent (kvl) then the rotated key (rope), stored at slot
+// (p0 + r) % slots as `dt` (fp8: scaled by amax / 448, the scale in lscale[slot]) and rot_dt(dt). One block a row.
+extern "C" __global__ void __launch_bounds__(256) hy4_cache_store(const float* __restrict__ src, long long lds, int kvl, int rope,
+                                                                  void* __restrict__ lat, void* __restrict__ rot,
+                                                                  float* __restrict__ lscale, int dt, long long slots,
+                                                                  long long p0) {
+    __shared__ float scratch[32];
+    const long long r = blockIdx.x;
+    const long long slot = (p0 + r) % slots;
+    const float* x = src + r * lds;
+    float inv = 1.0f;
+    if (dt == CDT_FP8) {
+        float m = 0.0f;
+        for (int c = threadIdx.x; c < kvl; c += 256) m = fmaxf(m, fabsf(x[c]));
+        const float amax = block_max<256>(m, scratch);
+        const float sc = amax > 0.0f ? amax / 448.0f : 1.0f;
+        if (threadIdx.x == 0) lscale[slot] = sc;
+        inv = 1.0f / sc;
+    }
+    for (int c = threadIdx.x; c < kvl; c += 256) stc(lat, dt, slot * kvl + c, x[c] * inv);
+    const int rdt = rot_dt(dt);
+    for (int c = threadIdx.x; c < rope; c += 256) stc(rot, rdt, slot * rope + c, x[kvl + c]);
+}
+
+// dst row (row0 + r) = src row r as `dt` (f32 or bf16), `width` wide.
+extern "C" __global__ void hy4_store_rows(const float* __restrict__ src, long long lds, void* __restrict__ dst, int dt, int width,
+                                          long long row0) {
+    const long long r = blockIdx.x;
+    for (int c = threadIdx.x; c < width; c += blockDim.x) stc(dst, dt, (row0 + r) * width + c, src[r * lds + c]);
+}
+
+// y = half(x) over `count` values (the grouped experts read fp16 or bf16 inputs).
+extern "C" __global__ void hy4_to_half(const float* __restrict__ x, __half* __restrict__ y, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] = __float2half_rn(x[i]);
 }
 
 // out[t, h, e] = sigmoid(gate[t, h, e]) * sum_c kvb[h * (nope + v) + nope + e, c] * ol[t, h, c]; a warp a value channel,
@@ -381,16 +549,17 @@ extern "C" __global__ void __launch_bounds__(256) hy4_uv_gate(const float* __res
 
 // ---------------------------------------------------------------- the compressed indexer
 // Group g's key from its `kpool` token keys: values = kv @ tok, gates = kg @ tok + ape[slot], softmax over the slots per
-// channel, key_norm (RMSNorm, f32 weight). The rotary part is applied after (hy4_rope with pos_step = kpool).
-extern "C" __global__ void __launch_bounds__(128) hy4_idx_pool(const float* __restrict__ tok, const float* __restrict__ kv,
-                                                               const float* __restrict__ kg, const float* __restrict__ ape,
-                                                               const float* __restrict__ knorm, float* __restrict__ gk, long long g0,
-                                                               int dim, int kpool, float eps) {
+// channel, key_norm (RMSNorm, f32 weight), into row g - g0 of `out` (f32). Token key j lives in row j % tslots of `tok`
+// (a ring of the last few rows). The rotary part is applied after (hy4_rope with pos_step = kpool), then hy4_store_rows.
+extern "C" __global__ void __launch_bounds__(128) hy4_idx_pool(const float* __restrict__ tok, long long tslots,
+                                                               const float* __restrict__ kv, const float* __restrict__ kg,
+                                                               const float* __restrict__ ape, const float* __restrict__ knorm,
+                                                               float* __restrict__ out, long long g0, int dim, int kpool, float eps) {
     __shared__ float ts[8][128];
     __shared__ float scratch[32];
     const long long g = g0 + blockIdx.x;
     const int c = threadIdx.x;
-    for (int s = 0; s < kpool; ++s) ts[s][c] = tok[(g * kpool + s) * dim + c];
+    for (int s = 0; s < kpool; ++s) ts[s][c] = tok[((g * kpool + s) % tslots) * dim + c];
     __syncthreads();
     float vals[8], gts[8];
     float most = -INFINITY;
@@ -412,12 +581,13 @@ extern "C" __global__ void __launch_bounds__(128) hy4_idx_pool(const float* __re
     }
     const float pooled = acc / sum;
     const float inv = rsqrtf(block_sum<128>(pooled * pooled, scratch) / (float)dim + eps);
-    gk[g * dim + c] = pooled * inv * knorm[c];
+    out[(long long)blockIdx.x * dim + c] = pooled * inv * knorm[c];
 }
 
-// logits[t, g] = sum_h hw[t, h] * hscale * relu(iq[t, h] . gk[g]) for the groups closed before the query's own, else -inf.
+// logits[t, g] = sum_h hw[t, h] * hscale * relu(iq[t, h] . gk[g]) for the groups closed before the query's own, else -inf
+// (gk stored as `gdt`: f32 or bf16).
 extern "C" __global__ void __launch_bounds__(256) hy4_idx_score(const float* __restrict__ iq, const float* __restrict__ hw,
-                                                                const float* __restrict__ gk, float* __restrict__ logits,
+                                                                const void* __restrict__ gk, int gdt, float* __restrict__ logits,
                                                                 long long ld, int heads, int dim, int groups, long long qpos0,
                                                                 int kpool, float hscale) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -432,7 +602,7 @@ extern "C" __global__ void __launch_bounds__(256) hy4_idx_score(const float* __r
     float l = 0.0f;
     for (int h = 0; h < heads; ++h) {
         float s = 0.0f;
-        for (int c = lane; c < dim; c += 32) s += iq[(t * heads + h) * dim + c] * gk[(long long)g * dim + c];
+        for (int c = lane; c < dim; c += 32) s += iq[(t * heads + h) * dim + c] * ldc(gk, gdt, (long long)g * dim + c);
         s = warp_sum(s);
         l += hw[t * heads + h] * hscale * fmaxf(s, 0.0f);
     }
@@ -445,12 +615,16 @@ __device__ __forceinline__ unsigned int order_key(float f) {
 }
 
 // keep[t, g] for the `recall` best groups below the query's own (ties: the lower group, as the reference's strict scan);
-// all of them when fewer. One block a query row.
+// all of them when fewer. With `list` non-null the kept groups also go there in ascending order (row t at t * lld) and
+// their number to count[t]: hy4_mla_attn then visits only those. One block a query row.
 extern "C" __global__ void __launch_bounds__(256) hy4_idx_topk(const float* __restrict__ logits, long long ld,
                                                                unsigned char* __restrict__ keep, long long kld, int groups,
-                                                               long long qpos0, int kpool, int recall) {
+                                                               long long qpos0, int kpool, int recall, int* __restrict__ list,
+                                                               long long lld, int* __restrict__ count) {
     __shared__ unsigned int cnt;
     __shared__ unsigned int thr;
+    __shared__ int woff[8];
+    __shared__ int base;
     const long long t = blockIdx.x;
     const long long ownl = (qpos0 + t) / kpool;
     const int own = (int)(ownl < groups ? ownl : groups);
@@ -460,40 +634,66 @@ extern "C" __global__ void __launch_bounds__(256) hy4_idx_topk(const float* __re
     __syncthreads();
     if (own <= recall) {
         for (int g = threadIdx.x; g < own; g += 256) kr[g] = 1;
-        return;
-    }
-    // the largest key k with count(key >= k) >= recall, bit by bit
-    if (threadIdx.x == 0) thr = 0;
-    __syncthreads();
-    for (int bit = 31; bit >= 0; --bit) {
-        const unsigned int cand = thr | (1u << bit);
+    } else {
+        // the largest key k with count(key >= k) >= recall, bit by bit
+        if (threadIdx.x == 0) thr = 0;
+        __syncthreads();
+        for (int bit = 31; bit >= 0; --bit) {
+            const unsigned int cand = thr | (1u << bit);
+            if (threadIdx.x == 0) cnt = 0;
+            __syncthreads();
+            unsigned int local = 0;
+            for (int g = threadIdx.x; g < own; g += 256) local += order_key(row[g]) >= cand;
+            atomicAdd(&cnt, local);
+            __syncthreads();
+            if (threadIdx.x == 0 && cnt >= (unsigned int)recall) thr = cand;
+            __syncthreads();
+        }
         if (threadIdx.x == 0) cnt = 0;
         __syncthreads();
-        unsigned int local = 0;
-        for (int g = threadIdx.x; g < own; g += 256) local += order_key(row[g]) >= cand;
-        atomicAdd(&cnt, local);
-        __syncthreads();
-        if (threadIdx.x == 0 && cnt >= (unsigned int)recall) thr = cand;
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) cnt = 0;
-    __syncthreads();
-    unsigned int above = 0;
-    for (int g = threadIdx.x; g < own; g += 256)
-        if (order_key(row[g]) > thr) {
-            kr[g] = 1;
-            ++above;
-        }
-    atomicAdd(&cnt, above);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        int left = recall - (int)cnt;
-        for (int g = 0; g < own && left > 0; ++g)
-            if (order_key(row[g]) == thr) {
+        unsigned int above = 0;
+        for (int g = threadIdx.x; g < own; g += 256)
+            if (order_key(row[g]) > thr) {
                 kr[g] = 1;
-                --left;
+                ++above;
             }
+        atomicAdd(&cnt, above);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int left = recall - (int)cnt;
+            for (int g = 0; g < own && left > 0; ++g)
+                if (order_key(row[g]) == thr) {
+                    kr[g] = 1;
+                    --left;
+                }
+        }
     }
+    if (!list) return;
+    __syncthreads();
+    // ascending compaction, 256 groups a pass: a ballot per warp, the warps' offsets by thread 0
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x == 0) base = 0;
+    __syncthreads();
+    for (int g0 = 0; g0 < own; g0 += 256) {
+        const int g = g0 + threadIdx.x;
+        const bool flag = g < own && kr[g];
+        const unsigned int ballot = __ballot_sync(0xffffffffu, flag);
+        if (lane == 0) woff[warp] = __popc(ballot);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int run = base;
+            for (int w = 0; w < 8; ++w) {
+                const int c = woff[w];
+                woff[w] = run;
+                run += c;
+            }
+            base = run;
+        }
+        __syncthreads();
+        if (flag) list[t * lld + woff[warp] + __popc(ballot & ((1u << lane) - 1u))] = g;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) count[t] = base;
 }
 
 // ---------------------------------------------------------------- the latent MoE
