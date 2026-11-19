@@ -98,3 +98,46 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | serve engine (`serve_engine.zig`: native_engines `hy_v4_flash/exl3`, one lane, Engram rows by pread from the NVMe sidecars, `--vision` with the template's start/pad/end markers, pad expanded to H x (W+1) tower rows) and server `tensorfold-hy4` (`zig build hy4-serve -Dfatbins=DIR -Dhy4-nvcc=NVCC [-Dtarget=aarch64-linux-gnu.2.39]`) | to run: yes, GLM stopped | built (x86_64 + aarch64), staged on the Spark (`~/hy4gpu/tensorfold-hy4`); first run in the next window |
 | full model load and first tokens, text + image smoke | yes, GLM stopped | whole-pack load + spot checks passed (first window); `tools/hy4/window/window.sh` now runs the kernel tests, then `tensorfold-hy4 serve --vision` on 127.0.0.1:8095 and `smoke.py` (text, image, thinking) |
 | multimodal serve, conformance, DFly2, speed (see the optimisation plan) | yes | |
+
+## Optimisation plan (after the first served tokens)
+
+The first engine (`serve_engine.zig`) is written for correctness: f32 activations, a full-length f32 latent cache in
+every layer, the MoE grouped on the host (expert ids downloaded, one sync per MoE layer), Engram rows read by `pread`
+per token and head, 256-row prefill chunks, one stream, no drafts. Each step below is measured in a window before and
+after (prefill tok/s at 2k/16k/64k, decode tok/s on prose/code/French, MemAvailable low), and kept only if the kernel
+tests and a fixed greedy transcript stay identical (or within the tested tolerance where precision changes).
+
+Memory and context first, since it decides streams and context:
+
+1. Caches: the 30 sliding layers keep only a 512-row ring (window 512); only the 12 sparse layers keep the full
+   history. Latent + rope rows in bf16 (576 values), indexer pooled keys in bf16. Arithmetic: f32 everywhere today is
+   ~96.8 KB/token (3.2 GB at 32k); ring + bf16 is ~13.8 KB/token of latents + ~0.8 KB/token of pooled keys, i.e.
+   ~3.8 GB per 262,144-token stream, ~7.7 GB at 512k, ~15.3 GB at 1M. Beside the 92.9 GiB arena that is roughly
+   4 x 262k, 2 x 512k or 1 x 1M on the Spark: to be measured (boot margin, MemAvailable low, vision tower, DFly2).
+2. Several lanes: `--parallel N` with batched decode rows (the GEMV path already takes m <= 8 rows) and per-lane caches.
+
+Decode:
+
+3. MoE grouping on the device (count + prefix + scatter kernel) instead of downloading the router's ids: removes 41
+   host syncs per token; then the expert projections as one grouped EXL3 launch per MoE layer (the GLM/DSV4.1 grouped
+   kernels) instead of one `Dense.decode` per active expert.
+4. Engram: the n-gram ids depend only on input tokens, so the four Engram layers' rows (16 heads each) are read in one
+   batched direct-I/O submission at step start, overlapped with the layers before L01; page-cache pressure off
+   (`O_DIRECT`, aligned 98-byte rows in 4 KiB reads).
+5. CUDA graph of the decode step once no host sync remains; bf16 activations in the attention/MLP inner products,
+   f32 residual and hyper-connection streams kept.
+6. DFly2: the pack's 5-layer drafter (`model.dfly_layers.*`, already in the load plan as group `draft`): draft k
+   tokens, verify them in one target pass through the chunked-prefill path (t = k + 1 rows), roll back by cache length
+   (ring rows and indexer pools rewritten from the accepted position; Engram windows recomputed). Adaptive k from the
+   acceptance rate. On GLM the DFlash2 gain was largest on code/math/JSON and smallest on prose; same measurement here.
+
+Prefill:
+
+7. Chunks of 2048 rows (work buffers sized for it); plain BF16 projections on tensor cores (mma bf16) instead of the
+   scalar GEMM; EXL3 experts through the existing prompt kernels, FP8 as on GLM if it holds the tolerance.
+8. Attention prefill tiled flash-style over the absorbed MLA (sliding: 512-row window; sparse: the indexer's top-2048
+   keep map per row), indexer scoring as a tensor-core GEMM over pooled keys.
+9. Vision: bf16 tower with tiled attention for large images; the tower runs once per image hash (prompt cache).
+
+Order: 1 -> 3 -> 4 -> 7 (biggest expected wins: context, per-token syncs, Engram I/O, prefill GEMM), then 6 (DFly2),
+5, 8, 9, 2. Streams at 256k / 512k / 1M are measured after 1 and 2.
