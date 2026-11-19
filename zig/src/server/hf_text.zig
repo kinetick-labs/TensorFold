@@ -1,4 +1,5 @@
 //! A checkpoint's tokenizer.json and chat template behind ``model_text.Text`` (our tokenizer and template engines).
+const hy4_reply = @import("hy4_reply.zig");
 const std = @import("std");
 const tokenizer = @import("tokenizer");
 const template = @import("template");
@@ -35,6 +36,7 @@ pub const HfText = struct {
     overridden: bool = false, // the chat template is --chat-template's file
     unread_template: bool = false, // a native DeepSeek checkpoint's own Jinja, which its encoder replaces
     clear_thinking: ?bool = null, // GLM-5.3's, given to its template on every render (``glmClearThinking``)
+    hy4_reply: bool = false, // Hy4-flash: decoded `<tool_call:opensource>`... read as GLM's markup (hy4_reply.zig)
     tool_source: []const u8 = "",
     compiled: ?template.Compiled = null,
     tool_compiled: ?template.Compiled = null,
@@ -96,6 +98,7 @@ pub const HfText = struct {
         if (model_config == .object) if (model_config.object.get("model_type")) |kind| {
             t.native_deepseek = template_override == null and kind == .string and
                 (std.mem.eql(u8, kind.string, "deepseek_v4") or std.mem.eql(u8, kind.string, "deepseek_v41"));
+            t.hy4_reply = kind == .string and std.mem.eql(u8, kind.string, "hy_v4_flash");
             if (kind == .string and std.mem.eql(u8, kind.string, "glm5_next")) {
                 const value = if (std.c.getenv(clear_thinking_env)) |v| std.mem.span(v) else null;
                 t.clear_thinking = glmClearThinking(value) orelse {
@@ -347,11 +350,19 @@ pub const HfText = struct {
     }
 
     fn decodeFn(ctx: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
-        return self(ctx).tok.decode(a, ids, false) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else a.dupe(u8, "\u{fffd}");
+        const out = self(ctx).tok.decode(a, ids, false) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else a.dupe(u8, "\u{fffd}");
+        if (!self(ctx).hy4_reply) return out;
+        errdefer a.free(out);
+        const mapped = try hy4_reply.rewrite(a, out);
+        if (mapped.ptr != out.ptr) a.free(out);
+        return mapped;
     }
 
     fn tokenIdFn(ctx: *anyopaque, piece: []const u8) ?u32 {
-        return self(ctx).tok.specialTokenId(piece);
+        const t = self(ctx);
+        // Hy4: `</think>` is the token `</think:opensource>` (the close a reply's thinking ends at)
+        if (t.hy4_reply) if (hy4_reply.tagFor(piece)) |tag| if (t.tok.specialTokenId(tag)) |id| return id;
+        return t.tok.specialTokenId(piece);
     }
 
     fn tokenStringFn(ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 {

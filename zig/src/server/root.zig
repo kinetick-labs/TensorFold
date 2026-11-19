@@ -68,6 +68,8 @@ test {
     _ = @import("fields.zig");
     _ = @import("reply_code.zig");
     _ = @import("reply_text.zig");
+    _ = @import("hy4_reply.zig");
+    _ = @import("hy4_reply_test.zig");
     _ = @import("reply_incremental_test.zig");
     _ = @import("recipient_reply_test.zig");
     _ = @import("recipient_cut_test.zig");
