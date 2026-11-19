@@ -214,3 +214,40 @@ test "Hy4 pictures: the position grid's resampling taps and patch order" {
     try std.testing.expectEqualSlices(f32, &.{ 0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21 }, pt[0..12]);
     try std.testing.expectEqualSlices(f32, &.{ 2, 3, 6, 7 }, pt[12..16]);
 }
+
+pub const reply = @import("reply.zig");
+
+test "Hy4 reply: thinking and tool calls become the GLM forms, whole and streamed" {
+    const a = std.testing.allocator;
+    const hy = "Need the tool.</think:opensource><tool_calls:opensource><tool_call:opensource>weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource></tool_call:opensource><tool_call:opensource>time<arg_key:opensource>tz</arg_key:opensource><arg_value:opensource>\"CET\"</arg_value:opensource></tool_call:opensource></tool_calls:opensource>";
+    const glm = "Need the tool.</think><tool_call>weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>time<arg_key>tz</arg_key><arg_value>\"CET\"</arg_value></tool_call>";
+    const whole = try reply.toGlm(a, hy);
+    defer a.free(whole);
+    try std.testing.expectEqualStrings(glm, whole);
+    // every split point, including inside tags, gives the same text
+    for (1..hy.len) |cut| {
+        var s: reply.Stream = .{};
+        defer s.deinit(a);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try s.feed(a, hy[0..cut], &out);
+        try s.feed(a, hy[cut..], &out);
+        try s.finish(a, &out);
+        try std.testing.expectEqualStrings(glm, out.items);
+    }
+    // text that only looks like a tag's start stays text; GLM's own tags pass through
+    const plain = try reply.toGlm(a, "a < b <think> <tool_call:x>");
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("a < b <think> <tool_call:x>", plain);
+    var s: reply.Stream = .{};
+    defer s.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try s.feed(a, "x <arg_ke", &out);
+    try std.testing.expectEqualStrings("x ", out.items);
+    try s.finish(a, &out);
+    try std.testing.expectEqualStrings("x <arg_ke", out.items);
+    try std.testing.expectEqualStrings("high", reply.reasoningEffort(null));
+    try std.testing.expectEqualStrings("high", reply.reasoningEffort(true));
+    try std.testing.expectEqualStrings("no_think", reply.reasoningEffort(false));
+}
