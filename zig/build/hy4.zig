@@ -13,3 +13,12 @@ pub fn wire(b: *std.Build, parent: ?*std.Build.Step) void {
     step.dependOn(&b.addRunArtifact(tests).step);
     if (parent) |p| p.dependOn(step);
 }
+
+/// `test-hy4-cuda-host`: the CUDA loader's host tests (layouts, weight descriptors) over the CUDA runtime and core
+/// modules, without a GPU; under `all` (test-cuda-host).
+pub fn cudaHost(b: *std.Build, cuda: *std.Build.Module, core: *std.Build.Module, all: *std.Build.Step) void {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/hy4/cuda.zig"), .target = b.graph.host, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
+    const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
+    b.step("test-hy4-cuda-host", "Hy4 CUDA loader: arena layout and EXL3 weight descriptors from the pack plan, no GPU").dependOn(&run.step);
+    all.dependOn(&run.step);
+}

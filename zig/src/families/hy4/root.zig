@@ -653,3 +653,136 @@ test "Hy4 vision reference: the release's 27-layer tower read from the pack (HY4
     std.debug.print("vision (release weights) worst relative error {e}\n", .{worst});
     try std.testing.expect(worst <= 2e-3);
 }
+
+pub const load_plan = @import("load_plan.zig");
+
+fn smallConfig(a: std.mem.Allocator) !config.Config {
+    var c = try config.Config.parse(a, fixture);
+    c.text.layers = 3;
+    c.text.experts = 8;
+    c.text.engram_len = 1;
+    return c;
+}
+
+test "Hy4 load plan: three layers of the real headers, EXL3 groups as the trellis kernels take them, placed and summed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try smallConfig(a);
+    var h = try load_plan.JsonHeaders.parse(a, @embedFile("fixtures/pack_headers.json"));
+    var problem: load_plan.Problem = .{};
+    const p = load_plan.build(a, &c, h.source(), h.source(), .{}, &problem) catch |e| {
+        std.debug.print("{s}: {s}\n", .{ problem.name, problem.what });
+        return e;
+    };
+    // layer 0's projections are plain bf16, layers 1-2 EXL3: lm_head, 3 attention groups and the shared expert's
+    // 3 each, and 8 experts x 3
+    try std.testing.expectEqual(@as(usize, 1 + 2 * (3 + 3 + 24)), p.exl3_groups);
+    try std.testing.expectEqual(@as(usize, 3), p.widths[16]); // 8 bits: lm_head and both shared experts' down_proj
+    try std.testing.expect(p.groupBytes(.routed_experts) > 0 and p.groupBytes(.vision) == 933_258_720);
+    try std.testing.expectEqual(@as(u64, 164_994_380 * 96 + 164_994_380 * 2), p.nvme_bytes);
+    for (p.entries) |e| if (std.mem.eql(u8, e.name, "model.layers.1.mlp.experts.0.gate_proj")) {
+        try std.testing.expectEqual(load_plan.Exl3{ .k = 1536, .n = 1536, .halves = 10 }, e.exl3.?);
+    };
+    for (p.entries) |e| if (std.mem.eql(u8, e.name, "model.layers.0.self_attn.q_b_proj.weight")) {
+        try std.testing.expectEqual(@as(?load_plan.Dtype, .BF16), e.dtype);
+    };
+    const text_only = try load_plan.build(a, &c, h.source(), null, .{ .vision = false }, &problem);
+    for (text_only.entries) |e| try std.testing.expect(e.group != .vision and e.place == .gpu);
+}
+
+test "Hy4 load plan: a group without its marker, a wrong width and a mis-shaped router are refused by name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try smallConfig(a);
+    var problem: load_plan.Problem = .{};
+    {
+        var h = try load_plan.JsonHeaders.parse(a, @embedFile("fixtures/pack_headers.json"));
+        _ = h.map.orderedRemove("model.layers.2.self_attn.o_proj.mul1");
+        try std.testing.expectError(error.BadExl3, load_plan.build(a, &c, h.source(), null, .{}, &problem));
+        try std.testing.expectEqualStrings("model.layers.2.self_attn.o_proj", problem.name);
+    }
+    {
+        var h = try load_plan.JsonHeaders.parse(a, @embedFile("fixtures/pack_headers.json"));
+        var cc = c;
+        cc.text.latent = 1024;
+        try std.testing.expectError(error.BadPack, load_plan.build(a, &cc, h.source(), null, .{}, &problem));
+    }
+    {
+        var h = try load_plan.JsonHeaders.parse(a, @embedFile("fixtures/pack_headers.json"));
+        var cc = c;
+        cc.text.experts = 7;
+        try std.testing.expectError(error.BadPack, load_plan.build(a, &cc, h.source(), null, .{}, &problem));
+        try std.testing.expectEqualStrings("model.layers.1.mlp.gate.weight", problem.name);
+    }
+}
+
+test "Hy4 load plan: the whole pack (HY4_PACK_DIR or HY4_HEADERS, on demand)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const c = try config.Config.parse(a, fixture);
+    var problem: load_plan.Problem = .{};
+    var side_pack: pack_read.Pack = undefined;
+    var main_pack: pack_read.Pack = undefined;
+    var json: load_plan.JsonHeaders = undefined;
+    var src: load_plan.Source = undefined;
+    var side: load_plan.Source = undefined;
+    if (std.testing.environ.getPosix("HY4_PACK_DIR")) |dir| {
+        main_pack = try pack_read.Pack.open(a, io, dir, "model.safetensors.index.json");
+        side_pack = try pack_read.Pack.open(a, io, dir, "engram.safetensors.index.json");
+        src = load_plan.Source.ofPack(&main_pack);
+        side = load_plan.Source.ofPack(&side_pack);
+    } else if (std.testing.environ.getPosix("HY4_HEADERS")) |path| {
+        json = try load_plan.JsonHeaders.parse(a, try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 28)));
+        src = json.source();
+        side = json.source();
+    } else return error.SkipZigTest;
+    const p = load_plan.build(a, &c, src, side, .{ .draft = true }, &problem) catch |e| {
+        std.debug.print("{s}: {s}\n", .{ problem.name, problem.what });
+        return e;
+    };
+    std.debug.print("plan: {d} entries, {d} EXL3 groups, GPU {d} bytes, NVMe {d} bytes\n", .{ p.entries.len, p.exl3_groups, p.gpu_bytes, p.nvme_bytes });
+    for (std.enums.values(load_plan.Group)) |g| std.debug.print("  {s}: {d}\n", .{ @tagName(g), p.groupBytes(g) });
+    for (p.widths, 0..) |n, w| if (n > 0) std.debug.print("  {d} groups at {d}/2 bits\n", .{ n, w });
+    try std.testing.expectEqual(@as(usize, 63253), p.exl3_groups);
+    // every byte both indexes' total_size counts is planned (99 754 676 490 + 64 680 628 768), EXL3 sizes from shapes
+    try std.testing.expectEqual(@as(u64, 164_435_305_258), p.gpu_bytes + p.nvme_bytes);
+    const l = try device_layout.build(a, &c, &p);
+    std.debug.print("device arena: {d} bytes over {d} slots, {d} layers\n", .{ l.total, l.slots.len, l.layers.len });
+    try std.testing.expectEqual(@as(usize, 42), l.layers.len);
+}
+
+pub const device_layout = @import("device_layout.zig");
+
+test "Hy4 device layout: aligned parts, every layer's slots, experts in stride, sized from the plan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try smallConfig(a);
+    var h = try load_plan.JsonHeaders.parse(a, @embedFile("fixtures/pack_headers.json"));
+    var problem: load_plan.Problem = .{};
+    const p = try load_plan.build(a, &c, h.source(), h.source(), .{}, &problem);
+    const l = try device_layout.build(a, &c, &p);
+    var sum: u64 = 0;
+    var last_end: u64 = 0;
+    for (l.slots) |s| for (s.parts) |part| {
+        if (part.bytes == 0) continue;
+        try std.testing.expect(part.offset % device_layout.alignment == 0 and part.offset >= last_end);
+        last_end = part.offset + part.bytes;
+        sum += part.bytes;
+    };
+    try std.testing.expectEqual(p.gpu_bytes, sum + 4 * p.exl3_groups); // mul1 markers stay on the host
+    try std.testing.expect(l.total >= last_end and l.total - last_end < device_layout.alignment);
+    // layer 0: dense, plain bf16 projections; layer 1: sparse with an Engram; layer 2: sparse, sliding
+    try std.testing.expect(l.layers[0].mlp_gate != device_layout.none and l.slots[l.layers[0].q_b].exl3 == null);
+    try std.testing.expect(l.layers[1].engram and l.layers[1].indexer[0] != device_layout.none);
+    try std.testing.expect(!l.layers[2].engram and l.layers[2].indexer[0] == device_layout.none);
+    const e1 = l.slots[l.layers[1].experts + 3 * 7 + 2].exl3.?; // expert 7's down_proj
+    try std.testing.expectEqual(@as(u32, 1536), e1.k);
+    const st = device_layout.storedStrides(l.slots[l.layers[2].o].exl3.?);
+    try std.testing.expectEqual(@as(u64, (3072 / 16) * 12 * 4), st.k);
+    try std.testing.expect(device_layout.fits(&l, l.total + 1, 1) and !device_layout.fits(&l, l.total, 1));
+}
