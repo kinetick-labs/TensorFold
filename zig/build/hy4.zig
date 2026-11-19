@@ -6,9 +6,10 @@ const std = @import("std");
 /// `test-hy4-host` under `parent`.
 pub fn wire(b: *std.Build, parent: ?*std.Build.Step) void {
     const resample = b.createModule(.{ .root_source_file = b.path("zig/src/core/picture/resample.zig"), .target = b.graph.host });
-    const root = b.createModule(.{ .root_source_file = b.path("zig/src/families/hy4/root.zig"), .target = b.graph.host, .imports = &.{.{ .name = "picture_resample", .module = resample }} });
+    const act_ref = b.createModule(.{ .root_source_file = b.path("zig/src/core/act_ref.zig"), .target = b.graph.host });
+    const root = b.createModule(.{ .root_source_file = b.path("zig/src/families/hy4/root.zig"), .target = b.graph.host, .imports = &.{ .{ .name = "picture_resample", .module = resample }, .{ .name = "act_ref", .module = act_ref } } });
     const tests = b.addTest(.{ .root_module = root });
-    const step = b.step("test-hy4-host", "Hy4-flash config, Engram hashes, pictures, reply markup and the layer reference against transformers");
+    const step = b.step("test-hy4-host", "Hy4-flash config, Engram hashes, pictures, reply markup, the layer, Engram and vision references against transformers");
     step.dependOn(&b.addRunArtifact(tests).step);
     if (parent) |p| p.dependOn(step);
 }

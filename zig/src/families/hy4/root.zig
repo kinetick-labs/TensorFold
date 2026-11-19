@@ -577,3 +577,79 @@ test "Hy4 Engram reference: windows, hash rows, FP8 reads and the gated residual
     if (worst > 2e-4) std.debug.print("engram layer worst relative error {e}\n", .{worst});
     try std.testing.expect(worst <= 2e-4);
 }
+
+pub const vision_ref = @import("vision_ref.zig");
+pub const pack_read = @import("pack_read.zig");
+
+fn visionWeights(a: std.mem.Allocator, ctx: anytype, get: fn (@TypeOf(ctx), std.mem.Allocator, []const u8) anyerror![]f32, layers: usize) !vision_ref.Weights {
+    const blocks = try a.alloc(vision_ref.Block, layers);
+    for (blocks, 0..) |*b, i| {
+        const n = try vision_ref.blockNames(a, i);
+        var s: [16][]f32 = undefined;
+        for (&s, n) |*o, name| o.* = try get(ctx, a, name);
+        b.* = .{ .norm1_w = s[0], .norm1_b = s[1], .q_w = s[2], .q_b = s[3], .k_w = s[4], .k_b = s[5], .v_w = s[6], .v_b = s[7], .o_w = s[8], .o_b = s[9], .norm2_w = s[10], .norm2_b = s[11], .fc1_w = s[12], .fc1_b = s[13], .fc2_w = s[14], .fc2_b = s[15] };
+    }
+    return .{
+        .patch_w = try get(ctx, a, "vit.embeddings.patch_embedding.weight"),
+        .patch_b = try get(ctx, a, "vit.embeddings.patch_embedding.bias"),
+        .positions = try get(ctx, a, "vit.embeddings.position_embedding.weight"),
+        .blocks = blocks,
+        .merge_norm = try get(ctx, a, "vit.perceive.norm.weight"),
+        .conv_w = try get(ctx, a, "vit.perceive.proj.0.weight"),
+        .conv_b = try get(ctx, a, "vit.perceive.proj.0.bias"),
+        .out_w = try get(ctx, a, "vit.perceive.proj.2.weight"),
+        .out_b = try get(ctx, a, "vit.perceive.proj.2.bias"),
+        .newline = try get(ctx, a, "vit.perceive.image_newline"),
+    };
+}
+
+fn visionCheck(a: std.mem.Allocator, d: *const vision_ref.Dims, w: *const vision_ref.Weights, st: *const Tensors) !f32 {
+    const grid_v = try st.i32s(a, "grid");
+    const grids = try a.alloc(image_grid.Grid, grid_v.len / 3);
+    for (grids, 0..) |*g, i| g.* = .{ .h = @intCast(grid_v[3 * i + 1]), .w = @intCast(grid_v[3 * i + 2]) };
+    const got = try vision_ref.forward(a, d, w, try st.f32s(a, "pixels"), grids);
+    const want = try st.f32s(a, "features");
+    try std.testing.expectEqual(want.len, got.len);
+    var worst: f32 = 0;
+    for (got, want) |g, x| worst = @max(worst, @abs(g - x) / @max(1.0, @abs(x)));
+    return worst;
+}
+
+test "Hy4 vision reference: a shrunken tower on two pictures matches HYV4VLVisionModel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const st = try Tensors.open(a, @embedFile("fixtures/vision.safetensors"));
+    const get = struct {
+        fn f(s: *const Tensors, al: std.mem.Allocator, name: []const u8) anyerror![]f32 {
+            return s.f32s(al, name);
+        }
+    }.f;
+    const w = try visionWeights(a, &st, get, 2);
+    const d: vision_ref.Dims = .{ .hidden = 32, .inter = 48, .heads = 4, .patch = 4, .out = 24, .edge = 8 };
+    const worst = try visionCheck(a, &d, &w, &st);
+    if (worst > 2e-4) std.debug.print("vision worst relative error {e}\n", .{worst});
+    try std.testing.expect(worst <= 2e-4);
+}
+
+test "Hy4 vision reference: the release's 27-layer tower read from the pack (HY4_PACK_DIR, on demand)" {
+    const dir = std.testing.environ.getPosix("HY4_PACK_DIR") orelse return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var p = try pack_read.Pack.open(a, std.testing.io, dir, "model.safetensors.index.json");
+    defer p.close();
+    const get = struct {
+        fn f(pk: *pack_read.Pack, al: std.mem.Allocator, name: []const u8) anyerror![]f32 {
+            return pk.f32s(al, name);
+        }
+    }.f;
+    const c = try config.Config.parse(a, fixture);
+    const v = c.vision.?;
+    const w = try visionWeights(a, &p, get, v.layers);
+    const d: vision_ref.Dims = .{ .hidden = v.hidden, .inter = v.width, .heads = v.heads, .patch = v.patch, .merge = v.merge, .out = v.out_hidden, .edge = v.max_image / v.patch, .eps = v.eps };
+    const st = try Tensors.open(a, @embedFile("fixtures/vision_real.safetensors"));
+    const worst = try visionCheck(a, &d, &w, &st);
+    std.debug.print("vision (release weights) worst relative error {e}\n", .{worst});
+    try std.testing.expect(worst <= 2e-3);
+}

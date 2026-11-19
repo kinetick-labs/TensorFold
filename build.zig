@@ -273,8 +273,9 @@ pub fn build(b: *std.Build) void {
     @import("zig/build/checkpoint_config.zig").wire(b);
     @import("zig/build/save_guard.zig").wire(b);
     @import("zig/build/cpu_contract.zig").steps(b, test_step);
-    @import("zig/build/bf16_round.zig").wire(b, test_step);
+    // before bf16_round, which hands its module to every module declared above it (act_ref needs it)
     @import("zig/build/hy4.zig").wire(b, test_step);
+    @import("zig/build/bf16_round.zig").wire(b, test_step);
     @import("zig/build/qwen35_layers.zig").wire(b, test_step);
     @import("zig/build/dev_tools.zig").wire(b, target);
     @import("zig/build/profile.zig").wire(b, test_step);
