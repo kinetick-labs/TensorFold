@@ -280,7 +280,7 @@ const Tensors = struct {
     }
 };
 
-test "Hy4 layer reference: an indexed and a sliding decoder layer match transformers" {
+test "Hy4 layer reference: indexed, sliding and MoE decoder layers match transformers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -294,7 +294,7 @@ test "Hy4 layer reference: an indexed and a sliding decoder layer match transfor
     sliding.heads = 3;
     sliding.theta = 1e4;
     sliding.window = 4;
-    for ([_]layer_ref.Dims{ indexed, sliding }, [_][]const u8{ "l0.", "l1." }) |d, pre| {
+    for ([_]layer_ref.Dims{ indexed, sliding, sliding }, [_][]const u8{ "l0.", "l1.", "l2." }) |d, pre| {
         const S = struct {
             st: *const Tensors,
             a: std.mem.Allocator,
@@ -309,7 +309,7 @@ test "Hy4 layer reference: an indexed and a sliding decoder layer match transfor
             .ffn_hc = .{ .fn_ = try s.get("ffn_hc.fn"), .base = try s.get("ffn_hc.base"), .scale = try s.get("ffn_hc.scale") },
             .input_norm = try s.get("input_layernorm.weight"),
             .post_attention_norm = try s.get("post_attention_layernorm.weight"),
-            .post_mlp_norm = try s.get("post_mlp_layernorm.weight"),
+            .post_mlp_norm = s.get("post_mlp_layernorm.weight") catch &.{},
             .q_a = try s.get("self_attn.q_a_proj.weight"),
             .q_a_norm = try s.get("self_attn.q_a_layernorm.weight"),
             .q_b = try s.get("self_attn.q_b_proj.weight"),
@@ -320,10 +320,31 @@ test "Hy4 layer reference: an indexed and a sliding decoder layer match transfor
             .o = try s.get("self_attn.o_proj.weight"),
             .post_proj_norm = try s.get("self_attn.post_proj_norm.weight"),
             .sinks = try s.get("self_attn.sinks"),
-            .mlp_gate = try s.get("mlp.gate_proj.weight"),
-            .mlp_up = try s.get("mlp.up_proj.weight"),
-            .mlp_down = try s.get("mlp.down_proj.weight"),
         };
+        if (s.get("mlp.gate.weight")) |router| {
+            w.moe = .{
+                .experts = 8,
+                .top = 3,
+                .latent = 16,
+                .width = 12,
+                .scale = 3.998,
+                .clamp = 10,
+                .router = router,
+                .bias = try s.get("mlp.gate.e_score_correction_bias"),
+                .pre = try s.get("mlp.pre_expert_proj.weight"),
+                .post = try s.get("mlp.post_expert_proj.weight"),
+                .gate_up = try s.get("mlp.experts.gate_up_proj"),
+                .down = try s.get("mlp.experts.down_proj"),
+                .shared_gate = try s.get("mlp.shared_experts.gate_proj.weight"),
+                .shared_up = try s.get("mlp.shared_experts.up_proj.weight"),
+                .shared_down = try s.get("mlp.shared_experts.down_proj.weight"),
+                .norm = try s.get("mlp.combine_output_norm.weight"),
+            };
+        } else |_| {
+            w.mlp_gate = try s.get("mlp.gate_proj.weight");
+            w.mlp_up = try s.get("mlp.up_proj.weight");
+            w.mlp_down = try s.get("mlp.down_proj.weight");
+        }
         if (d.index != null) w.index = .{
             .query = try s.get("self_attn.compressed_indexer.query_projection.weight"),
             .head_weight = try s.get("self_attn.compressed_indexer.head_weight_projection.weight"),

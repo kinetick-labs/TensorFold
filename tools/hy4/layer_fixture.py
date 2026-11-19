@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny Hy4-flash decoder layers through transformers' HYV4FlashDecoderLayer (PR #50903), saved for the CPU
 reference in zig/src/families/hy4/layer_ref.zig: an indexed layer whose context outgrows a shrunken index_topk (so
-the compressed indexer picks groups) and a sliding layer with a 4-token window, both with the dense MLP, on 3D
+the compressed indexer picks groups) a sliding layer with a 4-token window, both with the dense MLP, and a sliding layer with the latent MoE, on 3D
 positions that include a picture span. usage: layer_fixture.py BASE_CONFIG.json OUT.safetensors"""
 import json, sys
 import torch
@@ -16,15 +16,16 @@ for v in rope.values():
     v["mrope_section"] = [2, 2, 2]
 small = dict(base)
 small.update(
-    hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+    hidden_size=32, intermediate_size=48, num_hidden_layers=3, num_attention_heads=2, num_key_value_heads=2,
     swa_num_attention_heads=3, q_lora_rank=16, kv_lora_rank=8, qk_nope_head_dim=8, qk_rope_head_dim=12,
     v_head_dim=8, swa_qk_nope_head_dim=8, swa_qk_rope_head_dim=12, swa_v_head_dim=8, swa_qk_head_dim=20,
     qk_head_dim=20, head_dim=12, index_n_heads=2, index_head_dim=16, index_topk=8, index_kpool=4,
     compressed_indexer_num_attention_heads=2, compressed_indexer_head_dim=16, compressed_indexer_candidate_topk=8,
     compressed_indexer_compress_ratio=4, compressed_indexer_group_topk=2,
-    sliding_window=4, window_size=[3, 0], layer_types=["deepseek_sparse_attention", "sliding_attention"],
-    mlp_layer_types=["dense", "dense"], swa_pattern=[0, 1], engram_layer_ids=None, rope_parameters=rope,
-    n_routed_experts=4, num_experts_per_tok=2, first_k_dense_replace=2, indexer_types=["full", "full"],
+    sliding_window=4, window_size=[3, 0], layer_types=["deepseek_sparse_attention", "sliding_attention", "sliding_attention"],
+    mlp_layer_types=["dense", "dense", "sparse"], swa_pattern=[0, 1, 1], engram_layer_ids=None, rope_parameters=rope,
+    n_routed_experts=8, num_experts_per_tok=3, moe_intermediate_size=12, routed_expert_hidden_size=16,
+    first_k_dense_replace=2, indexer_types=["full", "full", "full"],
 )
 small = {k: v for k, v in small.items() if k not in ("architectures", "engram_layer_head_vocab_sizes", "model_type")}
 cfg = HYV4FlashTextConfig(**small)
@@ -47,6 +48,9 @@ for idx, kind in enumerate(cfg.layer_types):
     with torch.no_grad():
         for name, p in layer.named_parameters():
             p.copy_(torch.randn_like(p) * (0.3 if p.dim() > 1 else 0.5) + (1.0 if name.endswith("norm.weight") or name.endswith("layernorm.weight") else 0.0))
+        if hasattr(layer.mlp, "gate"):
+            layer.mlp.gate.e_score_correction_bias.copy_(torch.randn(cfg.n_routed_experts) * 0.2)
+            layer.mlp.experts.gate_up_proj.mul_(4.0)  # push some gates and ups past the swiglu clamp
     x = torch.randn(1, T, cfg.hc_mult, cfg.hidden_size)
     i = torch.arange(T)
     allowed = i[None, :] <= i[:, None]

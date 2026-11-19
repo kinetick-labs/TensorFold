@@ -170,9 +170,9 @@ pub const Config = struct {
         } else null;
         c.draft = try readDraft(top);
         const ids = .{
-            .{ "image_token", "image_token_id" },     .{ "image_start", "image_start_token_id" },
-            .{ "image_end", "image_end_token_id" },   .{ "image_newline", "image_newline_token_id" },
-            .{ "video_token", "video_token_id" },     .{ "video_start", "video_start_token_id" },
+            .{ "image_token", "image_token_id" },   .{ "image_start", "image_start_token_id" },
+            .{ "image_end", "image_end_token_id" }, .{ "image_newline", "image_newline_token_id" },
+            .{ "video_token", "video_token_id" },   .{ "video_start", "video_start_token_id" },
             .{ "video_end", "video_end_token_id" },
         };
         inline for (ids) |p| if (top.get(p[1])) |v| {
@@ -220,20 +220,19 @@ pub const Config = struct {
 fn readText(t: *Text, o: std.json.ObjectMap) !void {
     if (o.get("model_type")) |v| if (v != .string or !std.mem.eql(u8, v.string, "hy_v4_flash")) return error.UnsupportedArchitecture;
     const ints = .{
-        .{ "vocab", "vocab_size" },                   .{ "hidden", "hidden_size" },
-        .{ "layers", "num_hidden_layers" },           .{ "dense_width", "intermediate_size" },
-        .{ "q_lora", "q_lora_rank" },                 .{ "kv_lora", "kv_lora_rank" },
-        .{ "window", "sliding_window" },              .{ "experts", "n_routed_experts" },
-        .{ "shared_experts", "n_shared_experts" },    .{ "topk", "num_experts_per_tok" },
-        .{ "expert_width", "moe_intermediate_size" }, .{ "latent", "routed_expert_hidden_size" },
-        .{ "index_heads", "index_n_heads" },          .{ "index_dim", "index_head_dim" },
-        .{ "index_topk", "index_topk" },              .{ "index_pool", "index_kpool" },
-        .{ "index_pool", "compressed_indexer_compress_ratio" },
-        .{ "hc_mult", "hc_mult" },                    .{ "engram_max_ngram", "engram_max_ngram_size" },
-        .{ "engram_heads", "engram_n_head_per_ngram" }, .{ "engram_width", "engram_n_embed_per_ngram" },
-        .{ "engram_pad", "engram_pad_id" },           .{ "engram_seed", "engram_seed" },
-        .{ "engram_map_size", "engram_lookup_table_size" },
-        .{ "bos", "bos_token_id" },                   .{ "eos", "eos_token_id" },
+        .{ "vocab", "vocab_size" },                             .{ "hidden", "hidden_size" },
+        .{ "layers", "num_hidden_layers" },                     .{ "dense_width", "intermediate_size" },
+        .{ "q_lora", "q_lora_rank" },                           .{ "kv_lora", "kv_lora_rank" },
+        .{ "window", "sliding_window" },                        .{ "experts", "n_routed_experts" },
+        .{ "shared_experts", "n_shared_experts" },              .{ "topk", "num_experts_per_tok" },
+        .{ "expert_width", "moe_intermediate_size" },           .{ "latent", "routed_expert_hidden_size" },
+        .{ "index_heads", "index_n_heads" },                    .{ "index_dim", "index_head_dim" },
+        .{ "index_topk", "index_topk" },                        .{ "index_pool", "index_kpool" },
+        .{ "index_pool", "compressed_indexer_compress_ratio" }, .{ "hc_mult", "hc_mult" },
+        .{ "engram_max_ngram", "engram_max_ngram_size" },       .{ "engram_heads", "engram_n_head_per_ngram" },
+        .{ "engram_width", "engram_n_embed_per_ngram" },        .{ "engram_pad", "engram_pad_id" },
+        .{ "engram_seed", "engram_seed" },                      .{ "engram_map_size", "engram_lookup_table_size" },
+        .{ "bos", "bos_token_id" },                             .{ "eos", "eos_token_id" },
         .{ "pad", "pad_token_id" },
     };
     inline for (ints) |p| if (o.get(p[1])) |v| {
@@ -348,9 +347,9 @@ fn readEngram(t: *Text, o: std.json.ObjectMap) !void {
 fn readVision(o: std.json.ObjectMap) !Vision {
     var v: Vision = .{};
     const ints = .{
-        .{ "layers", "num_hidden_layers" }, .{ "hidden", "hidden_size" },         .{ "width", "intermediate_size" },
-        .{ "heads", "num_attention_heads" }, .{ "patch", "patch_size" },          .{ "merge", "spatial_merge_size" },
-        .{ "channels", "num_channels" },    .{ "out_hidden", "out_hidden_size" }, .{ "max_image", "max_image_size" },
+        .{ "layers", "num_hidden_layers" },  .{ "hidden", "hidden_size" },         .{ "width", "intermediate_size" },
+        .{ "heads", "num_attention_heads" }, .{ "patch", "patch_size" },           .{ "merge", "spatial_merge_size" },
+        .{ "channels", "num_channels" },     .{ "out_hidden", "out_hidden_size" }, .{ "max_image", "max_image_size" },
         .{ "min_image", "min_image_size" },
     };
     inline for (ints) |p| if (o.get(p[1])) |x| {

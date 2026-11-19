@@ -1,5 +1,5 @@
 //! A plain f32 CPU reference of one Hy4-flash decoder layer (transformers HYV4FlashDecoderLayer, PR #50903) with
-//! the dense MLP: hyper-connection mixing (sigmoid, no Sinkhorn), gated MLA with learned sinks, interleaved 3D M-RoPE,
+//! the dense MLP or the latent MoE: hyper-connection mixing (sigmoid, no Sinkhorn), gated MLA with learned sinks, interleaved 3D M-RoPE,
 //! a sliding window or the compressed indexer's group recall, and the sandwich norms. It is the oracle the CUDA kernels
 //! are checked against, not a fast path: every token is recomputed and nothing is cached.
 
@@ -48,6 +48,28 @@ pub const IndexWeights = struct {
     ape: []const f32, // [kpool, dim]
 };
 
+/// The latent MoE (`mlp_layer_types` "sparse"): sigmoid router with a choice-only bias, the top `top` experts
+/// renormalized and scaled, SwiGLU experts on the latent width with clamped gate and up, plus the shared expert on the
+/// full width, closed by `combine_output_norm`.
+pub const Moe = struct {
+    experts: u32,
+    top: u32,
+    latent: u32,
+    width: u32, // per-expert and shared intermediate size
+    scale: f32,
+    clamp: f32,
+    router: []const f32, // [experts, hidden]
+    bias: []const f32, // [experts]
+    pre: []const f32, // [latent, hidden]
+    post: []const f32, // [hidden, latent]
+    gate_up: []const f32, // [experts, 2 * width, latent]
+    down: []const f32, // [experts, latent, width]
+    shared_gate: []const f32, // [width, hidden]
+    shared_up: []const f32,
+    shared_down: []const f32, // [hidden, width]
+    norm: []const f32,
+};
+
 pub const Weights = struct {
     attn_hc: Hc,
     ffn_hc: Hc,
@@ -64,9 +86,11 @@ pub const Weights = struct {
     o: []const f32,
     post_proj_norm: []const f32,
     sinks: []const f32,
-    mlp_gate: []const f32,
-    mlp_up: []const f32,
-    mlp_down: []const f32,
+    // the dense MLP, or `moe` (then `post_mlp_norm` is unused: the block closes with its own norm)
+    mlp_gate: []const f32 = &.{},
+    mlp_up: []const f32 = &.{},
+    mlp_down: []const f32 = &.{},
+    moe: ?Moe = null,
     index: ?IndexWeights = null,
 };
 
@@ -329,6 +353,10 @@ pub fn forward(a: Allocator, d: *const Dims, w: *const Weights, positions: []con
         hyper(d, w.ffn_hc, streams[i * n * H ..][0 .. n * H], post[i * n ..][0..n], mixed);
         const xi = x[i * H ..][0..H];
         rmsNorm(xi, mixed, w.post_attention_norm, d.eps);
+        if (w.moe) |*m| {
+            try moe(a, d, m, xi, y[i * H ..][0..H]);
+            continue;
+        }
         linear(gt, w.mlp_gate, xi);
         linear(up, w.mlp_up, xi);
         for (gt, up) |*g, u| g.* = silu(g.*) * u;
@@ -336,6 +364,55 @@ pub fn forward(a: Allocator, d: *const Dims, w: *const Weights, positions: []con
         rmsNorm(y[i * H ..][0..H], mixed, w.post_mlp_norm, d.eps);
     }
     residual(d, streams, post, y, t);
+}
+
+fn moe(a: Allocator, d: *const Dims, m: *const Moe, x: []const f32, out: []f32) !void {
+    const scores = try a.alloc(f32, m.experts);
+    defer a.free(scores);
+    linear(scores, m.router, x);
+    for (scores) |*e| e.* = sigmoid(e.*);
+    var chosen: [64]u32 = undefined;
+    var taken: [1024]bool = @splat(false);
+    std.debug.assert(m.top <= chosen.len and m.experts <= taken.len);
+    var total: f32 = 0;
+    for (chosen[0..m.top]) |*c| {
+        var best: u32 = 0;
+        var top = -std.math.inf(f32);
+        for (0..m.experts) |e| if (!taken[e] and scores[e] + m.bias[e] > top) {
+            top = scores[e] + m.bias[e];
+            best = @intCast(e);
+        };
+        taken[best] = true;
+        c.* = best;
+        total += scores[best];
+    }
+    const latent = try a.alloc(f32, m.latent);
+    defer a.free(latent);
+    const acc = try a.alloc(f32, m.latent);
+    defer a.free(acc);
+    const gu = try a.alloc(f32, 2 * m.width);
+    defer a.free(gu);
+    const back = try a.alloc(f32, m.latent);
+    defer a.free(back);
+    linear(latent, m.pre, x);
+    @memset(acc, 0);
+    for (chosen[0..m.top]) |e| {
+        const weight = scores[e] / (total + 1e-20) * m.scale;
+        linear(gu, m.gate_up[e * 2 * m.width * m.latent ..][0 .. 2 * m.width * m.latent], latent);
+        for (gu[0..m.width], gu[m.width..]) |*g, u| g.* = silu(@min(g.*, m.clamp)) * std.math.clamp(u, -m.clamp, m.clamp);
+        linear(back, m.down[e * m.latent * m.width ..][0 .. m.latent * m.width], gu[0..m.width]);
+        for (acc, back) |*o, b| o.* += b * weight;
+    }
+    const sum = try a.alloc(f32, d.hidden);
+    defer a.free(sum);
+    linear(sum, m.post, acc);
+    linear(gu[0..m.width], m.shared_gate, x);
+    linear(gu[m.width..], m.shared_up, x);
+    for (gu[0..m.width], gu[m.width..]) |*g, u| g.* = silu(g.*) * u;
+    linear(out, m.shared_down, gu[0..m.width]);
+    for (sum, out) |s, *o| o.* += s;
+    @memcpy(sum, out);
+    rmsNorm(out, sum, m.norm, d.eps);
 }
 
 /// `streams[s] += post[s] * y` per token.
