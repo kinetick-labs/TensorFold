@@ -81,7 +81,9 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | tensor name map + REXL3 pack index reader, tested on the pack's headers (range reads) | no | blocked on gated access |
 | chat template render vs jinja2 (text, pictures, tools, reasoning modes) | no | done |
 | picture resize: core/picture/resample.zig `.torch` kind (torchvision antialiased bicubic) + normalize/patchify glue | no | next |
-| CPU reference forward for 1 layer on tiny random weights (iHC, gated MLA, sinks, SWA, indexer pooling) | no | next |
+| CPU reference of one decoder layer vs transformers (iHC, gated MLA + sinks + gate, M-RoPE, sliding window, compressed indexer group recall, dense MLP): `layer_ref.zig`, fixture from tools/hy4/layer_fixture.py | no | done |
+| reply markup onto the GLM tool/thinking parser, reasoning_effort mapping (thinking on/unsaid -> high, off -> no_think) | no | done (`reply.zig`); server wiring next |
+| CPU reference of the MoE block (sigmoid router + bias, top-16, latent pre/post projections, shared expert, clamp) and the Engram block | no | next |
 | CUDA kernels: iHC, pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | |
 | ViT tower + merger vs transformers on CPU (layers extracted from the base repo) | short | |
 | full model load and first tokens | yes, GLM stopped | needs a window |

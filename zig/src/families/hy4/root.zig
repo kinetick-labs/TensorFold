@@ -251,3 +251,95 @@ test "Hy4 reply: thinking and tool calls become the GLM forms, whole and streame
     try std.testing.expectEqualStrings("high", reply.reasoningEffort(true));
     try std.testing.expectEqualStrings("no_think", reply.reasoningEffort(false));
 }
+
+pub const layer_ref = @import("layer_ref.zig");
+
+/// The f32 tensors of a small safetensors file, by name (the header's offsets into the bytes after it).
+const Tensors = struct {
+    bytes: []const u8,
+    header: std.json.Parsed(std.json.Value),
+
+    fn open(a: std.mem.Allocator, bytes: []const u8) !Tensors {
+        const n = std.mem.readInt(u64, bytes[0..8], .little);
+        return .{ .bytes = bytes[8 + n ..], .header = try std.json.parseFromSlice(std.json.Value, a, bytes[8..][0..n], .{}) };
+    }
+
+    fn f32s(t: *const Tensors, a: std.mem.Allocator, name: []const u8) ![]f32 {
+        const m = t.header.value.object.get(name) orelse return error.MissingTensor;
+        const off = m.object.get("data_offsets").?.array.items;
+        const lo: usize = @intCast(off[0].integer);
+        const hi: usize = @intCast(off[1].integer);
+        const out = try a.alloc(f32, (hi - lo) / 4);
+        for (out, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u32, t.bytes[lo + 4 * i ..][0..4], .little));
+        return out;
+    }
+
+    fn i32s(t: *const Tensors, a: std.mem.Allocator, name: []const u8) ![]i32 {
+        const f = try t.f32s(a, name);
+        return @ptrCast(f);
+    }
+};
+
+test "Hy4 layer reference: an indexed and a sliding decoder layer match transformers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const st = try Tensors.open(a, @embedFile("fixtures/layers.safetensors"));
+    const positions = try st.i32s(a, "positions");
+    const t = positions.len / 3;
+    const shared: layer_ref.Dims = .{ .hidden = 32, .hc = 4, .heads = 2, .nope = 8, .rope = 12, .v = 8, .q_lora = 16, .kv_lora = 8, .inter = 48, .eps = 1e-5, .hc_eps = 1e-6, .hc_magnitude = 2.0, .theta = 1e7, .sections = .{ 2, 2, 2 } };
+    var indexed = shared;
+    indexed.index = .{ .heads = 2, .dim = 16, .kpool = 4, .topk = 8 };
+    var sliding = shared;
+    sliding.heads = 3;
+    sliding.theta = 1e4;
+    sliding.window = 4;
+    for ([_]layer_ref.Dims{ indexed, sliding }, [_][]const u8{ "l0.", "l1." }) |d, pre| {
+        const S = struct {
+            st: *const Tensors,
+            a: std.mem.Allocator,
+            pre: []const u8,
+            fn get(s: @This(), name: []const u8) ![]f32 {
+                return s.st.f32s(s.a, try std.mem.concat(s.a, u8, &.{ s.pre, name }));
+            }
+        };
+        const s: S = .{ .st = &st, .a = a, .pre = pre };
+        var w: layer_ref.Weights = .{
+            .attn_hc = .{ .fn_ = try s.get("attn_hc.fn"), .base = try s.get("attn_hc.base"), .scale = try s.get("attn_hc.scale") },
+            .ffn_hc = .{ .fn_ = try s.get("ffn_hc.fn"), .base = try s.get("ffn_hc.base"), .scale = try s.get("ffn_hc.scale") },
+            .input_norm = try s.get("input_layernorm.weight"),
+            .post_attention_norm = try s.get("post_attention_layernorm.weight"),
+            .post_mlp_norm = try s.get("post_mlp_layernorm.weight"),
+            .q_a = try s.get("self_attn.q_a_proj.weight"),
+            .q_a_norm = try s.get("self_attn.q_a_layernorm.weight"),
+            .q_b = try s.get("self_attn.q_b_proj.weight"),
+            .kv_a = try s.get("self_attn.kv_a_proj_with_mqa.weight"),
+            .kv_a_norm = try s.get("self_attn.kv_a_layernorm.weight"),
+            .kv_b = try s.get("self_attn.kv_b_proj.weight"),
+            .gate = try s.get("self_attn.gate_proj.weight"),
+            .o = try s.get("self_attn.o_proj.weight"),
+            .post_proj_norm = try s.get("self_attn.post_proj_norm.weight"),
+            .sinks = try s.get("self_attn.sinks"),
+            .mlp_gate = try s.get("mlp.gate_proj.weight"),
+            .mlp_up = try s.get("mlp.up_proj.weight"),
+            .mlp_down = try s.get("mlp.down_proj.weight"),
+        };
+        if (d.index != null) w.index = .{
+            .query = try s.get("self_attn.compressed_indexer.query_projection.weight"),
+            .head_weight = try s.get("self_attn.compressed_indexer.head_weight_projection.weight"),
+            .token_key = try s.get("self_attn.compressed_indexer.token_key_projection.weight"),
+            .token_key_norm = try s.get("self_attn.compressed_indexer.token_key_norm.weight"),
+            .key_value = try s.get("self_attn.compressed_indexer.key_value_projection.weight"),
+            .key_gate = try s.get("self_attn.compressed_indexer.key_gate_projection.weight"),
+            .key_norm = try s.get("self_attn.compressed_indexer.key_norm.weight"),
+            .ape = try s.get("self_attn.compressed_indexer.intra_group_ape"),
+        };
+        const streams = try s.get("in");
+        const want = try s.get("out");
+        try layer_ref.forward(a, &d, &w, positions, t, streams);
+        var worst: f32 = 0;
+        for (streams, want) |g, e| worst = @max(worst, @abs(g - e) / @max(1.0, @abs(e)));
+        if (worst > 2e-4) std.debug.print("{s} worst relative error {e}\n", .{ pre, worst });
+        try std.testing.expect(worst <= 2e-4);
+    }
+}
