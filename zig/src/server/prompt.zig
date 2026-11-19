@@ -48,6 +48,19 @@ test "thinking off asks GLM-5.3's template for Low effort, and leaves other temp
     try std.testing.expect(offEffort("Reasoning: {{ reasoning_effort }}") == null);
 }
 
+/// Hy4's template takes only `high` or `no_think` and raises on anything else, so thinking on asks for `high` and off for `no_think`, whatever effort the request named.
+pub fn hy4Effort(source: []const u8, thinking: bool) ?[]const u8 {
+    if (std.mem.indexOf(u8, source, "should be no_think/high") == null) return null;
+    return if (thinking) "high" else "no_think";
+}
+
+test "Hy4's template hears high with thinking on and no_think with it off, and other templates are left alone" {
+    const hy4 = "{%- elif reasoning_effort not in ['no_think', 'high'] %}{{- raise_exception('reasoning_effort error : ' + reasoning_effort + ', should be no_think/high') }}";
+    try std.testing.expectEqualStrings("high", hy4Effort(hy4, true).?);
+    try std.testing.expectEqualStrings("no_think", hy4Effort(hy4, false).?);
+    try std.testing.expect(hy4Effort("Reasoning: {{ reasoning_effort }}", true) == null);
+}
+
 pub fn renderRequest(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, require_off: bool) errors.Refused![]const u32 {
     return renderStarts(srv, cx, messages, tools, thinking, effort, generation, require_off, null);
 }
@@ -64,7 +77,7 @@ pub fn renderStarts(srv: *Server, cx: *Cx, messages: Value, tools: []const Value
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
         .add_generation_prompt = generation,
         .enable_thinking = thinking,
-        .reasoning_effort = if (thinking) effort else cx.named_effort orelse srv.off_effort orelse offEffort(srv.text.templateSource()), // off: an effort the request named, else the template's off default
+        .reasoning_effort = hy4Effort(srv.text.templateSource(), thinking) orelse if (thinking) effort else cx.named_effort orelse srv.off_effort orelse offEffort(srv.text.templateSource()), // off: an effort the request named, else the template's off default
         .clear_thinking = cx.clear_thinking,
         .tool_choice = cx.template_fields.get("tool_choice"),
         .response_format = cx.template_fields.get("response_format"),
