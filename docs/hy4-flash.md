@@ -65,8 +65,10 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 6. Latent MoE with 512 experts / top-16 and the shared expert, REXL3 grouped matmul.
 7. Vision: tower on `cuda/vit.zig` (exact GELU, LayerNorm bias, learned grid resample), the 2x2 conv merger and
    newline column; preprocessor (smart resize + bicubic + patchify: grid math done, bicubic to port).
-8. Chat: the template uses `str.format` and `namespace`; `reasoning_effort` must be `high` or `no_think` (the
-   template raises otherwise), so the server maps thinking on/off to those; `hy_v4` tool/reasoning parser.
+8. Chat: the template uses `str.format` (now in the engine) and `namespace`; it renders byte-identical to jinja2
+   (tools/hy4/template_parity.py + zig/src/core/template/hy4_parity_test.zig). `reasoning_effort` must be `high` or
+   `no_think` (the template raises otherwise), so the server must map thinking on/off to those; `hy_v4` tool/reasoning
+   parser still to write.
 9. DFly2 drafter (later; serve without speculation first).
 
 ## Plan
@@ -77,7 +79,8 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | Engram hash ids vs reference | no | done |
 | picture grid: smart resize, token count, 3D positions, position-grid taps (vs torch), patch order | no | done |
 | tensor name map + REXL3 pack index reader, tested on the pack's headers (range reads) | no | blocked on gated access |
-| bicubic resize vs PIL, chat template render vs Jinja reference | no | next |
+| chat template render vs jinja2 (text, pictures, tools, reasoning modes) | no | done |
+| picture resize: core/picture/resample.zig `.torch` kind (torchvision antialiased bicubic) + normalize/patchify glue | no | next |
 | CPU reference forward for 1 layer on tiny random weights (iHC, gated MLA, sinks, SWA, indexer pooling) | no | next |
 | CUDA kernels: iHC, pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | |
 | ViT tower + merger vs transformers on CPU (layers extracted from the base repo) | short | |
