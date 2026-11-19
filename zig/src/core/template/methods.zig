@@ -311,7 +311,63 @@ fn strMethod(rt: *Rt, s: v.Str, name: []const u8, pos: []const Value, kw: []cons
         }
         return .{ .str = out.str() };
     }
+    if (eq(u8, name, "format")) return .{ .str = try formatStr(rt, s, pos, kw) };
     return rt.fail("str.{s}() is not supported", .{name});
+}
+
+/// Python's str.format with plain fields: `{}`, `{0}`, `{name}`, `{{` and `}}`; values print as str() does.
+/// Conversions, specs and attribute or item lookups in a field are refused rather than guessed.
+fn formatStr(rt: *Rt, s: v.Str, pos: []const Value, kw: []const Kw) Error!v.Str {
+    const t = s.s;
+    var out: v.Buffer = .{};
+    var auto: usize = 0;
+    var numbered = false;
+    var lit: usize = 0;
+    var i: usize = 0;
+    while (i < t.len) {
+        const c = t[i];
+        if (c == '}') {
+            if (i + 1 < t.len and t[i + 1] == '}') {
+                try out.append(rt.a, try s.part(rt.a, t[lit .. i + 1]));
+                i += 2;
+                lit = i;
+                continue;
+            }
+            return rt.fail("Single '}}' encountered in format string", .{});
+        }
+        if (c != '{') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < t.len and t[i + 1] == '{') {
+            try out.append(rt.a, try s.part(rt.a, t[lit .. i + 1]));
+            i += 2;
+            lit = i;
+            continue;
+        }
+        const close = std.mem.indexOfScalarPos(u8, t, i + 1, '}') orelse return rt.fail("Single '{{' encountered in format string", .{});
+        const field = t[i + 1 .. close];
+        if (std.mem.indexOfAny(u8, field, "!:.[{")) |_| return rt.fail("str.format() field '{s}' is not supported", .{field});
+        if (lit < i) try out.append(rt.a, try s.part(rt.a, t[lit..i]));
+        const arg: Value = if (field.len == 0) blk: {
+            if (numbered) return rt.fail("cannot switch from manual field specification to automatic field numbering", .{});
+            if (auto >= pos.len) return rt.fail("Replacement index {d} out of range for positional args tuple", .{auto});
+            auto += 1;
+            break :blk pos[auto - 1];
+        } else if (std.fmt.parseInt(usize, field, 10)) |n| blk: {
+            if (auto > 0) return rt.fail("cannot switch from automatic field numbering to manual field specification", .{});
+            numbered = true;
+            if (n >= pos.len) return rt.fail("Replacement index {d} out of range for positional args tuple", .{n});
+            break :blk pos[n];
+        } else |_| for (kw) |k| {
+            if (std.mem.eql(u8, k.name, field)) break k.value;
+        } else return rt.fail("KeyError: '{s}'", .{field});
+        try out.append(rt.a, try v.asStr(rt, arg));
+        i = close + 1;
+        lit = i;
+    }
+    if (lit < t.len) try out.append(rt.a, try s.part(rt.a, t[lit..]));
+    return out.str();
 }
 
 fn dictMethod(rt: *Rt, d: *const v.Dict, self: Value, name: []const u8, pos: []const Value, kw: []const Kw) Error!Value {
