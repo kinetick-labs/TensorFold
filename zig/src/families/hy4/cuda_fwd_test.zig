@@ -27,6 +27,8 @@ const Gpu = struct {
         g.k.unload();
         g.ctx.deinit();
         g.d.close();
+        g.bufs.deinit(g.a);
+        g.a.destroy(g);
     }
 
     fn c(g: *Gpu) gm.Ctx {
@@ -69,10 +71,12 @@ const Gpu = struct {
     }
 };
 
-fn open(a: std.mem.Allocator) !?Gpu {
+/// On the heap: the stream, module and buffers keep `&g.d`, so the Gpu must not move after this.
+fn open(a: std.mem.Allocator) !?*Gpu {
     const path = std.testing.environ.getPosix("HY4_FWD_FATBIN") orelse return null;
     const image = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(64 << 20));
-    var g: Gpu = .{ .d = try cuda.Driver.open(), .ctx = undefined, .k = undefined, .s = undefined, .a = a };
+    const g = try a.create(Gpu);
+    g.* = .{ .d = try cuda.Driver.open(), .ctx = undefined, .k = undefined, .s = undefined, .a = a };
     g.ctx = try cuda.Context.init(&g.d, 0);
     g.k = try fwd.Kernels.load(&g.d, image);
     g.s = try cuda.Stream.init(&g.d, true);
@@ -152,7 +156,7 @@ test "Hy4 CUDA forward: a sliding-window layer with the dense MLP, and an indexe
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var g = (try open(a)) orelse return error.SkipZigTest;
+    const g = (try open(a)) orelse return error.SkipZigTest;
     defer g.deinit();
     var rng = std.Random.DefaultPrng.init(11);
     const r = rng.random();
@@ -303,7 +307,7 @@ test "Hy4 CUDA forward: a sliding-window layer with the dense MLP, and an indexe
         try layer_ref.forward(a, &d, &w, pos, T, want);
         const plans = [_][]const u32{ &.{T}, &.{ 23, 17 }, &.{ 13, 24, 1, 1, 1 } };
         for (plans) |plan| {
-            const got = try runLayer(&g, &L, lim, pos, streams, plan);
+            const got = try runLayer(g, &L, lim, pos, streams, plan);
             const e = worst(got, want);
             std.debug.print("hy4 forward layer ({s}) chunks {any}: worst relative error {e}\n", .{ if (indexed) "indexed + MoE" else "sliding + dense", plan, e });
             try std.testing.expect(e <= 2e-3);
@@ -315,7 +319,7 @@ test "Hy4 CUDA forward: the Engram residual matches engram_ref (HY4_FWD_FATBIN)"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var g = (try open(a)) orelse return error.SkipZigTest;
+    const g = (try open(a)) orelse return error.SkipZigTest;
     defer g.deinit();
     var rng = std.Random.DefaultPrng.init(12);
     const r = rng.random();
@@ -414,7 +418,7 @@ test "Hy4 CUDA forward: the vision tower matches vision_ref (HY4_FWD_FATBIN)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var g = (try open(a)) orelse return error.SkipZigTest;
+    const g = (try open(a)) orelse return error.SkipZigTest;
     defer g.deinit();
     var rng = std.Random.DefaultPrng.init(13);
     const r = rng.random();
@@ -453,14 +457,14 @@ test "Hy4 CUDA forward: the vision tower matches vision_ref (HY4_FWD_FATBIN)" {
         gb.* = .{
             .norm1_w = try g.put(@constCast(b.norm1_w), .bf16),
             .norm1_b = try g.put(@constCast(b.norm1_b), .bf16),
-            .q = try P2(&g, b.q_w, b.q_b, h, h),
-            .k = try P2(&g, b.k_w, b.k_b, h, h),
-            .v = try P2(&g, b.v_w, b.v_b, h, h),
-            .o = try P2(&g, b.o_w, b.o_b, h, h),
+            .q = try P2(g, b.q_w, b.q_b, h, h),
+            .k = try P2(g, b.k_w, b.k_b, h, h),
+            .v = try P2(g, b.v_w, b.v_b, h, h),
+            .o = try P2(g, b.o_w, b.o_b, h, h),
             .norm2_w = try g.put(@constCast(b.norm2_w), .bf16),
             .norm2_b = try g.put(@constCast(b.norm2_b), .bf16),
-            .fc1 = try P2(&g, b.fc1_w, b.fc1_b, h, d.inter),
-            .fc2 = try P2(&g, b.fc2_w, b.fc2_b, d.inter, h),
+            .fc1 = try P2(g, b.fc1_w, b.fc1_b, h, d.inter),
+            .fc2 = try P2(g, b.fc2_w, b.fc2_b, d.inter, h),
         };
     }
     const vw: vision_ref.Weights = .{

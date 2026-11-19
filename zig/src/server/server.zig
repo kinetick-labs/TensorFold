@@ -262,7 +262,8 @@ pub const Server = struct {
         if (srv.recipients and srv.effort_levels.len > 0) srv.off_effort = fields.coerceEffort("minimal", srv.effort_levels);
         // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
         srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
-            std.mem.indexOf(u8, source, "thinking_mode") != null;
+            std.mem.indexOf(u8, source, "thinking_mode") != null or
+            @import("prompt.zig").hy4Effort(source, false) != null; // Hy4-flash: off is reasoning_effort no_think
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
         if (srv.info.vision != null) {

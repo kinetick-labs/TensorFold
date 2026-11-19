@@ -1,13 +1,22 @@
 # smoke.py PORT IMAGE: one text and one image chat to a Hy4 server, thinking off (no_think) and on (high).
-import base64, json, sys, urllib.request
+import base64, json, sys, time, urllib.request
 p, img = sys.argv[1], sys.argv[2]
 U = f"http://127.0.0.1:{p}/v1/chat/completions"
 m = json.load(urllib.request.urlopen(f"http://127.0.0.1:{p}/v1/models", timeout=10))["data"][0]["id"]
 def ask(content, think, n=128):
+    try:
+        return ask1(content, think, n)
+    except Exception as e:
+        body = e.read().decode()[:300] if hasattr(e, "read") else ""
+        print("  error:", e, body)
+        return {}
+def ask1(content, think, n=128):
     b = {"model": m, "messages": [{"role": "user", "content": content}], "max_tokens": n, "temperature": 0, "chat_template_kwargs": {"enable_thinking": think}}
+    t0 = time.time()
     r = json.load(urllib.request.urlopen(urllib.request.Request(U, json.dumps(b).encode(), {"Content-Type": "application/json"}), timeout=600))
+    u = r.get("usage", {}); dt = time.time() - t0
+    print(f"  usage {u.get('prompt_tokens')} prompt + {u.get('completion_tokens')} completion tokens in {dt:.1f} s")
     return r["choices"][0]["message"]
-import time
 ok = 0
 t0 = time.time()
 t = ask("What is the capital of France? One word.", False)

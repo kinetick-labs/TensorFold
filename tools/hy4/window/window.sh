@@ -48,7 +48,7 @@ nohup bash -c 'low=999999999; while true; do a=$(awk "/MemAvailable/{print \$2}"
 
 # --- 1. the kernels against their CPU references (hc, forward layers, Engram, vision); HY4_LOAD=1: whole-pack load too
 log "kernels: hy4-gpu-test (HY4_FWD_FATBIN, HY4_HC_PTX${HY4_LOAD:+, HY4_LOAD_PACK=$P})"
-( cd $G && HY4_FWD_FATBIN=$G/hy4_forward.fatbin HY4_HC_PTX=$G/hc.ptx ${HY4_LOAD:+HY4_LOAD_PACK=$P} HY4_LOAD_RESERVE_MIB=${HY4_RESERVE_MIB:-6144} timeout 1800 nice -n 5 ./hy4-gpu-test ) > $D/kernels.out 2>&1
+( cd $G && env HY4_FWD_FATBIN=$G/hy4_forward.fatbin HY4_HC_PTX=$G/hc.ptx ${HY4_LOAD:+HY4_LOAD_PACK=$P} HY4_LOAD_RESERVE_MIB=${HY4_RESERVE_MIB:-6144} timeout ${HY4_KT_TIMEOUT:-600} nice -n 5 ./hy4-gpu-test ) > $D/kernels.out 2>&1
 rc=$?
 grep -E "^hy4 |pass|fail|error|differ|expected" $D/kernels.out | tee -a $L
 log "kernels rc $rc"
@@ -63,6 +63,10 @@ if [ -n "${HY4_SERVE_BIN:-}" ]; then
   if [ $up = 1 ]; then
     log "serve: healthy after ~$((i * 3)) s; $(free -g | awk '/Mem:/{print "MemAvailable " $7 " GiB"}')"
     timeout 1500 python3 $D/smoke.py 8095 $D/smoke.png 2>&1 | tee -a $L
+    [ -s $D/bench.py ] && timeout 900 python3 $D/bench.py 8095 2>&1 | tee -a $L
+    log "serve: $(free -g | awk '/Mem:/{print "MemAvailable " $7 " GiB"}') after the smoke"
+    # HY4_HOLD=1: keep the server up for more tests until ~/hy4-logs/release exists (the deadline still restores)
+    if [ -n "${HY4_HOLD:-}" ]; then rm -f $D/release; log "hold: touch $D/release to end"; while [ ! -e $D/release ] && kill -0 $(cat $D/serve.pid) 2>/dev/null; do sleep 5; done; fi
   else
     log "serve: never healthy"
   fi
