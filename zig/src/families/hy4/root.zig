@@ -404,3 +404,76 @@ test "Hy4 pictures: preprocessing matches HYV4VLImageProcessor (upscaled, downsc
         try std.testing.expectApproxEqAbs(o.get("sum").?.float, sum, 1e-2);
     }
 }
+
+pub const pack = @import("pack.zig");
+
+/// The release config cut to the fixture slice of the pack index (tools/hy4/pack_index_fixture.py).
+fn sliceConfig(a: std.mem.Allocator) !config.Config {
+    var c = try config.Config.parse(a, fixture);
+    c.text.layers = 3;
+    c.text.experts = 2;
+    c.text.engram_len = 1; // config id 2: decoder layer 1
+    c.vision.?.layers = 1;
+    c.draft.?.layers = 1;
+    return c;
+}
+
+test "Hy4 pack: the real index's slice has every tensor the config needs, EXL3 or plain, and nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try sliceConfig(a);
+    const want = try pack.expected(a, &c);
+    const index = @embedFile("fixtures/pack_index.json");
+    const r = try pack.check(a, index, want, &.{});
+    for (r.missing) |m| std.debug.print("missing {s}\n", .{m});
+    for (r.unknown) |m| std.debug.print("unknown {s}\n", .{m});
+    for (r.partial) |m| std.debug.print("partial {s}\n", .{m});
+    try std.testing.expect(r.ok());
+    // layer 0's attention and dense MLP are plain; layers 1-2: 3 attention + 3 shared + 2 x 3 expert projections each,
+    // plus the lm head and the draft layer's 6
+    try std.testing.expectEqual(@as(usize, 6), r.plain_projections);
+    try std.testing.expectEqual(@as(usize, 1 + 2 * (3 + 3 + 6) + 6), r.exl3);
+    try std.testing.expectEqual(@as(u64, 99754676490), r.total_size);
+
+    // half an EXL3 projection, a dropped tensor and a stray name are each refused
+    const cases = [_][3][]const u8{
+        .{ "\"model.layers.1.mlp.experts.0.up_proj.suh\":", "\"model.layers.1.mlp.experts.0.up_proj.xxx\":", "partial" },
+        .{ "\"model.layers.2.self_attn.learnable_sink_param\":", "\"model.layers.2.self_attn.learnable_sink_parameter\":", "missing" },
+        .{ "\"model.norm.weight\":", "\"model.norm.weight\":\"x\",\"model.extra.weight\":", "unknown" },
+    };
+    for (cases) |k| {
+        const n = std.mem.replacementSize(u8, index, k[0], k[1]);
+        const bad = try a.alloc(u8, n);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.replace(u8, index, k[0], k[1], bad));
+        const b = try pack.check(a, bad, want, &.{});
+        try std.testing.expect(!b.ok());
+        const list = if (std.mem.eql(u8, k[2], "partial")) b.partial else if (std.mem.eql(u8, k[2], "missing")) b.missing else b.unknown;
+        try std.testing.expect(list.len >= 1);
+    }
+    const renamed = try pack.canonical(a, "model.layers.3.hc_attn_layer.hc_pre.hc_fn");
+    try std.testing.expectEqualStrings("model.layers.3.attn_hc.fn", renamed);
+    try std.testing.expectEqualStrings("model.layers.0.mlp.post_mlp_layernorm.weight", try pack.canonical(a, "model.layers.0.mlp.post_fc2_norm.weight"));
+}
+
+test "Hy4 pack: the whole downloaded pack (HY4_PACK_DIR, on demand)" {
+    const dir = std.testing.environ.getPosix("HY4_PACK_DIR") orelse return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const read = struct {
+        fn f(al: std.mem.Allocator, d: []const u8, name: []const u8) ![]u8 {
+            return std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(al, &.{ d, name }), al, .limited(1 << 28));
+        }
+    }.f;
+    const c = try config.Config.parse(a, try read(a, dir, "config.json"));
+    const r = try pack.check(a, try read(a, dir, "model.safetensors.index.json"), try pack.expected(a, &c), &.{});
+    std.debug.print("pack: {d} tensors, {d} EXL3 and {d} plain projections, {d} shards, {d} bytes; missing {d}, unknown {d}, partial {d}\n", .{ r.tensors, r.exl3, r.plain_projections, r.shards, r.total_size, r.missing.len, r.unknown.len, r.partial.len });
+    for (r.missing[0..@min(r.missing.len, 10)]) |m| std.debug.print("missing {s}\n", .{m});
+    for (r.unknown[0..@min(r.unknown.len, 10)]) |m| std.debug.print("unknown {s}\n", .{m});
+    try std.testing.expect(r.ok());
+    const side = try pack.check(a, try read(a, dir, "engram.safetensors.index.json"), &.{}, try pack.expectedSidecar(a, &c));
+    try std.testing.expectEqual(@as(usize, 0), side.unknown.len);
+    try std.testing.expectEqual(@as(usize, 2), side.shards);
+}

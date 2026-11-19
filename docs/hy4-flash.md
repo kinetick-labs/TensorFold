@@ -30,7 +30,12 @@ authors of the port. License: tencent-hy-license (see the pack's LICENSE).
 
 - 12 GPU shards, 99.75 GB (92.9 GiB): REXL3 trellis weights at 4.84 bpw average.
 - Engram sidecar, 2 shards, 64.68 GB: F8_E4M3 rows with F32 per-row amax scales, meant to be mmapped from NVMe.
-- No vision tower in the pack: the ViT and merger (~0.9 GB bf16) come from `tencent/Hy4-flash` (tools/hy4/st_fetch.py).
+- The vision tower and merger are in the pack (`vit.*`, plain tensors).
+- Names are Tencent's checkpoint names (`learnable_sink_param`, `linear_gate`, `hc_attn_layer.hc_pre.hc_*`,
+  `routed_expert_down_proj`, per-expert `experts.E.{gate,up,down}_proj`), not transformers' renames. 254,613 tensors:
+  1,595 plain tensors, 63,253 EXL3 projections (`trellis`/`suh`/`svh`/`mul1`) and 6 plain projections (layer 0's
+  attention and dense MLP). Engram tables: `...multi_head_embedding.embedding.weight` (F8_E4M3) + `.scale_bf16`.
+  `pack.zig` checks all of it against the config (0 missing, 0 unknown, 0 partial on the real index).
 - Gated (manual approval) on Hugging Face.
 
 Memory: 93 GiB of weights + ~1 GiB ViT + KV/activations do not fit beside GLM-5.3 prod (~110 GB). Hy4 runs need
@@ -78,13 +83,13 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | config parser, refusals, fixture | no | done (`test-hy4-host`) |
 | Engram hash ids vs reference | no | done |
 | picture grid: smart resize, token count, 3D positions, position-grid taps (vs torch), patch order | no | done |
-| tensor name map + REXL3 pack index reader, tested on the pack's headers (range reads) | no | blocked on gated access |
+| tensor-name map (pack -> transformers) + pack index check against the config: `pack.zig`, real index slice fixture + on-demand full check | no | done |
 | chat template render vs jinja2 (text, pictures, tools, reasoning modes) | no | done |
 | picture preprocessing (smart resize, core resample `.torch` = torchvision antialiased uint8 bicubic, fused normalize, patches) vs HYV4VLImageProcessor: `preprocess.zig` | no | done |
 | CPU reference of one decoder layer vs transformers (iHC, gated MLA + sinks + gate, M-RoPE, sliding window, compressed indexer group recall, dense MLP): `layer_ref.zig`, fixture from tools/hy4/layer_fixture.py | no | done |
 | reply markup onto the GLM tool/thinking parser, reasoning_effort mapping (thinking on/unsaid -> high, off -> no_think) | no | done (`reply.zig`); server wiring next |
 | CPU reference of the latent MoE block (sigmoid router + bias, top-k, latent pre/post projections, clamp, shared expert) | no | done |
-| CPU reference of the Engram block; tensor-name map + pack index reader | no | next (index needs pack access) |
+| CPU reference of the Engram block | no | next |
 | CUDA kernels: iHC, pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | |
 | ViT tower + merger vs transformers on CPU (layers extracted from the base repo) | short | |
 | full model load and first tokens | yes, GLM stopped | needs a window |
