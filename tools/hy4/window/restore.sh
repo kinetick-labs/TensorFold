@@ -7,10 +7,10 @@ exec 9>$D/restore.flock; flock -n 9 || { echo "restore already running"; exit 0;
 log(){ echo "$(date -u +%T)Z $*" | tee -a $L; }
 q(){ echo "- $(date -u +%H:%MZ) hy4: $*" >> ~/GPU-QUEUE.md; }
 log "RESTORE ($1)"
-pkill -x hy4-gpu-test 2>/dev/null; [ -s $D/serve.pid ] && kill -9 $(cat $D/serve.pid) 2>/dev/null
+pkill -x hy4-gpu-test 2>/dev/null; pkill -x tensorfold-hy4 2>/dev/null; [ -s $D/serve.pid ] && kill -9 $(cat $D/serve.pid) 2>/dev/null
 kill $(cat $D/guard.pid 2>/dev/null) 2>/dev/null
 [ "$1" != deadline ] && { p=$(cat $D/deadline.pid 2>/dev/null); [ -n "$p" ] && pkill -P $p 2>/dev/null; kill $p 2>/dev/null; }
-for i in $(seq 30); do pgrep -x hy4-gpu-test >/dev/null || break; sleep 1; done
+for i in $(seq 30); do pgrep -x hy4-gpu-test >/dev/null || pgrep -x tensorfold-hy4 >/dev/null || break; sleep 1; done
 t0=$(date +%s); systemctl --user start $U
 for i in $(seq 400); do curl -sf -m3 http://127.0.0.1:8083/health >/dev/null && break; sleep 3; done
 code=$(curl -s -o /dev/null -w %{http_code} -m5 http://127.0.0.1:8083/health)

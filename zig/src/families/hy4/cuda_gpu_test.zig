@@ -4,4 +4,5 @@
 test {
     _ = @import("cuda_hc_test.zig");
     _ = @import("cuda_load_test.zig");
+    _ = @import("cuda_fwd_test.zig");
 }

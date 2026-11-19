@@ -131,3 +131,7 @@ test "Hy4 CUDA: load compiles against the runtime and checkpoint it calls" {
     _ = &Device.weight;
     _ = &Device.ptr;
 }
+
+test {
+    _ = @import("bind.zig"); // the binder, the GPU model and the vision tower compile against this runtime; the e4m3 table
+}
