@@ -80,10 +80,11 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | picture grid: smart resize, token count, 3D positions, position-grid taps (vs torch), patch order | no | done |
 | tensor name map + REXL3 pack index reader, tested on the pack's headers (range reads) | no | blocked on gated access |
 | chat template render vs jinja2 (text, pictures, tools, reasoning modes) | no | done |
-| picture resize: core/picture/resample.zig `.torch` kind (torchvision antialiased bicubic) + normalize/patchify glue | no | next |
+| picture preprocessing (smart resize, core resample `.torch` = torchvision antialiased uint8 bicubic, fused normalize, patches) vs HYV4VLImageProcessor: `preprocess.zig` | no | done |
 | CPU reference of one decoder layer vs transformers (iHC, gated MLA + sinks + gate, M-RoPE, sliding window, compressed indexer group recall, dense MLP): `layer_ref.zig`, fixture from tools/hy4/layer_fixture.py | no | done |
 | reply markup onto the GLM tool/thinking parser, reasoning_effort mapping (thinking on/unsaid -> high, off -> no_think) | no | done (`reply.zig`); server wiring next |
-| CPU reference of the MoE block (sigmoid router + bias, top-16, latent pre/post projections, shared expert, clamp) and the Engram block | no | next |
+| CPU reference of the latent MoE block (sigmoid router + bias, top-k, latent pre/post projections, clamp, shared expert) | no | done |
+| CPU reference of the Engram block; tensor-name map + pack index reader | no | next (index needs pack access) |
 | CUDA kernels: iHC, pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | |
 | ViT tower + merger vs transformers on CPU (layers extracted from the base repo) | short | |
 | full model load and first tokens | yes, GLM stopped | needs a window |

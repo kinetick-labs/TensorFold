@@ -364,3 +364,43 @@ test "Hy4 layer reference: indexed, sliding and MoE decoder layers match transfo
         try std.testing.expect(worst <= 2e-4);
     }
 }
+
+pub const preprocess = @import("preprocess.zig");
+
+test "Hy4 pictures: preprocessing matches HYV4VLImageProcessor (upscaled, downscaled, tall)" {
+    const a = std.testing.allocator;
+    const ref = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/pictures.json"), .{});
+    defer ref.deinit();
+    for (ref.value.array.items) |case| {
+        const o = case.object;
+        const w: u32 = @intCast(o.get("width").?.integer);
+        const h: u32 = @intCast(o.get("height").?.integer);
+        // tools/hy4/picture_fixture.py's drawing
+        const rgb = try a.alloc(u8, @as(usize, w) * h * 3);
+        defer a.free(rgb);
+        for (0..h) |y| for (0..w) |x| for (0..3) |c| {
+            rgb[(y * w + x) * 3 + c] = @intCast((x * 7 + y * 13 + c * 50 + (x * y) % 31) % 256);
+        };
+        var p = try preprocess.picture(a, rgb, w, h, .{});
+        defer p.deinit(a);
+        const grid = o.get("grid").?.array.items;
+        try std.testing.expectEqual(@as(u32, @intCast(grid[1].integer)), p.grid.h);
+        try std.testing.expectEqual(@as(u32, @intCast(grid[2].integer)), p.grid.w);
+        var sum: f64 = 0;
+        for (p.patches) |v| sum += v;
+        const every = o.get("every97").?.array.items;
+        var off: usize = 0;
+        for (every, 0..) |e, k| {
+            const want: f32 = @floatCast(switch (e) {
+                .float => |f| f,
+                .integer => |n| @as(f64, @floatFromInt(n)),
+                else => unreachable,
+            });
+            // one uint8 step is 2 / 255
+            if (@abs(p.patches[k * 97] - want) > 1e-6) off += 1;
+        }
+        if (off > 0) std.debug.print("{d}x{d}: {d} of {d} samples differ, sum {d} vs {d}\n", .{ w, h, off, every.len, sum, o.get("sum").?.float });
+        try std.testing.expectEqual(@as(usize, 0), off);
+        try std.testing.expectApproxEqAbs(o.get("sum").?.float, sum, 1e-2);
+    }
+}
