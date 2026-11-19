@@ -88,6 +88,16 @@ pub const Pack = struct {
         return buf;
     }
 
+    /// `len` bytes of the tensor from byte `off` of its stored data, in `a` (spot checks of big tensors).
+    pub fn rawRange(p: *Pack, a: Allocator, name: []const u8, off: u64, len: usize) ![]u8 {
+        const i = try p.info(name);
+        if (off + len > i.end - i.begin) return error.OutOfRange;
+        const buf = try a.alloc(u8, len);
+        const s = p.shards.getPtr(i.shard).?;
+        if (try s.file.readPositionalAll(p.io, buf, i.begin + off) != buf.len) return error.ShortRead;
+        return buf;
+    }
+
     /// A float tensor (F32, BF16 or F16) widened to f32, in `a`.
     pub fn f32s(p: *Pack, a: Allocator, name: []const u8) ![]f32 {
         const i = try p.info(name);

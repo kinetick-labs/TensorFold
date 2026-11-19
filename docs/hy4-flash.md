@@ -87,10 +87,12 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | chat template render vs jinja2 (text, pictures, tools, reasoning modes) | no | done |
 | picture preprocessing (smart resize, core resample `.torch` = torchvision antialiased uint8 bicubic, fused normalize, patches) vs HYV4VLImageProcessor: `preprocess.zig` | no | done |
 | CPU reference of one decoder layer vs transformers (iHC, gated MLA + sinks + gate, M-RoPE, sliding window, compressed indexer group recall, dense MLP): `layer_ref.zig`, fixture from tools/hy4/layer_fixture.py | no | done |
-| reply markup onto the GLM tool/thinking parser, reasoning_effort mapping (thinking on/unsaid -> high, off -> no_think) | no | done (`reply.zig`); server wiring next |
+| reply markup onto the GLM tool/thinking parser, reasoning_effort mapping (thinking on/unsaid -> high, off -> no_think) | no | done (`reply.zig`); server wiring done: `server/hy4_reply.zig` rewrites Hy4 tags to the GLM forms on decode and maps GLM tag lookups to Hy4 ids (`hf_text.zig`), `prompt.hy4Effort` |
 | CPU reference of the latent MoE block (sigmoid router + bias, top-k, latent pre/post projections, clamp, shared expert) | no | done |
 | CPU reference of the Engram block (document-bounded n-gram windows from the time plane, hash, FP8 E4M3 round trip, per-head norms with f32-eps RMSNorm, gated per-stream residual) and the decoder layer carrying it: `engram_ref.zig` | no | done |
-| CUDA kernels: iHC, pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | |
-| ViT tower + merger vs transformers on CPU (layers extracted from the base repo) | short | |
-| full model load and first tokens | yes, GLM stopped | needs a window |
+| load plan (every pack tensor -> GPU arena or NVMe Engram sidecar, EXL3 shapes/widths checked; whole pack: 63,253 EXL3 groups, GPU 99,754,676,490 B, NVMe 64,680,628,768 B) and device layout (92.9 GiB arena, per-layer slots): `load_plan.zig`, `device_layout.zig` | no | done |
+| CUDA loader: one arena, per-part uploads, EXL3 groups as `cuda.exl3.Weight` (mul1, stored strides): `cuda.zig` (`test-hy4-cuda-host`); whole-pack load + read-back spot checks: `cuda_load_test.zig` (HY4_LOAD_PACK) | the load: yes, GLM stopped | host tests done; load needs a window (`tools/hy4/window/window.sh`) |
+| CUDA kernels: iHC pre/post (`kernels/cuda/hy4/hc.cu`, `cuda_hc_test.zig`, beside prod via `tools/hy4/window/kernel-beside-prod.sh`), pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | hc written, GPU run waits for prod MemAvailable > 4.5 GiB; others to do |
+| ViT tower + merger vs transformers on CPU: `vision_ref.zig`, tiny tower and the release's 27 layers from the pack (worst relative error 5.7e-5) | no | done |
+| full model load and first tokens | yes, GLM stopped | load ready for a window; first tokens need the forward (MLA + sinks/gate, compressed indexer, latent MoE over EXL3, M-RoPE, Engram NVMe reader for 98-byte FP8 rows, GPU vision tower) |
 | multimodal serve, conformance, DFly2 | yes | |
