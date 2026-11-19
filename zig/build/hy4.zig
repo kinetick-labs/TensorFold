@@ -22,3 +22,16 @@ pub fn cudaHost(b: *std.Build, cuda: *std.Build.Module, core: *std.Build.Module,
     b.step("test-hy4-cuda-host", "Hy4 CUDA loader: arena layout and EXL3 weight descriptors from the pack plan, no GPU").dependOn(&run.step);
     all.dependOn(&run.step);
 }
+
+/// `test-hy4-gpu` (runs here) and `install-hy4-gpu-test` (zig-out/bin/hy4-gpu-test, for -Dhy4-gpu-target, e.g.
+/// aarch64-linux-gnu, to copy to a Spark): the Hy4 kernels against their CPU references on a GPU. The kernels come as
+/// PTX at run time (HY4_HC_PTX: `nvcc -ptx zig/kernels/cuda/hy4/hc.cu`); without it the tests skip.
+pub fn gpuTests(b: *std.Build) void {
+    const triple = b.option([]const u8, "hy4-gpu-target", "Target of install-hy4-gpu-test (default: this host)");
+    const target = if (triple) |t| b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t }) catch @panic("bad -Dhy4-gpu-target")) else b.graph.host;
+    const cuda = @import("cuda_runtime.zig").runtime(b, target, .ReleaseSafe, &.{});
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/hy4/cuda_hc_test.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} });
+    const exe = b.addTest(.{ .root_module = m, .name = "hy4-gpu-test" });
+    b.step("test-hy4-gpu", "Hy4 CUDA kernels against their CPU references on this machine's GPU (HY4_HC_PTX)").dependOn(&b.addRunArtifact(exe).step);
+    b.step("install-hy4-gpu-test", "Install the Hy4 GPU kernel test binary (see -Dhy4-gpu-target)").dependOn(&b.addInstallArtifact(exe, .{}).step);
+}

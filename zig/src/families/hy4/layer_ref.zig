@@ -146,7 +146,7 @@ pub fn rotate(d: *const Dims, x: []f32, pos: [3]i32) void {
 }
 
 /// One hyper-connection: the `post` weights of each stream and the streams mixed into one input.
-fn hyper(d: *const Dims, h: Hc, streams: []const f32, post: []f32, out: []f32) void {
+pub fn hyper(d: *const Dims, h: Hc, streams: []const f32, post: []f32, out: []f32) void {
     const n = d.hc;
     var mix: [16]f32 = undefined;
     std.debug.assert(2 * n <= mix.len);
