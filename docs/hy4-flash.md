@@ -89,7 +89,7 @@ row reads (16 heads x 4 layers x tokens, 96 B each) go through direct I/O from N
 | CPU reference of one decoder layer vs transformers (iHC, gated MLA + sinks + gate, M-RoPE, sliding window, compressed indexer group recall, dense MLP): `layer_ref.zig`, fixture from tools/hy4/layer_fixture.py | no | done |
 | reply markup onto the GLM tool/thinking parser, reasoning_effort mapping (thinking on/unsaid -> high, off -> no_think) | no | done (`reply.zig`); server wiring next |
 | CPU reference of the latent MoE block (sigmoid router + bias, top-k, latent pre/post projections, clamp, shared expert) | no | done |
-| CPU reference of the Engram block | no | next |
+| CPU reference of the Engram block (document-bounded n-gram windows from the time plane, hash, FP8 E4M3 round trip, per-head norms with f32-eps RMSNorm, gated per-stream residual) and the decoder layer carrying it: `engram_ref.zig` | no | done |
 | CUDA kernels: iHC, pooled indexer, sinks/gate, SWA latent ring, Engram gather | small tests only, beside prod | |
 | ViT tower + merger vs transformers on CPU (layers extracted from the base repo) | short | |
 | full model load and first tokens | yes, GLM stopped | needs a window |

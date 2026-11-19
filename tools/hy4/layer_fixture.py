@@ -2,7 +2,9 @@
 """Tiny Hy4-flash decoder layers through transformers' HYV4FlashDecoderLayer (PR #50903), saved for the CPU
 reference in zig/src/families/hy4/layer_ref.zig: an indexed layer whose context outgrows a shrunken index_topk (so
 the compressed indexer picks groups) a sliding layer with a 4-token window, both with the dense MLP, and a sliding layer with the latent MoE, on 3D
-positions that include a picture span. usage: layer_fixture.py BASE_CONFIG.json OUT.safetensors"""
+positions that include a picture span. usage: layer_fixture.py BASE_CONFIG.json OUT.safetensors [ENGRAM_OUT.safetensors]
+With ENGRAM_OUT, also a sliding dense layer carrying an Engram memory (config id 2), with its token ids, multipliers
+and the n-gram windows the model builds from the time positions."""
 import json, sys
 import torch
 from safetensors.torch import save_file
@@ -67,4 +69,42 @@ for idx, kind in enumerate(cfg.layer_types):
         out[pre + name] = p.float().contiguous()
     print(kind, "out norm", float(y.norm()), file=sys.stderr)
 save_file(out, sys.argv[2], metadata={"source": "transformers HYV4FlashDecoderLayer @ b865850d, seed 7"})
+
+if len(sys.argv) > 3:
+    e = dict(small)
+    e.update(engram_layer_ids=[2], engram_max_ngram_size=3, engram_n_head_per_ngram=2, engram_n_embed_per_ngram=16,
+             engram_layer_head_vocab_sizes={"2": [[31, 37], [41, 43]]}, engram_lookup_table_size=50, engram_pad_id=49,
+             engram_fp8_embedding=True)
+    ecfg = HYV4FlashTextConfig(**e)
+    ecfg._attn_implementation = "eager"
+    torch.manual_seed(11)
+    layer = m.HYV4FlashDecoderLayer(ecfg, 1).float()
+    eng = layer.engram_layer
+    with torch.no_grad():
+        for name, p in layer.named_parameters():
+            p.copy_(torch.randn_like(p) * (0.3 if p.dim() > 1 else 0.5) + (1.0 if name.endswith("norm.weight") or name.endswith("layernorm.weight") or ".norm_key." in name or ".norm_query." in name or "lookup_per_head_norms" in name else 0.0))
+        eng.lookup_table.copy_(torch.randint(0, 40, (50,), dtype=torch.int32))
+        eng.hash_multipliers.copy_(eng.draw_hash_multipliers(int(eng.lookup_table.max()) + 1))
+    # a picture's pad tokens (masked), ids past the lookup table (read as the pad), a second document from token 10
+    ids = torch.tensor([[3, 17, 5, 120120, 120120, 120120, 120120, 120120, 120120, 55, 0, 9, 9, 61, 49, 22]])
+    epos = pos.clone()
+    for i in range(10, T):
+        epos[:, 0, i] = i - 10
+    ngram = m.HYV4FlashTextModel.build_ngram_tokens(type("M", (), {"config": ecfg})(), ids, epos)
+    emask = (ids != 120120) & (ids != 120124) & (ids != ecfg.engram_pad_id)
+    x = torch.randn(1, T, ecfg.hc_mult, ecfg.hidden_size)
+    i = torch.arange(T)
+    allowed = (i[None, :] <= i[:, None]) & ((i[:, None] - i[None, :]) < ecfg.sliding_window)
+    mask = torch.zeros(1, 1, T, T).masked_fill(~allowed, torch.finfo(torch.float32).min)
+    cos, sin = m.HYV4FlashRotaryEmbedding(ecfg)(x, epos, layer_type="sliding_attention")
+    with torch.no_grad():
+        y = layer(x, attention_mask=mask, position_ids=epos, position_embeddings=(cos, sin), ngram_tokens=ngram, engram_mask=emask)
+        engram_only = eng(x, ngram, emask)
+    eo = {"positions": epos[:, 0].to(torch.int32).contiguous(), "ids": ids[0].to(torch.int32).contiguous(),
+          "ngram": ngram[0].to(torch.int32).contiguous(), "multipliers": eng.hash_multipliers.clone(),
+          "in": x[0].contiguous(), "out": y[0].contiguous(), "engram_out": engram_only[0].contiguous()}
+    for name, p in layer.state_dict().items():
+        eo[name] = p.float().contiguous() if p.dtype.is_floating_point else p.contiguous()
+    print("engram out norm", float(engram_only.norm()), file=sys.stderr)
+    save_file(eo, sys.argv[3], metadata={"source": "transformers HYV4FlashDecoderLayer + HYV4FlashEngramLayer @ b865850d, seed 11"})
 json.dump({k: v for k, v in cfg.to_dict().items() if not isinstance(v, (dict,)) or k == "rope_parameters"}, sys.stderr, default=str) if False else None

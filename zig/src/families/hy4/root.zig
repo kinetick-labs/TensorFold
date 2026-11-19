@@ -274,6 +274,16 @@ const Tensors = struct {
         return out;
     }
 
+    fn i64s(t: *const Tensors, a: std.mem.Allocator, name: []const u8) ![]i64 {
+        const m = t.header.value.object.get(name) orelse return error.MissingTensor;
+        const off = m.object.get("data_offsets").?.array.items;
+        const lo: usize = @intCast(off[0].integer);
+        const hi: usize = @intCast(off[1].integer);
+        const out = try a.alloc(i64, (hi - lo) / 8);
+        for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, t.bytes[lo + 8 * i ..][0..8], .little);
+        return out;
+    }
+
     fn i32s(t: *const Tensors, a: std.mem.Allocator, name: []const u8) ![]i32 {
         const f = try t.f32s(a, name);
         return @ptrCast(f);
@@ -476,4 +486,94 @@ test "Hy4 pack: the whole downloaded pack (HY4_PACK_DIR, on demand)" {
     const side = try pack.check(a, try read(a, dir, "engram.safetensors.index.json"), &.{}, try pack.expectedSidecar(a, &c));
     try std.testing.expectEqual(@as(usize, 0), side.unknown.len);
     try std.testing.expectEqual(@as(usize, 2), side.shards);
+}
+
+pub const engram_ref = @import("engram_ref.zig");
+
+test "Hy4 Engram reference: windows, hash rows, FP8 reads and the gated residual match transformers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const st = try Tensors.open(a, @embedFile("fixtures/engram.safetensors"));
+    const positions = try st.i32s(a, "positions");
+    const t = positions.len / 3;
+    const ids: []const u32 = @ptrCast(try st.i32s(a, "ids"));
+    const want_windows: []const u32 = @ptrCast(try st.i32s(a, "ngram"));
+    const wins = try a.alloc(u32, t * 3);
+    engram_ref.windows(ids, positions[0..t], 3, 49, wins);
+    try std.testing.expectEqualSlices(u32, want_windows, wins);
+    const mask = try a.alloc(bool, t);
+    for (mask, ids) |*m, id| m.* = id != 120120 and id != 120124 and id != 49;
+
+    const cat = struct {
+        fn of(al: std.mem.Allocator, tt: *const Tensors, comptime fmt: []const u8, n: usize) ![]f32 {
+            var out: std.ArrayList(f32) = .empty;
+            for (0..n) |i| try out.appendSlice(al, try tt.f32s(al, try std.fmt.allocPrint(al, fmt, .{i})));
+            return out.items;
+        }
+    };
+    const e: engram_ref.Engram = .{
+        .hidden = 32,
+        .hc = 4,
+        .order = 3,
+        .heads_per_order = 2,
+        .head_dim = 8,
+        .pad = 49,
+        .map = try st.i32s(a, "engram_layer.lookup_table"),
+        .mult = try st.i64s(a, "multipliers"),
+        .sizes = &.{ 31, 37, 41, 43 },
+        .table = try st.f32s(a, "engram_layer.multi_head_embedding.embedding.weight"),
+        .head_norms = try cat.of(a, &st, "engram_layer.lookup_per_head_norms.{d}.weight", 4),
+        .key_w = try cat.of(a, &st, "engram_layer.key_projs.{d}.weight", 4),
+        .key_b = try cat.of(a, &st, "engram_layer.key_projs.{d}.bias", 4),
+        .norm_key = try cat.of(a, &st, "engram_layer.norm_key.{d}.weight", 4),
+        .norm_query = try cat.of(a, &st, "engram_layer.norm_query.{d}.weight", 4),
+        .value_w = try st.f32s(a, "engram_layer.value_proj.weight"),
+        .value_b = try st.f32s(a, "engram_layer.value_proj.bias"),
+        .pre_gamma = try st.f32s(a, "engram_layer.unified_pre_gamma"),
+        .scales = try cat.of(a, &st, "engram_layer.unified_per_hc_scales.{d}", 4),
+    };
+    const streams = try st.f32s(a, "in");
+    const res = try a.alloc(f32, streams.len);
+    try engram_ref.residual(a, &e, wins, mask, streams, res);
+    const want_res = try st.f32s(a, "engram_out");
+    var worst: f32 = 0;
+    for (res, want_res) |g, w| worst = @max(worst, @abs(g - w) / @max(1.0, @abs(w)));
+    if (worst > 2e-4) std.debug.print("engram residual worst relative error {e}\n", .{worst});
+    try std.testing.expect(worst <= 2e-4);
+    // E4M3: the grid, ties to even, subnormals
+    try std.testing.expectEqual(@as(f32, 448), engram_ref.e4m3(448));
+    try std.testing.expectEqual(@as(f32, 1.125), engram_ref.e4m3(1.0625 + 0.001));
+    try std.testing.expectEqual(@as(f32, 1.0), engram_ref.e4m3(1.0625));
+    try std.testing.expectEqual(@as(f32, 0.001953125), engram_ref.e4m3(0.0025));
+
+    // the whole decoder layer: the Engram residual, then attention and the dense MLP
+    for (streams, res) |*x, r| x.* += r;
+    const d: layer_ref.Dims = .{ .hidden = 32, .hc = 4, .heads = 3, .nope = 8, .rope = 12, .v = 8, .q_lora = 16, .kv_lora = 8, .inter = 48, .eps = 1e-5, .hc_eps = 1e-6, .hc_magnitude = 2.0, .theta = 1e4, .sections = .{ 2, 2, 2 }, .window = 4 };
+    const w: layer_ref.Weights = .{
+        .attn_hc = .{ .fn_ = try st.f32s(a, "attn_hc.fn"), .base = try st.f32s(a, "attn_hc.base"), .scale = try st.f32s(a, "attn_hc.scale") },
+        .ffn_hc = .{ .fn_ = try st.f32s(a, "ffn_hc.fn"), .base = try st.f32s(a, "ffn_hc.base"), .scale = try st.f32s(a, "ffn_hc.scale") },
+        .input_norm = try st.f32s(a, "input_layernorm.weight"),
+        .post_attention_norm = try st.f32s(a, "post_attention_layernorm.weight"),
+        .post_mlp_norm = try st.f32s(a, "post_mlp_layernorm.weight"),
+        .q_a = try st.f32s(a, "self_attn.q_a_proj.weight"),
+        .q_a_norm = try st.f32s(a, "self_attn.q_a_layernorm.weight"),
+        .q_b = try st.f32s(a, "self_attn.q_b_proj.weight"),
+        .kv_a = try st.f32s(a, "self_attn.kv_a_proj_with_mqa.weight"),
+        .kv_a_norm = try st.f32s(a, "self_attn.kv_a_layernorm.weight"),
+        .kv_b = try st.f32s(a, "self_attn.kv_b_proj.weight"),
+        .gate = try st.f32s(a, "self_attn.gate_proj.weight"),
+        .o = try st.f32s(a, "self_attn.o_proj.weight"),
+        .post_proj_norm = try st.f32s(a, "self_attn.post_proj_norm.weight"),
+        .sinks = try st.f32s(a, "self_attn.sinks"),
+        .mlp_gate = try st.f32s(a, "mlp.gate_proj.weight"),
+        .mlp_up = try st.f32s(a, "mlp.up_proj.weight"),
+        .mlp_down = try st.f32s(a, "mlp.down_proj.weight"),
+    };
+    try layer_ref.forward(a, &d, &w, positions, t, streams);
+    const want = try st.f32s(a, "out");
+    worst = 0;
+    for (streams, want) |g, x| worst = @max(worst, @abs(g - x) / @max(1.0, @abs(x)));
+    if (worst > 2e-4) std.debug.print("engram layer worst relative error {e}\n", .{worst});
+    try std.testing.expect(worst <= 2e-4);
 }
