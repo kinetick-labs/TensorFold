@@ -99,7 +99,7 @@ if [ -n "${HY4_SERVE_BIN:-}" ]; then
   # --- 2b. profiling pass: one 32k boot per variant in HY4_PROF_VARIANTS (CHUNK:ATTN_TC_ROWS, default the new path at
   # chunks 256 and 512 and the scalar attention at 256), HY4_PROFILE=4 (op groups timed on the stream: a summary every 4
   # steps), a ~6k-token prompt then 4 streams; the "hy4 profile" lines go to the window log. Skipped with < 15 min left
-  # before the capacity reserve. HY4_PROF_VARIANTS= (empty) skips it.
+  # before the capacity reserve. HY4_PROF_VARIANTS= (empty) skips it; HY4_CAP_CTX=" " (a space) skips the capacity.
   for v in ${HY4_PROF_VARIANTS-256:16 512:16 256:0}; do
     left=$(( END - $(date +%s) - ${HY4_CAP_RESERVE_S:-900} ))
     [ $left -ge 900 ] || { log "profile $v: skipped, $((left / 60)) min left before the capacity reserve"; continue; }

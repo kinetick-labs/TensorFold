@@ -81,6 +81,8 @@ const Fns = struct {
     mla_scores_tc: cuda.Function,
     mla_softmax: cuda.Function,
     mla_pv_tc: cuda.Function,
+    uv_gate_tc_bf16: cuda.Function,
+    uv_gate_tc_f16: cuda.Function,
 };
 
 fn blocks(n: u64, per: u64) u32 {
@@ -252,6 +254,11 @@ pub const Kernels = struct {
     }
 
     pub fn uvGate(k: *const Kernels, s: cuda.Stream, ol: u64, kvb: W, gate: u64, out: u64, t: u32, heads: u32, nope: u32, vdim: u32, kvl: u32) !void {
+        if (k.tc_min > 0 and t >= k.tc_min and (kvb.dt == .bf16 or kvb.dt == .f16)) {
+            // prompt rows: per head a tensor-core GEMM with the gate fused (the scalar kernel re-reads ol per 8 columns)
+            const f = if (kvb.dt == .bf16) k.f.uv_gate_tc_bf16 else k.f.uv_gate_tc_f16;
+            return go(f, s, .{ blocks(vdim, 64), blocks(t, 64), heads }, 128, 0, .{ ol, kvb.ptr, gate, out, @as(i32, @intCast(t)), @as(i32, @intCast(heads)), @as(i32, @intCast(nope)), @as(i32, @intCast(vdim)), @as(i32, @intCast(kvl)) });
+        }
         try go(k.f.uv_gate, s, .{ blocks(vdim, 8), heads, blocks(t, 8) }, 256, 0, .{ ol, kvb.ptr, @intFromEnum(kvb.dt), gate, out, @as(i32, @intCast(t)), @as(i32, @intCast(heads)), @as(i32, @intCast(nope)), @as(i32, @intCast(vdim)), @as(i32, @intCast(kvl)) });
     }
 

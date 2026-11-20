@@ -261,6 +261,51 @@ with the shape the engine binds and checks them against the pack's headers (host
   uploads fired.
 - **Larger chunks**: `HY4_CHUNK` up to 1024 (the indexer's logits are `[chunk, ctx / 4]` f32: 1 GiB at chunk 1024 and
   1M context, so 512 is the next step at 32k-256k).
+- **Tensor-core value-up + gate** (`hy4_uv_gate_tc_*`, per head a wmma GEMM of ol x Wv^T with the sigmoid gate
+  fused) for >= `HY4_TC_GEMM_ROWS` rows; tested against the scalar kernel (1.4e-3 bf16, 1.9e-4 f16).
 - **Window script**: a profiling pass after the smoke + bench: one 32k boot per `HY4_PROF_VARIANTS` entry
   (`CHUNK:ATTN_TC_ROWS`, default `256:16 512:16 256:0`), a ~6k-token prompt and 4 streams, the profile lines in the
   window log.
+
+### Window 4 (20 Nov 2026, 12:37-13:15 Paris; profiling pass, builds 32c1614fa then + tensor-core value-up)
+
+Two runs, GLM restored after each (13:01 and 13:15 Paris: health 200, chat 'OK', TC2 7/7). Kernel tests 17/17 (then
+18/18 with the value-up test) incl. the tensor-core attention on the GPU (worst 1.9e-3 .. 3.3e-3 of the largest output
+over sliding ring bf16 / fp8, indexed list bf16 / f32, dense causal). Smoke 3/3 on both builds; MoE check 1.8e-4 ..
+2.2e-4.
+
+Prefill, one 256-row chunk at ~5k deep, device ms (`HY4_PROFILE=4`, 32k, bf16 caches):
+
+| op group | scalar attention | TC attention | + TC value-up |
+|---|---|---|---|
+| experts (grouped EXL3) | 541 | 540 | 532 |
+| attention | 1072 | 275 | 273 |
+| attn_out (value-up + gate, o_proj, norm) | 479 | 481 | 51 |
+| attn_proj (q_a / q_b / kv_a / gate / indexer projections, q absorb) | 141 | 137 | 136 |
+| shared expert | 43 | 42 | 41 |
+| router | 31 | 30 | 30 |
+| indexer / rope + store / dense / Engram / upload | 19 / 16 / 7 / 7 / 5 | 19 / 16 / 7 / 7 / 5 | 19 / 16 / 8 / 7 / 5 |
+| step | 2366 | 1558 | 1119 |
+
+Chunk 512 (TC attention + value-up): 1967-2109 ms a step, experts 1000-1040 ms: every op scales linearly with the rows,
+so the grouped EXL3 experts are compute-bound per (row, expert) pair, not weight-bandwidth-bound; 512 gains ~6%.
+
+Decode, one row (84 ms): attn_proj 19.5, attention 15.2, experts 14.7, attn_out 10.4, router 7.6, shared 6.0,
+rope_store 3.7, logits 1.7, indexer 1.5, dense 1.3, Engram 1.2. Four rows (127 ms): experts 41, attn_proj 19,
+rope_store 14.9 (per-segment launches), attention 14.6, attn_out 12.5. Engram reads overlap (upload wait < 1 ms one
+row, ~4 ms four).
+
+Bench (32k, 4 lanes, bf16; window 3 in brackets): 2k prompt 125 -> 170 (TC attention) -> 238 tok/s prefill (+ value-up);
+8k 112 -> 166 -> 231; 5.5k profile prompt chunk 256: 114 (scalar attention) / 166 / 232, chunk 512: 173 / 247.
+Decode 13.9 (short), 11.9 (2k / 8k); 4 streams 28.4 -> 30.0 tok/s aggregate (30.5 at chunk 512). 256k fp8: 7 lanes,
+28,553-token prompt at 160 tok/s (107), decode 11.1.
+
+Next, from the profile:
+1. Grouped EXL3 experts for prompt rows (48% of a prefill chunk): decode each expert tile once and run it over all
+   of the expert's rows on tensor cores (today the cost is per row x expert); also the per-expert gather / scatter.
+2. Decode: attn_proj (19.5 ms: several small GEMVs + the scalar q absorb a layer; fuse q_a / kv_a / gate, absorb as
+   a batched GEMV), router 7.6 ms (fp32 logits GEMV + top-k a layer: far over its weight bytes), attention 15 ms
+   (one block a row and head over up to 2k keys: split keys across blocks), then CUDA graphs for the launch gaps.
+3. Prefill attention (24%): fp8 / bf16 Q K in one pass with the softmax (flash style) instead of S / P in memory.
+4. rope + store per segment (15 ms with 4 decode rows): one launch over all segments (the device segment table of the
+   CUDA graph plan).

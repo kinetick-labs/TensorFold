@@ -439,6 +439,42 @@ test "Hy4 CUDA forward: the tensor-core GEMM (bf16 and f16 weights) matches the 
     }
 }
 
+test "Hy4 CUDA forward: the tensor-core value-up + gate matches the scalar one (HY4_FWD_FATBIN)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = (try open(a)) orelse return error.SkipZigTest;
+    defer g.deinit();
+    var rng = std.Random.DefaultPrng.init(17);
+    const r = rng.random();
+    // ragged rows, the model's head shapes (nope 192, v 256, latent 512), a few heads
+    const t = 77;
+    const heads = 3;
+    const nope = 192;
+    const vdim = 256;
+    const kvl = 512;
+    const ol = try g.put(try rand(a, r, t * heads * kvl, 1.0), .f32);
+    const gate = try g.put(try rand(a, r, t * heads * vdim, 2.0), .f32);
+    for ([_]fwd.Dt{ .bf16, .f16 }) |dt| {
+        const kvb = try g.put(try rand(a, r, heads * (nope + vdim) * kvl, 0.05), dt);
+        var outs: [2][]f32 = undefined;
+        for (0..2) |pass| {
+            const od = try g.alloc(t * heads * vdim * 4);
+            g.k.tc_min = if (pass == 0) 0 else 32;
+            try g.k.uvGate(g.s, ol.ptr, kvb, gate.ptr, od, t, heads, nope, vdim, kvl);
+            outs[pass] = try a.alloc(f32, t * heads * vdim);
+            try g.c().download(std.mem.sliceAsBytes(outs[pass]), od);
+        }
+        g.k.tc_min = 0;
+        var big: f32 = 0;
+        for (outs[0]) |v| big = @max(big, @abs(v));
+        var e: f32 = 0;
+        for (outs[0], outs[1]) |want, got| e = @max(e, @abs(got - want) / big);
+        std.debug.print("hy4 tensor-core value-up + gate ({s} kv_b) {d} rows x {d} heads: worst error {e} of the largest |out| {e}\n", .{ @tagName(dt), t, heads, e, big });
+        try std.testing.expect(big > 0 and e <= @as(f32, if (dt == .bf16) 1e-2 else 2e-3));
+    }
+}
+
 test "Hy4 CUDA forward: the tensor-core attention matches the scalar one: sliding ring, indexed list, bf16 / fp8 caches (HY4_FWD_FATBIN)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

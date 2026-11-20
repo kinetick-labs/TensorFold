@@ -139,7 +139,8 @@ __device__ __forceinline__ __half to_t<__half>(float x) { return __float2half_rn
 
 template <typename T>
 __device__ __forceinline__ void gemm_tc(const float* __restrict__ x, long long ldx, const T* __restrict__ w, const void* __restrict__ b,
-                                        int bdt, float* __restrict__ y, long long ldy, int m, int n, int k, int accumulate) {
+                                        int bdt, float* __restrict__ y, long long ldy, int m, int n, int k, int accumulate,
+                                        const float* __restrict__ gate = nullptr) {
     using namespace nvcuda;
     __shared__ __align__(32) T xs[64][32 + 8];
     __shared__ __align__(32) T ws[64][32 + 8];
@@ -184,7 +185,8 @@ __device__ __forceinline__ void gemm_tc(const float* __restrict__ x, long long l
     for (int e = lane; e < 32 * 32; e += 32) {
         const int r = row0 + wr + e / 32, c = col0 + wc + e % 32;
         if (r >= m || c >= n) continue;
-        const float v = out[warp][e / 32][e % 32] + (b ? ldw(b, bdt, c) : 0.0f);
+        float v = out[warp][e / 32][e % 32] + (b ? ldw(b, bdt, c) : 0.0f);
+        if (gate) v *= sigm(gate[(long long)r * ldy + c]);
         float* o = y + (long long)r * ldy + c;
         *o = accumulate ? *o + v : v;
     }
@@ -199,6 +201,27 @@ extern "C" __global__ void __launch_bounds__(128) hy4_gemm_tc_f16(const float* _
                                                                   int wdt, const void* __restrict__ b, int bdt, float* __restrict__ y,
                                                                   long long ldy, int m, int n, int k, int accumulate) {
     gemm_tc<__half>(x, ldx, reinterpret_cast<const __half*>(w), b, bdt, y, ldy, m, n, k, accumulate);
+}
+
+// hy4_uv_gate on tensor cores (prompt rows): per head h (grid z) out[t, h, :] = (ol[t, h, :] . Wv_h^T) * sigmoid(gate),
+// Wv_h the value rows of kv_b ([vdim, kvl] at row h * (nope + vdim) + nope). Grid (vdim / 64, ceil(rows / 64), heads).
+template <typename T>
+__device__ __forceinline__ void uv_gate_tc(const float* ol, const T* kvb, const float* gate, float* out, int rows, int heads,
+                                           int nope, int vdim, int kvl) {
+    const int h = blockIdx.z;
+    const long long ho = (long long)h * vdim;
+    gemm_tc<T>(ol + (long long)h * kvl, (long long)heads * kvl, kvb + ((long long)h * (nope + vdim) + nope) * kvl, nullptr, 0,
+               out + ho, (long long)heads * vdim, rows, vdim, kvl, 0, gate + ho);
+}
+extern "C" __global__ void __launch_bounds__(128) hy4_uv_gate_tc_bf16(const float* __restrict__ ol, const void* __restrict__ kvb,
+                                                                      const float* __restrict__ gate, float* __restrict__ out,
+                                                                      int rows, int heads, int nope, int vdim, int kvl) {
+    uv_gate_tc<__nv_bfloat16>(ol, reinterpret_cast<const __nv_bfloat16*>(kvb), gate, out, rows, heads, nope, vdim, kvl);
+}
+extern "C" __global__ void __launch_bounds__(128) hy4_uv_gate_tc_f16(const float* __restrict__ ol, const void* __restrict__ kvb,
+                                                                     const float* __restrict__ gate, float* __restrict__ out,
+                                                                     int rows, int heads, int nope, int vdim, int kvl) {
+    uv_gate_tc<__half>(ol, reinterpret_cast<const __half*>(kvb), gate, out, rows, heads, nope, vdim, kvl);
 }
 
 // The same for at most 8 rows (decode): a warp per output column, lanes along k, every row at once.
