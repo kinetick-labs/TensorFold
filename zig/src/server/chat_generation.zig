@@ -443,7 +443,7 @@ pub const Generation = struct {
         // a resumed segment that ended at its EOS inside the think block the result turn reopened (our readText's case)
         if (native == null and g.thinking) {
             const t = g.collected.items;
-            const unclosed = g.resumed and close_at != .token and reasoning != null and reply_text.pyStrip(content).len == 0 and
+            const unclosed = g.resumed and close_at != null and close_at.? != .token and reasoning != null and reply_text.pyStrip(content).len == 0 and
                 t.len > 0 and g.eos(t[t.len - 1]);
             if (unclosed and !g.close_turn) { // no turn to answer in (no room, or the template has none): its text answers
                 content = reasoning.?;

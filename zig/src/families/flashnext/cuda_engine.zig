@@ -452,7 +452,7 @@ pub const Engine = struct {
     /// EXL3 (an ExLlamaV3 pack): the trellis linear and grouped expert kernels (cuda_exl3.zig)
     k3: ?exl3.Kernels = null,
     /// the lane matmul (cuda.qmmf) for the hyper-connections' decode rows (W.Hc down_l / up_l)
-    lane: ?*const cuda.qmmf.Lane = null,
+    lane: ?cuda.qmmf.Lane = null,
     /// with `digest`: each chunk's (streams, logits) sha256 prefixes kept here too (the CLI's media gate)
     digests: ?*std.ArrayList([2][16]u8) = null,
     /// TF_FLASHNEXT_POISON_PADS: rows past a chunk's end in the row-indexed prompt buffers overwritten with
