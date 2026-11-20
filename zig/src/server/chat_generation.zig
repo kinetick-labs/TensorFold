@@ -455,7 +455,6 @@ pub const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (read) content else text, g.tools, reason, g.single) else content;
             const cut = g.lane_own and std.mem.eql(u8, reason, "length");
             const o = reply_text.openersOf(g.srv.markers);
             const shown = if (cut) try reply_owned.cutProse(a, content, o, g.owned) else if (g.calls != null) try tool_stream.endProseOwned(a, content, if (g.thinking) content else text, g.tools, reason, g.single, o, g.owned) else content;
@@ -465,7 +464,7 @@ pub const Generation = struct {
             if (g.calls) |*c| {
                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
                 var out: std.ArrayList(Value) = .empty;
-                const final_text = if (read) content else text;
+                const final_text = if (g.thinking) content else text;
                 if (std.mem.eql(u8, reason, "length")) {
                     try c.finishCut(final_text, &out);
                 } else if (close.len > 0 or c.streamed or g.recipient != null) {
