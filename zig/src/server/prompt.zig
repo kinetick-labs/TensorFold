@@ -169,7 +169,6 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     const marks = srv.info.prompt_cache or srv.chunks.step > 0; // read only by the prompt cache and prompt cuts
     const prompt = try renderStarts(srv, cx, input.messages, input.tools, thinking, effort, true, input.explicit_off, if (marks) &message_starts else null);
     if (input.media) |raw| return @import("vision_helper_prompt.zig").prepare(srv, cx, raw, input.tools, thinking, effort);
-    const prompt = try renderRequest(srv, cx, input.messages, input.tools, thinking, effort, true, input.explicit_off);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
