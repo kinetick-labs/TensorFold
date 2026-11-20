@@ -182,16 +182,25 @@ Done in code, host-tested, compiled for sm_121 / aarch64; none of the new kernel
 Deferred:
 
 - **CUDA graphs** of the decode step: needs positions and segment tables on the device (today `p0`, ring slots and the
-  segment loop are host values baked into launch arguments) and fixed-size grids for top-k / grouped MoE. Plan: a
-  device `Seg` table written by one small upload per step, kernels reading it, then capture one graph per lane count.
+  segment loop are host values baked into launch arguments) and fixed-size grids for top-k / grouped MoE. Plan:
+  (1) a device `Seg` table `{p0, rows, lane cache base, ring slot}` per segment, written into the pinned stage and
+  uploaded with the ids; (2) rope / cache store / indexer / attention read it (grid over segments x heads, `p0` from the
+  table, key counts bounded by the window or `(recall + 1) * kpool`, so grids are fixed); (3) grouped MoE with a fixed
+  grid over `rows * topk` (empty tiles exit) — already true for the decode rows; (4) capture one graph per lane count
+  (1..8) on the first decode step, replay with only the stage upload before it. Worth it once the profile shows the
+  decode step's launch gaps: ~42 layers x ~25 launches, at a few us each ~3-5 ms of the ~70-90 ms step.
 - **Multi-stream CUDA streams** (overlap of Engram reads / uploads with the first layers): after graphs.
 
 ### DFly2 drafter (design; implementation next)
 
 Reference: Tencent AngelSpec (`models/draft/dfly2.py`, `dspark.py`, `hy4_mla.py`, config
 `dfly2_hy_v4_flash_draft_config.json`), Apache-2.0 — our implementation follows its published design and credits it.
-The pack carries `model.dfly_layers.0..4.*` (EXL3 q_b / o_proj / MLP, plain q_a / kv_a / kv_b / linear_gate / norms /
-learnable sink) plus `mtp_fusion`, `hidden_correction`, `confidence_head`, `final_norm`.
+The pack carries `model.dfly_layers.0..4.*` (EXL3 q_b / linear_gate / o_proj / MLP gate-up-down 3072 -> 9216 -> 3072,
+plain bf16 q_a / kv_a, f16 kv_b `[32 x (192 + 256), 512]`, norms, f32 learnable sink `[32]`) plus `mtp_fusion`
+(eh_proj `[3072, 6144]`, enorm, hnorm, gate), `hidden_correction` (gate / up `[3072, 6144]`, down `[3072, 3072]`,
+hidden_norm, embed_norm), `confidence_head` (`[1, 3072]` + bias) and `final_norm`. `draft_plan.zig` lists every one
+with the shape the engine binds and checks them against the pack's headers (host test over
+`fixtures/dfly_headers.json`, the 177 real headers: all bound, none left over).
 
 - Inputs: the target's hidden states of the last accepted row (fused by `mtp_fusion`: enorm(embedding) ‖
   hnorm(hidden) -> eh_proj, gated), `hidden_correction` on top.
@@ -201,7 +210,10 @@ learnable sink) plus `mtp_fusion`, `hidden_correction`, `confidence_head`, `fina
   gives a per-position stop score (adaptive k).
 - Verify: the block goes through the multi-row path as one segment (t = k + 1 rows); rollback = lane position reset
   (ring rows and indexer pools are rewritten from the accepted position; the full-history layers just overwrite).
-- Engine work: a `Draft` struct bound from the pack (bind.zig group `draft`), a forward reusing `hy4_mla_attn` with the
+- Per draft layer, the keys are the target layer's cached latents (normed latent + roped key, as our cache already
+  stores them) kept to that layer's top-k, plus the block's own latents from the draft layer's `kv_a` (the block sees
+  itself in full); the attention is the same absorbed MLA as `hy4_mla_attn`, with a second key source.
+- Engine work: a `Draft` struct bound from the pack (bind.zig group `draft`, shapes per `draft_plan.zig`), a forward reusing `hy4_mla_attn` with the
   target's `CacheView` of the five source layers, and the accept loop in `serve_engine` (greedy first, then
   sampling with the standard speculative acceptance).
 
@@ -231,3 +243,24 @@ learnable sink) plus `mtp_fusion`, `hidden_correction`, `confidence_head`, `fina
   | 256k | 2 | 4 | 6-7 | 7 lanes, 2142 MiB each, MemAvailable low 6.9 GiB with 4 streams + a 28k fill |
   | 512k | 1 | 2 | 3 | 3 lanes, 4269 MiB each, MemAvailable 9.4 GiB after the fill |
   | 1M | 0 | 1 | 1 | 1 lane, 8523 MiB, 10.3 GiB of the device free |
+
+### After window 3 (code; GPU-tested in the next window)
+
+- **Tensor-core attention for prompt chunks** (`hy4_mla_scores_tc` / `hy4_mla_softmax` / `hy4_mla_pv_tc`): for >= 16
+  rows (`HY4_ATTN_TC_ROWS`, 0 = the scalar kernel), scores Q_abs x [latent | rope]^T as wmma bf16 64x64 tiles over the
+  row's keys (ring window, the indexer's kept groups plus its own, or causal), the softmax with the head's sink, then
+  P x latent in wmma; scratch for `HY4_ATTN_TC_PIECE` rows (64) x heads x keys. f32 / bf16 / fp8 caches read through
+  the same per-row scale. Tested against the scalar kernel (sliding ring bf16 / fp8, indexed list bf16 / f32, dense
+  causal; 2e-2 of the largest output) in `hy4-gpu-test`.
+- **Profiling mode** (`prof.zig`, `HY4_PROFILE=N`): CUDA events between op groups of every step (upload, embed,
+  Engram, attention projections, rope + cache store, indexer, attention, attention output, router, experts, shared
+  expert, dense MLP, logits) and host timers (schedule, Engram reads, sampling); every N steps the serve logs
+  `hy4 profile prefill|decode: steps, rows a step, wall ms, device ms: <op> ms ...; host ...`.
+- **Fewer syncs on the step**: the host inputs (embeddings, masks, ids, positions) live in two pinned stages used in
+  turn, so the uploads are async and the stream no longer syncs after them; a stage is reused once the event after its
+  uploads fired.
+- **Larger chunks**: `HY4_CHUNK` up to 1024 (the indexer's logits are `[chunk, ctx / 4]` f32: 1 GiB at chunk 1024 and
+  1M context, so 512 is the next step at 32k-256k).
+- **Window script**: a profiling pass after the smoke + bench: one 32k boot per `HY4_PROF_VARIANTS` entry
+  (`CHUNK:ATTN_TC_ROWS`, default `256:16 512:16 256:0`), a ~6k-token prompt and 4 streams, the profile lines in the
+  window log.

@@ -3,7 +3,8 @@
 # kernel tests against their CPU references (hy4-gpu-test: hc, the forward layers incl. ring / bf16 / fp8 caches and
 # two sequences a call, Engram, vision; HY4_LOAD=1 adds the whole-pack load + spot checks), then serve Hy4
 # (HY4_SERVE_BIN, --vision, 32k, 4 lanes, bf16 caches) for the text + image smoke and the bench (short / 2k / 8k,
-# 4 streams at once), then the stream capacity: one boot per context in HY4_CAP_CTX (default 256k 512k 1M, caches
+# 4 streams at once), then a profiling pass (HY4_PROF_VARIANTS boots: chunk and tensor-core attention on/off, op
+# timings from HY4_PROFILE), then the stream capacity: one boot per context in HY4_CAP_CTX (default 256k 512k 1M, caches
 # HY4_CAP_DT, default fp8) logging the lanes that fit, MemAvailable, a HY4_FILL_WORDS-word fill (~1.3 tokens a word)
 # and min(lanes, 4) streams at once. Then restore GLM prod and check it (health 200, a chat answer, TC2). Restore
 # runs on success, failure, Ctrl-C, and by a deadline (HY4_WINDOW_MIN, default 60) from a detached sleeper; a guard
@@ -94,6 +95,23 @@ if [ -n "${HY4_SERVE_BIN:-}" ]; then
     if [ -n "${HY4_HOLD:-}" ]; then rm -f $D/release; log "hold: touch $D/release to end"; while [ ! -e $D/release ] && kill -0 $(cat $D/serve.pid) 2>/dev/null; do sleep 5; done; fi
   fi
   serve_down
+
+  # --- 2b. profiling pass: one 32k boot per variant in HY4_PROF_VARIANTS (CHUNK:ATTN_TC_ROWS, default the new path at
+  # chunks 256 and 512 and the scalar attention at 256), HY4_PROFILE=4 (op groups timed on the stream: a summary every 4
+  # steps), a ~6k-token prompt then 4 streams; the "hy4 profile" lines go to the window log. Skipped with < 15 min left
+  # before the capacity reserve. HY4_PROF_VARIANTS= (empty) skips it.
+  for v in ${HY4_PROF_VARIANTS-256:16 512:16 256:0}; do
+    left=$(( END - $(date +%s) - ${HY4_CAP_RESERVE_S:-900} ))
+    [ $left -ge 900 ] || { log "profile $v: skipped, $((left / 60)) min left before the capacity reserve"; continue; }
+    if HY4_PROFILE=${HY4_PROFILE_EVERY:-4} HY4_CHUNK=${v%%:*} HY4_ATTN_TC_ROWS=${v##*:} serve_up 32768 --parallel 4; then
+      timeout $(( left > 900 ? 600 : left - 300 )) python3 $D/bench.py 8095 --skip-base --fill ${HY4_PROF_FILL:-4600} --parallel 4 2>&1 | sed "s/^/[chunk ${v%%:*} tc ${v##*:}] /" | tee -a $L
+      grep -E "hy4 profile" $D/serve.out | sed "s/^/[chunk ${v%%:*} tc ${v##*:}] /" | tail -${HY4_PROF_LINES:-40} | tee -a $L
+      cp $D/serve.out $D/serve-prof-${v%%:*}-${v##*:}.out
+    else
+      log "profile $v: boot failed; $(grep -E 'error|budget|OutOfDeviceMemory' $D/serve.out | tail -2 | tr '\n' ' ')"
+    fi
+    serve_down
+  done
 
   # --- 3. stream capacity: a boot per context, lanes not fixed (the engine takes what fits, at most 8)
   for ctx in ${HY4_CAP_CTX:-262144 524288 1048576}; do

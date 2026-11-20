@@ -82,6 +82,7 @@ fn open(a: std.mem.Allocator) !?*Gpu {
     g.ctx = try cuda.Context.init(&g.d, 0);
     g.k = try fwd.Kernels.load(&g.d, image);
     g.k.tc_min = 0; // the reference comparisons run the fp32 GEMM; the tensor-core one has its own test
+    g.k.attn_tc_min = 0; // likewise the scalar attention (the tensor-core attention test compares the two)
     g.s = try cuda.Stream.init(&g.d, true);
     return g;
 }
@@ -435,6 +436,91 @@ test "Hy4 CUDA forward: the tensor-core GEMM (bf16 and f16 weights) matches the 
         std.debug.print("hy4 tensor-core GEMM ({s} weights) {d}x{d}x{d}: worst error {e} of the largest |y|\n", .{ @tagName(dt), m, n, k, e });
         // x rounded to the weight type: bf16 keeps 8 bits, f16 11
         try std.testing.expect(e <= @as(f32, if (dt == .bf16) 1e-2 else 2e-3));
+    }
+}
+
+test "Hy4 CUDA forward: the tensor-core attention matches the scalar one: sliding ring, indexed list, bf16 / fp8 caches (HY4_FWD_FATBIN)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = (try open(a)) orelse return error.SkipZigTest;
+    defer g.deinit();
+    var rng = std.Random.DefaultPrng.init(17);
+    const r = rng.random();
+    const kvl = 512;
+    const rope = 64;
+    const nope = 16;
+    const qk = nope + rope;
+    const Case = struct { name: []const u8, heads: u32, slots: u32, p0: u32, t: u32, window: u32, listed: bool, dt: fwd.CacheDt };
+    const cases = [_]Case{
+        .{ .name = "sliding ring bf16", .heads = 64, .slots = 96, .p0 = 120, .t = 37, .window = 40, .listed = false, .dt = .bf16 },
+        .{ .name = "sliding ring fp8", .heads = 64, .slots = 96, .p0 = 120, .t = 37, .window = 40, .listed = false, .dt = .fp8 },
+        .{ .name = "indexed list bf16", .heads = 32, .slots = 256, .p0 = 200, .t = 20, .window = 0, .listed = true, .dt = .bf16 },
+        .{ .name = "indexed list f32", .heads = 32, .slots = 256, .p0 = 200, .t = 20, .window = 0, .listed = true, .dt = .f32 },
+        .{ .name = "dense causal bf16", .heads = 32, .slots = 256, .p0 = 0, .t = 70, .window = 0, .listed = false, .dt = .bf16 },
+    };
+    for (cases) |cs| {
+        // the cache: random latent + rotary rows stored through the cache kernel
+        const src = try rand(a, r, @as(usize, cs.slots) * (kvl + rope), 1.0);
+        const src_d = try g.alloc(src.len * 4);
+        try g.c().upload(src_d, std.mem.sliceAsBytes(src));
+        const lat = try g.alloc(@as(u64, cs.slots) * kvl * cs.dt.latBytes());
+        const rot = try g.alloc(@as(u64, cs.slots) * rope * cs.dt.rotBytes());
+        const scl = try g.alloc(@as(u64, cs.slots) * 4);
+        const cv: fwd.Kernels.CacheView = .{ .lat = lat, .rot = rot, .scale = if (cs.dt == .fp8) scl else 0, .dt = cs.dt, .slots = cs.slots };
+        try g.k.cacheStore(g.s, src_d, kvl + rope, kvl, rope, cv, 0, cs.slots);
+        const ql = try rand(a, r, @as(usize, cs.t) * cs.heads * kvl, 0.08);
+        const q = try rand(a, r, @as(usize, cs.t) * cs.heads * qk, 0.3);
+        const sinks = try rand(a, r, cs.heads, 1.0);
+        const ql_d = (try g.put(ql, .f32)).ptr;
+        const q_d = (try g.put(q, .f32)).ptr;
+        const sinks_d = (try g.put(sinks, .f32)).ptr;
+        // indexed: up to 12 kept groups before the row's own, distinct, ascending
+        const ld: u32 = 12;
+        var keep: fwd.Kernels.Keep = .{};
+        var nkmax: u64 = 0;
+        if (cs.listed) {
+            const list = try a.alloc(i32, cs.t * ld);
+            const count = try a.alloc(i32, cs.t);
+            for (0..cs.t) |row| {
+                const own = (cs.p0 + row) / 4;
+                var k: u32 = 0;
+                var gg: u32 = 0;
+                while (gg < own and k < ld) : (gg += 1) {
+                    if (r.uintLessThan(u32, 4) != 0) continue;
+                    list[row * ld + k] = @intCast(gg);
+                    k += 1;
+                }
+                count[row] = @intCast(k);
+            }
+            const list_d = try g.alloc(list.len * 4);
+            try g.c().upload(list_d, std.mem.sliceAsBytes(list));
+            const count_d = try g.alloc(count.len * 4);
+            try g.c().upload(count_d, std.mem.sliceAsBytes(count));
+            keep = .{ .list = list_d, .ld = ld, .count = count_d, .kpool = 4 };
+            nkmax = (ld + 1) * 4;
+        } else nkmax = if (cs.window > 0) cs.window else cs.p0 + cs.t;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, qk));
+        var outs: [2][]f32 = undefined;
+        const piece: u32 = 16; // several pieces, the last one short
+        const S = try g.alloc(piece * cs.heads * nkmax * 4);
+        const P = try g.alloc(piece * cs.heads * nkmax * 2);
+        for (0..2) |pass| {
+            const ol = try g.alloc(@as(u64, cs.t) * cs.heads * kvl * 4);
+            if (pass == 0) {
+                try g.k.mlaAttn(g.s, ql_d, q_d, qk, nope, cv, sinks_d, ol, cs.t, cs.heads, kvl, rope, cs.p0, cs.window, keep, scale);
+            } else {
+                try g.k.mlaAttnTc(g.s, ql_d, q_d, qk, nope, cv, sinks_d, ol, cs.t, cs.heads, kvl, rope, cs.p0, cs.window, keep, scale, S, P, nkmax, piece);
+            }
+            outs[pass] = try a.alloc(f32, @as(usize, cs.t) * cs.heads * kvl);
+            try g.c().download(std.mem.sliceAsBytes(outs[pass]), ol);
+        }
+        var big: f32 = 0;
+        for (outs[0]) |v| big = @max(big, @abs(v));
+        var e: f32 = 0;
+        for (outs[0], outs[1]) |want, got| e = @max(e, @abs(got - want) / big);
+        std.debug.print("hy4 tensor-core attention ({s}, {d} heads, {d} rows): worst error {e} of the largest |out| {e}\n", .{ cs.name, cs.heads, cs.t, e, big });
+        try std.testing.expect(e <= 2e-2);
     }
 }
 

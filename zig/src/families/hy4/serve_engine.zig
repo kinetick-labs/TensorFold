@@ -59,6 +59,46 @@ fn envU32(name: [*:0]const u8, default: u32) u32 {
     return std.fmt.parseInt(u32, std.mem.span(v), 10) catch default;
 }
 
+/// A step's host-side inputs in page-locked memory, so their uploads are truly asynchronous: two of them take turns
+/// and a stage is refilled only after the device has read it (its event), so the host prepares step N + 1 (Engram
+/// reads above all) while the device still runs step N.
+const Stage = struct {
+    mem: [*]align(16) u8,
+    bytes: usize,
+    emb: []f32,
+    mask: []u8,
+    ids: []i32,
+    pos: []i32, // [3, chunk]: the positions of the step's rows, plane by plane
+    read: cuda.Event,
+    used: bool = false,
+
+    fn init(d: *const cuda.Driver, emb: usize, chunk: usize) !Stage {
+        const al = struct {
+            fn up(n: usize) usize {
+                return std.mem.alignForward(usize, n, 64);
+            }
+        }.up;
+        const bytes = al(emb * 4) + al(chunk) + al(chunk * 4) + al(3 * chunk * 4);
+        var p: ?*anyopaque = null;
+        try d.check(d.api.cuMemHostAlloc(&p, bytes, cuda.abi.host_alloc_portable), "cuMemHostAlloc");
+        const m: [*]align(16) u8 = @ptrCast(@alignCast(p.?));
+        var at: usize = 0;
+        const e: [*]f32 = @ptrCast(@alignCast(m + at));
+        at += al(emb * 4);
+        const mk = m + at;
+        at += al(chunk);
+        const ids: [*]i32 = @ptrCast(@alignCast(m + at));
+        at += al(chunk * 4);
+        const pos: [*]i32 = @ptrCast(@alignCast(m + at));
+        return .{ .mem = m, .bytes = bytes, .emb = e[0..emb], .mask = mk[0..chunk], .ids = ids[0..chunk], .pos = pos[0 .. 3 * chunk], .read = try cuda.Event.init(d, false) };
+    }
+
+    fn deinit(st: *Stage, d: *const cuda.Driver) void {
+        st.read.deinit();
+        _ = d.api.cuMemFreeHost(st.mem);
+    }
+};
+
 /// One request's state: its caches, positions and tokens.
 const Lane = struct {
     job: ?*Job = null,
@@ -114,10 +154,16 @@ pub const Runner = struct {
     e4m3: [256]f32,
     ctx_len: u32,
     info_: api.Info,
-    // a step's host buffers
-    emb_host: []f32,
-    mask_host: []u8,
-    ids_host: []i32,
+    // a step's host buffers: the current stage's (Stage), two taking turns
+    stages: [2]Stage = undefined,
+    stage_at: u1 = 0,
+    emb_host: []f32 = &.{},
+    mask_host: []u8 = &.{},
+    ids_host: []i32 = &.{},
+    pos_host: []i32 = &.{},
+    // HY4_PROFILE=N: op groups timed every step, a summary every N steps
+    prof: gm.Prof = undefined,
+    profiling: bool = false,
     logits: []f32, // [lanes, vocab]
     values: []f64,
     cand: []u64,
@@ -240,6 +286,12 @@ pub const Runner = struct {
         }
         r.engram_threads = engram_batch.threadsFromEnv();
         lim.engram_layers = @intCast(@max(tables.len, 1));
+        // tensor-core attention for prompt rows: scratch for HY4_ATTN_TC_PIECE rows (default 64) of the most keys a row
+        // sees (the window, or the indexer's kept groups and its own); HY4_ATTN_TC_ROWS=0 keeps the scalar kernel
+        if (r.k.attn_tc_min > 0) {
+            lim.att_keys = @max(t.window, (lim.recall + 1) * @max(t.index_pool, 1));
+            lim.att_rows = @max(1, envU32("HY4_ATTN_TC_PIECE", 64));
+        }
         r.work = try gm.Work.init(a, r.ctx_(), lim);
         r.work.check_left = envU32("HY4_MOE_CHECK", 0);
         // vision
@@ -284,9 +336,14 @@ pub const Runner = struct {
         if (at - r.cache_buf.ptr != per_lane * fits) return error.Hy4Shape;
         std.log.info("hy4: {d} lanes of {d} tokens, {s} caches, {d} MiB each; chunk {d}", .{ fits, r.ctx_len, @tagName(r.cache_dt), per_lane >> 20, r.chunk });
         // host buffers
-        r.emb_host = try a.alloc(f32, @as(usize, lim.engram_layers) * r.chunk * lim.engram_width);
-        r.mask_host = try a.alloc(u8, r.chunk);
-        r.ids_host = try a.alloc(i32, r.chunk);
+        for (&r.stages) |*st| st.* = try Stage.init(&r.d, @as(usize, lim.engram_layers) * r.chunk * lim.engram_width, r.chunk);
+        r.useStage();
+        if (envU32("HY4_PROFILE", 0) > 0) {
+            r.prof = try gm.Prof.init(a, &r.d, r.s, 4096, envU32("HY4_PROFILE", 0));
+            r.profiling = true;
+            r.work.prof = &r.prof;
+            std.log.info("hy4: profiling every {d} steps (HY4_PROFILE)", .{envU32("HY4_PROFILE", 0)});
+        }
         r.logits = try a.alloc(f32, @as(usize, fits) * t.vocab);
         r.values = try a.alloc(f64, t.vocab);
         r.cand = try a.alloc(u64, t.vocab);
@@ -373,6 +430,8 @@ pub const Runner = struct {
         if (r.thread) |t| t.join();
         r.ctx.makeCurrent() catch {};
         r.work.deinit();
+        if (r.profiling) r.prof.deinit();
+        for (&r.stages) |*st| st.deinit(&r.d);
         r.cache_buf.free();
         if (r.vwork) |*v| v.deinit();
         if (r.img_buf) |*b| b.free();
@@ -524,12 +583,22 @@ pub const Runner = struct {
         if (np == 0) return;
         const parts = r.parts[0..np];
         const t = used;
+        const kind: gm.prof.Kind = if (t > np) .prefill else .decode;
+        if (r.profiling) try r.prof.start();
+        // this step's stage: free once the device read it two steps ago
+        const st = &r.stages[r.stage_at];
+        if (st.used) try st.read.synchronize();
+        r.useStage();
         // token ids, positions and picture rows
         r.spans_step.clearRetainingCapacity();
         for (parts) |p| {
             const ln = &r.lanes[p.lane];
             for (0..p.rows) |q| r.ids_host[p.row + q] = @intCast(ln.tokens.items[p.p0 + q]);
-            for (0..3) |pl| try c.upload(ln.pos_dev + 4 * (@as(u64, pl) * r.ctx_len + p.p0), std.mem.sliceAsBytes(ln.pos[pl][p.p0..][0..p.rows]));
+            for (0..3) |pl| {
+                const ph = r.pos_host[pl * r.chunk + p.row ..][0..p.rows];
+                @memcpy(ph, ln.pos[pl][p.p0..][0..p.rows]);
+                try c.upload(ln.pos_dev + 4 * (@as(u64, pl) * r.ctx_len + p.p0), std.mem.sliceAsBytes(ph));
+            }
             for (ln.spans.items) |sp| {
                 const lo = @max(sp.row, p.p0);
                 const hi = @min(sp.row + sp.rows, p.p0 + p.rows);
@@ -538,8 +607,13 @@ pub const Runner = struct {
             }
         }
         try c.upload(w.tokens, std.mem.sliceAsBytes(r.ids_host[0..t]));
-        try r.engramRows(parts);
+        try r.engramRows(parts, kind);
+        try st.read.record(r.s);
+        st.used = true;
+        r.stage_at ^= 1;
+        try w.mark(.upload);
         try gm.embedWithImage(w, &r.m.head, t, tx.hc_mult, tx.hidden, r.spans_step.items);
+        try w.mark(.embed);
         const segs = r.segs[0..np];
         for (r.m.layers, 0..) |*Ly, li| {
             for (parts, segs) |p, *sg| sg.* = .{ .cache = r.lanes[p.lane].caches[li], .pos = r.lanes[p.lane].pos_dev, .p0 = p.p0, .row = p.row, .rows = p.rows };
@@ -564,10 +638,19 @@ pub const Runner = struct {
                 r.mutex.unlock(r.io);
             }
         }
-        if (nl == 0) return;
+        if (nl == 0) {
+            if (r.profiling) try r.prof.finish(kind, t);
+            return;
+        }
         try gm.logitsOf(w, &r.m.head, last[0..nl], tx.hc_mult, tx.hidden, tx.eps, tx.hc_eps);
+        try w.mark(.logits);
         try c.download(std.mem.sliceAsBytes(r.logits[0 .. nl * tx.vocab]), w.head);
+        const t_sample = gm.prof.nowNs();
         for (who[0..nl], 0..) |lane, q| try r.advance(lane, r.logits[q * tx.vocab ..][0..tx.vocab]);
+        if (r.profiling) {
+            r.prof.addHost(.sample, kind, gm.prof.nowNs() - t_sample);
+            try r.prof.finish(kind, t);
+        }
     }
 
     /// A lane's next token from its logits row: delivered, then the stop checks.
@@ -629,7 +712,16 @@ pub const Runner = struct {
 
     /// Every Engram layer's rows for the step's tokens (hashed here, read by the thread pool), the owner mask, one
     /// upload each.
-    fn engramRows(r: *Runner, parts: []const Part) !void {
+    /// Point the step's host slices at the current stage.
+    fn useStage(r: *Runner) void {
+        const st = &r.stages[r.stage_at];
+        r.emb_host = st.emb;
+        r.mask_host = st.mask;
+        r.ids_host = st.ids;
+        r.pos_host = st.pos;
+    }
+
+    fn engramRows(r: *Runner, parts: []const Part, kind: gm.prof.Kind) !void {
         const tx = &r.c.text;
         if (r.engram_layers.len == 0) return;
         const E: usize = tx.hashHeads() * tx.engramHeadDim();
@@ -664,12 +756,13 @@ pub const Runner = struct {
                 }
             }
         }
+        const t_read = gm.prof.nowNs();
         try engram_batch.readAll(r.reqs.items, &r.e4m3, r.engram_threads);
+        if (r.profiling) r.prof.addHost(.engram_read, kind, gm.prof.nowNs() - t_read);
         const c = r.ctx_();
         for (0..r.engram_layers.len) |slot| try c.upload(r.work.embAt(@intCast(slot)), std.mem.sliceAsBytes(r.emb_host[slot * r.chunk * E ..][0 .. t * E]));
         try c.upload(r.work.mask, r.mask_host[0..t]);
-        // the host buffers are refilled by the next step: wait until the uploads were read
-        try r.s.synchronize();
+        // no wait here: the stage is page-locked and not refilled before its `read` event (step)
     }
 
     fn sample(r: *Runner, req: *const api.Request, row: []const f32, position: u64) !u32 {

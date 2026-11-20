@@ -505,6 +505,208 @@ extern "C" __global__ void __launch_bounds__(256) hy4_cache_store(const float* _
     for (int c = threadIdx.x; c < rope; c += 256) stc(rot, rdt, slot * rope + c, x[kvl + c]);
 }
 
+// ---------------------------------------------------------------- MLA on tensor cores (prompt rows)
+// The same attention as hy4_mla_attn in three passes for many query rows: all heads of a row against a tile of its
+// keys as one 64 x 64 x (kvl + rope) wmma product (Q and K rounded to bf16, fp32 sums), a softmax per row and head
+// with the sink, then P (bf16) times the latents. Scores live in `S` ([rows, heads, s_ld] f32), weights in `P`
+// ([rows, heads, s_ld] bf16); the caller cuts the rows so they fit. Keys as hy4_mla_attn: key v of row t is
+// att_slot(...); rows past their key count are not written and not read.
+__device__ __forceinline__ long long att_nkeys(long long t, long long i, long long lo, const int* __restrict__ list,
+                                               const int* __restrict__ count, int kpool) {
+    return list ? ((long long)count[t] + 1) * kpool : i - lo + 1;
+}
+__device__ __forceinline__ long long att_slot(long long t, long long v, long long i, long long lo, long long nk,
+                                              const int* __restrict__ list, long long list_ld,
+                                              const int* __restrict__ count, int kpool, long long slots) {
+    if (v >= nk) return -1;
+    long long j;
+    if (list) {
+        const long long picked = count[t];
+        const long long g = v < picked * kpool ? (long long)list[t * list_ld + v / kpool] : i / kpool;
+        j = g * kpool + v % kpool;
+        if (j > i) return -1;
+    } else {
+        j = lo + v;
+    }
+    return j % slots;
+}
+
+extern "C" __global__ void __launch_bounds__(128) hy4_mla_scores_tc(
+    const float* __restrict__ ql, const float* __restrict__ q, int qk, int nope, const void* __restrict__ lat,
+    const void* __restrict__ rot, const float* __restrict__ lscale, int dt, long long slots, float* __restrict__ S,
+    long long s_ld, int heads, int kvl, int rope, long long qpos0, int window, const int* __restrict__ list,
+    long long list_ld, const int* __restrict__ count, int kpool, float scale) {
+    using namespace nvcuda;
+    __shared__ __align__(32) __nv_bfloat16 qs[64][32 + 8];
+    __shared__ __align__(32) __nv_bfloat16 ks[64][32 + 8];
+    __shared__ __align__(32) float out[4][32][32 + 4];
+    __shared__ long long sl[64];
+    __shared__ float kscale[64];
+    const long long t = blockIdx.x;
+    const long long v0 = (long long)blockIdx.y * 64;
+    const int h0 = blockIdx.z * 64;
+    const long long i = qpos0 + t;
+    const long long lo = window > 0 ? (i - window + 1 > 0 ? i - window + 1 : 0) : 0;
+    const long long nk = att_nkeys(t, i, lo, list, count, kpool);
+    if (v0 >= nk) return;
+    const int rdt = rot_dt(dt);
+    const int K = kvl + rope;
+    if (threadIdx.x < 64) {
+        const long long slot = att_slot(t, v0 + threadIdx.x, i, lo, nk, list, list_ld, count, kpool, slots);
+        sl[threadIdx.x] = slot;
+        kscale[threadIdx.x] = (slot >= 0 && dt == CDT_FP8) ? lscale[slot] : 1.0f;
+    }
+    const int warp = threadIdx.x >> 5;
+    const int wr = (warp >> 1) * 32, wc = (warp & 1) * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 2; ++b) wmma::fill_fragment(acc[a][b], 0.0f);
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        for (int e = threadIdx.x; e < 64 * 32; e += 128) {
+            const int r = e / 32, kk = e % 32, c = k0 + kk;
+            const int h = h0 + r;
+            float qv = 0.0f;
+            if (h < heads && c < K) {
+                const long long th = t * heads + h;
+                qv = c < kvl ? ql[th * kvl + c] : q[th * qk + nope + (c - kvl)];
+            }
+            qs[r][kk] = __float2bfloat16_rn(qv);
+            const long long slot = sl[r];
+            float kv = 0.0f;
+            if (slot >= 0 && c < K) kv = c < kvl ? ldc(lat, dt, slot * kvl + c) * kscale[r] : ldc(rot, rdt, slot * rope + (c - kvl));
+            ks[r][kk] = __float2bfloat16_rn(kv);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> fb[2];
+#pragma unroll
+            for (int a = 0; a < 2; ++a) wmma::load_matrix_sync(fa[a], &qs[wr + 16 * a][kk], 32 + 8);
+#pragma unroll
+            for (int b = 0; b < 2; ++b) wmma::load_matrix_sync(fb[b], &ks[wc + 16 * b][kk], 32 + 8);
+#pragma unroll
+            for (int a = 0; a < 2; ++a)
+#pragma unroll
+                for (int b = 0; b < 2; ++b) wmma::mma_sync(acc[a][b], fa[a], fb[b], acc[a][b]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 2; ++b) wmma::store_matrix_sync(&out[warp][16 * a][16 * b], acc[a][b], 32 + 4, wmma::mem_row_major);
+    __syncwarp();
+    const int lane = threadIdx.x & 31;
+    for (int e = lane; e < 32 * 32; e += 32) {
+        const int r = e / 32, col = e % 32;
+        const int h = h0 + wr + r;
+        const long long v = v0 + wc + col;
+        if (h >= heads || v >= nk) continue;
+        S[(t * heads + h) * s_ld + v] = sl[wc + col] >= 0 ? out[warp][r][col] * scale : -INFINITY;
+    }
+}
+
+// P[t, h, v] = exp(S - m) / (exp(sink - m) + sum exp(S - m)) over the row's keys; one block a row and head.
+extern "C" __global__ void __launch_bounds__(256) hy4_mla_softmax(const float* __restrict__ S, __nv_bfloat16* __restrict__ P,
+                                                                  long long s_ld, const float* __restrict__ sinks, int heads,
+                                                                  long long qpos0, int window, const int* __restrict__ count,
+                                                                  int listed, int kpool) {
+    __shared__ float scratch[32];
+    const long long t = blockIdx.x;
+    const int h = blockIdx.y;
+    const long long i = qpos0 + t;
+    const long long lo = window > 0 ? (i - window + 1 > 0 ? i - window + 1 : 0) : 0;
+    const long long nk = listed ? ((long long)count[t] + 1) * kpool : i - lo + 1;
+    const float* s = S + (t * heads + h) * s_ld;
+    __nv_bfloat16* p = P + (t * heads + h) * s_ld;
+    float m = -INFINITY;
+    for (long long v = threadIdx.x; v < nk; v += 256) m = fmaxf(m, s[v]);
+    m = fmaxf(block_max<256>(m, scratch), sinks[h]);
+    float sum = 0.0f;
+    for (long long v = threadIdx.x; v < nk; v += 256) sum += s[v] == -INFINITY ? 0.0f : expf(s[v] - m);
+    sum = block_sum<256>(sum, scratch) + expf(sinks[h] - m);
+    const float inv = 1.0f / sum;
+    for (long long v = threadIdx.x; v < nk; v += 256) p[v] = __float2bfloat16_rn(s[v] == -INFINITY ? 0.0f : expf(s[v] - m) * inv);
+}
+
+// ol[t, h, c] = sum_v P[t, h, v] * lat[slot(v), c] (fp8: times its row scale); 64 heads x 64 channels a block.
+extern "C" __global__ void __launch_bounds__(128) hy4_mla_pv_tc(
+    const __nv_bfloat16* __restrict__ P, long long s_ld, const void* __restrict__ lat, const float* __restrict__ lscale,
+    int dt, long long slots, float* __restrict__ ol, int heads, int kvl, long long qpos0, int window,
+    const int* __restrict__ list, long long list_ld, const int* __restrict__ count, int kpool) {
+    using namespace nvcuda;
+    __shared__ __align__(32) __nv_bfloat16 ps[64][32 + 8];
+    __shared__ __align__(32) __nv_bfloat16 vs[32][64 + 8];
+    __shared__ __align__(32) float out[4][32][32 + 4];
+    __shared__ long long sl[32];
+    __shared__ float kscale[32];
+    const long long t = blockIdx.x;
+    const int c0 = blockIdx.y * 64;
+    const int h0 = blockIdx.z * 64;
+    const long long i = qpos0 + t;
+    const long long lo = window > 0 ? (i - window + 1 > 0 ? i - window + 1 : 0) : 0;
+    const long long nk = att_nkeys(t, i, lo, list, count, kpool);
+    const int warp = threadIdx.x >> 5;
+    const int wr = (warp >> 1) * 32, wc = (warp & 1) * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 2; ++b) wmma::fill_fragment(acc[a][b], 0.0f);
+    for (long long v0 = 0; v0 < nk; v0 += 32) {
+        if (threadIdx.x < 32) {
+            const long long slot = att_slot(t, v0 + threadIdx.x, i, lo, nk, list, list_ld, count, kpool, slots);
+            sl[threadIdx.x] = slot;
+            kscale[threadIdx.x] = (slot >= 0 && dt == CDT_FP8) ? lscale[slot] : 1.0f;
+        }
+        __syncthreads();
+        for (int e = threadIdx.x; e < 64 * 32; e += 128) {
+            const int r = e / 32, kk = e % 32;
+            const int h = h0 + r;
+            const long long v = v0 + kk;
+            ps[r][kk] = (h < heads && v < nk) ? P[(t * heads + h) * s_ld + v] : __float2bfloat16_rn(0.0f);
+        }
+        for (int e = threadIdx.x; e < 32 * 64; e += 128) {
+            const int kk = e / 64, col = e % 64;
+            const long long slot = sl[kk];
+            const int c = c0 + col;
+            vs[kk][col] = __float2bfloat16_rn((slot >= 0 && c < kvl) ? ldc(lat, dt, slot * kvl + c) * kscale[kk] : 0.0f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> fb[2];
+#pragma unroll
+            for (int a = 0; a < 2; ++a) wmma::load_matrix_sync(fa[a], &ps[wr + 16 * a][kk], 32 + 8);
+#pragma unroll
+            for (int b = 0; b < 2; ++b) wmma::load_matrix_sync(fb[b], &vs[kk][wc + 16 * b], 64 + 8);
+#pragma unroll
+            for (int a = 0; a < 2; ++a)
+#pragma unroll
+                for (int b = 0; b < 2; ++b) wmma::mma_sync(acc[a][b], fa[a], fb[b], acc[a][b]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 2; ++b) wmma::store_matrix_sync(&out[warp][16 * a][16 * b], acc[a][b], 32 + 4, wmma::mem_row_major);
+    __syncwarp();
+    const int lane = threadIdx.x & 31;
+    for (int e = lane; e < 32 * 32; e += 32) {
+        const int r = e / 32, col = e % 32;
+        const int h = h0 + wr + r;
+        const int c = c0 + wc + col;
+        if (h >= heads || c >= kvl) continue;
+        ol[(t * heads + h) * kvl + c] = out[warp][r][col];
+    }
+}
+
 // dst row (row0 + r) = src row r as `dt` (f32 or bf16), `width` wide.
 extern "C" __global__ void hy4_store_rows(const float* __restrict__ src, long long lds, void* __restrict__ dst, int dt, int width,
                                           long long row0) {

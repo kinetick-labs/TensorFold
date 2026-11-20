@@ -78,6 +78,9 @@ const Fns = struct {
     to_half: cuda.Function,
     gemm_tc_bf16: cuda.Function,
     gemm_tc_f16: cuda.Function,
+    mla_scores_tc: cuda.Function,
+    mla_softmax: cuda.Function,
+    mla_pv_tc: cuda.Function,
 };
 
 fn blocks(n: u64, per: u64) u32 {
@@ -90,12 +93,16 @@ pub const Kernels = struct {
     /// Plain bf16 / f16 projections of at least this many rows run on tensor cores (x rounded to the weight's type,
     /// fp32 sums); 0: never. HY4_TC_GEMM_ROWS, default 32.
     tc_min: u32 = 32,
+    /// Attention calls of at least this many query rows take the tensor-core path (mlaAttnTc) when the caller has
+    /// scratch for it; 0: never. HY4_ATTN_TC_ROWS, default 16 (prompt chunks; decode keeps the scalar kernel).
+    attn_tc_min: u32 = 16,
 
     /// The image (a fatbin or a cubin) loaded on the current context.
     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
         var k: Kernels = .{ .mod = try cuda.Module.load(d, image), .f = undefined };
         errdefer k.mod.unload();
         if (std.c.getenv("HY4_TC_GEMM_ROWS")) |v| k.tc_min = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 32;
+        if (std.c.getenv("HY4_ATTN_TC_ROWS")) |v| k.attn_tc_min = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 16;
         inline for (comptime std.meta.fieldNames(Fns)) |name| @field(k.f, name) = try k.mod.function("hy4_" ++ name);
         return k;
     }
@@ -197,6 +204,32 @@ pub const Kernels = struct {
         if (kvl + rope_dim > 640 or kvl > 1024) return error.Hy4Shape;
         if (t == 0) return;
         try go(k.f.mla_attn, s, .{ t, heads, 1 }, 256, 0, .{ ql, q, @as(i32, @intCast(qk)), @as(i32, @intCast(nope)), cv.lat, cv.rot, cv.scale, @intFromEnum(cv.dt), @as(i64, @intCast(cv.slots)), sinks, ol, @as(i32, @intCast(heads)), @as(i32, @intCast(kvl)), @as(i32, @intCast(rope_dim)), @as(i64, @intCast(qpos0)), @as(i32, @intCast(window)), keep.list, @as(i64, @intCast(keep.ld)), keep.count, @as(i32, @intCast(if (keep.kpool == 0) 1 else keep.kpool)), scale });
+    }
+
+    /// Scratch of mlaAttnTc: scores (f32) and weights (bf16) for `rows` query rows of `heads` heads and `keys` keys.
+    pub fn attnTcBytes(rows: u64, heads: u64, keys: u64) u64 {
+        return rows * heads * keys * 6;
+    }
+
+    /// mlaAttn on tensor cores for `t` query rows: scores, softmax with the sink, weights times latents, in pieces of
+    /// at most `piece` rows. `keys` (>= every row's key count) is the row stride of the scratch `S` (f32) / `P`
+    /// (bf16), each `piece * heads * keys` long. Q and K are rounded to bf16 (the caches are bf16 or fp8 by default).
+    pub fn mlaAttnTc(k: *const Kernels, s: cuda.Stream, ql: u64, q: u64, qk: u32, nope: u32, cv: CacheView, sinks: u64, ol: u64, t: u32, heads: u32, kvl: u32, rope_dim: u32, qpos0: u64, window: u32, keep: Keep, scale: f32, S: u64, P: u64, keys: u64, piece: u32) !void {
+        if (t == 0) return;
+        if (kvl % 64 != 0 or (kvl + rope_dim) % 32 != 0 or piece == 0) return error.Hy4Shape;
+        const kp: i32 = @intCast(if (keep.kpool == 0) 1 else keep.kpool);
+        var r: u32 = 0;
+        while (r < t) : (r += piece) {
+            const n = @min(piece, t - r);
+            const ru: u64 = r;
+            const list = if (keep.list != 0) keep.list + 4 * ru * keep.ld else 0;
+            const count = if (keep.count != 0) keep.count + 4 * ru else 0;
+            const p0: i64 = @intCast(qpos0 + ru);
+            const hz = blocks(heads, 64);
+            try go(k.f.mla_scores_tc, s, .{ n, blocks(keys, 64), hz }, 128, 0, .{ ql + 4 * ru * heads * kvl, q + 4 * ru * heads * qk, @as(i32, @intCast(qk)), @as(i32, @intCast(nope)), cv.lat, cv.rot, cv.scale, @intFromEnum(cv.dt), @as(i64, @intCast(cv.slots)), S, @as(i64, @intCast(keys)), @as(i32, @intCast(heads)), @as(i32, @intCast(kvl)), @as(i32, @intCast(rope_dim)), p0, @as(i32, @intCast(window)), list, @as(i64, @intCast(keep.ld)), count, kp, scale });
+            try go(k.f.mla_softmax, s, .{ n, heads, 1 }, 256, 0, .{ S, P, @as(i64, @intCast(keys)), sinks, @as(i32, @intCast(heads)), p0, @as(i32, @intCast(window)), count, @as(i32, @intFromBool(list != 0)), kp });
+            try go(k.f.mla_pv_tc, s, .{ n, blocks(kvl, 64), hz }, 128, 0, .{ P, @as(i64, @intCast(keys)), cv.lat, cv.scale, @intFromEnum(cv.dt), @as(i64, @intCast(cv.slots)), ol + 4 * ru * heads * kvl, @as(i32, @intCast(heads)), @as(i32, @intCast(kvl)), p0, @as(i32, @intCast(window)), list, @as(i64, @intCast(keep.ld)), count, kp });
+        }
     }
 
     /// Rows [p0, p0 + rows) of `src` (latent then rotary key, `lds` floats apart) into the cache's slots.

@@ -13,6 +13,9 @@ const Allocator = std.mem.Allocator;
 const cuda = @import("cuda");
 const fwd = @import("fwd.zig");
 const layer_ref = @import("layer_ref.zig");
+const prof_mod = @import("prof.zig");
+pub const Prof = prof_mod.Prof;
+pub const prof = prof_mod;
 
 pub const W = fwd.W;
 pub const CacheDt = fwd.CacheDt;
@@ -160,6 +163,8 @@ pub const Limits = struct {
     lanes: u32 = 1, // sequences a call may carry (one logits row each)
     grouped_rows: u32 = 0, // rows the device-grouped MoE takes at most (0: never)
     grouped_scratch: u64 = 0, // its scratch bytes for that many rows
+    att_keys: u32 = 0, // keys a query row of the tensor-core attention may see (max of window, topk); 0: no TC scratch
+    att_rows: u32 = 64, // query rows of one tensor-core attention piece
 };
 
 /// One sequence's rows in a forward call: rows [row, row + rows) of the work buffers are its positions
@@ -195,6 +200,7 @@ pub const Work = struct {
     a: Allocator,
     check_left: u32 = 0, // MoE calls still compared grouped against per-expert (HY4_MOE_CHECK)
     check_worst: f32 = 0,
+    prof: ?*prof_mod.Prof = null, // HY4_PROFILE: op groups timed on the stream
     // [chunk, ...] f32 unless noted
     streams: u64,
     mixed: u64,
@@ -241,6 +247,8 @@ pub const Work = struct {
     last: u64, // [lanes, hc, hidden]: the rows whose logits are wanted
     head: u64, // [lanes, vocab]
     gscr: u64, // the grouped experts' scratch
+    att_s: u64, // f32 [att_rows, heads, att_keys]: tensor-core attention scores
+    att_p: u64, // bf16 [att_rows, heads, att_keys]: their softmax weights
 
     pub fn init(a: Allocator, c: Ctx, lim: Limits) !Work {
         const C: u64 = lim.chunk;
@@ -254,6 +262,7 @@ pub const Work = struct {
         w.a = a;
         w.check_left = 0;
         w.check_worst = 0;
+        w.prof = null;
         w.streams = b.take(C * lim.hc * lim.hidden * f);
         w.mixed = b.take(C * lim.hidden * f);
         w.x = b.take(C * lim.hidden * f);
@@ -300,6 +309,9 @@ pub const Work = struct {
         w.last = b.take(lanes * lim.hc * lim.hidden * f);
         w.head = b.take(lanes * @as(u64, lim.vocab) * f);
         w.gscr = b.take(if (lim.grouped_rows > 0) lim.grouped_scratch else 0);
+        const att_n: u64 = if (lim.att_keys > 0) @as(u64, @min(lim.att_rows, lim.chunk)) * lim.heads * lim.att_keys else 0;
+        w.att_s = b.take(att_n * 4);
+        w.att_p = b.take(att_n * 2);
         w.buf = try cuda.DeviceBuffer.alloc(c.d, b.at);
         errdefer w.buf.free();
         const base = w.buf.ptr;
@@ -321,6 +333,11 @@ pub const Work = struct {
 
     pub fn bytes(w: *const Work) u64 {
         return w.buf.len;
+    }
+
+    /// The op group `op` ends here (HY4_PROFILE).
+    pub fn mark(w: *Work, op: prof_mod.Op) !void {
+        if (w.prof) |p| try p.mark(op);
     }
 
     /// Engram layer `slot`'s fetched rows.
@@ -420,7 +437,10 @@ pub fn layer(w: *Work, L: *const Layer, segs: []const Seg, emb: u64) !void {
     if (t == 0) return;
     if (t > w.lim.chunk) return error.Hy4Shape;
 
-    if (L.engram) |*e| try engramStep(w, e, emb, H, n, t);
+    if (L.engram) |*e| {
+        try engramStep(w, e, emb, H, n, t);
+        try w.mark(.engram);
+    }
 
     // attention: projections over every row
     const A = &L.attn;
@@ -444,6 +464,7 @@ pub fn layer(w: *Work, L: *const Layer, segs: []const Seg, emb: u64) !void {
         }
     }
     try k.absorbQ(s, w.q, A.kv_b, w.ql, t, heads, qk, d.nope, d.v, kvl);
+    try w.mark(.attn_proj);
 
     // per sequence: positions, the cache, the indexer, attention
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(qk)));
@@ -457,6 +478,7 @@ pub fn layer(w: *Work, L: *const Layer, segs: []const Seg, emb: u64) !void {
         try k.rope(s, w.kvn + f4(r0 * kw), kw, rows, 1, d.rope, kvl, d.rope, rope, p0, 1);
         if (d.window) |win| if (cache.view.slots < @min(@as(u64, w.lim.ctx), @as(u64, win) + rows - 1)) return error.Hy4Shape;
         try k.cacheStore(s, w.kvn + f4(r0 * kw), kw, kvl, d.rope, cache.view, p0, rows);
+        try w.mark(.rope_store);
         var keep: fwd.Kernels.Keep = .{};
         if (d.index) |ix| {
             const I = A.index.?;
@@ -491,13 +513,26 @@ pub fn layer(w: *Work, L: *const Layer, segs: []const Seg, emb: u64) !void {
                 try k.idxTopk(s, lg, ld, w.keep + r0 * ld, ld, rows, g_new, p0, ix.kpool, recall, list, w.lim.recall, count);
                 keep = .{ .list = list, .ld = w.lim.recall, .count = count, .kpool = ix.kpool };
             }
+            try w.mark(.indexer);
         }
-        try k.mlaAttn(s, w.ql + f4(r0 * heads * kvl), w.q + f4(r0 * heads * qk), qk, d.nope, cache.view, A.sinks, w.ol + f4(r0 * heads * kvl), rows, heads, kvl, d.rope, p0, d.window orelse 0, keep, scale);
+        // the most keys a row of this segment sees: its kept groups (and its own), the window, or all before it
+        const win = d.window orelse 0;
+        const nkmax: u64 = if (keep.list != 0) @as(u64, w.lim.recall + 1) * keep.kpool else if (win > 0) @min(@as(u64, win), @as(u64, p0) + rows) else @as(u64, p0) + rows;
+        const ql_r = w.ql + f4(r0 * heads * kvl);
+        const q_r = w.q + f4(r0 * heads * qk);
+        const ol_r = w.ol + f4(r0 * heads * kvl);
+        if (k.attn_tc_min > 0 and rows >= k.attn_tc_min and w.lim.att_keys > 0 and nkmax <= w.lim.att_keys and heads <= w.lim.heads) {
+            try k.mlaAttnTc(s, ql_r, q_r, qk, d.nope, cache.view, A.sinks, ol_r, rows, heads, kvl, d.rope, p0, win, keep, scale, w.att_s, w.att_p, w.lim.att_keys, @min(w.lim.att_rows, w.lim.chunk));
+        } else {
+            try k.mlaAttn(s, ql_r, q_r, qk, d.nope, cache.view, A.sinks, ol_r, rows, heads, kvl, d.rope, p0, win, keep, scale);
+        }
+        try w.mark(.attention);
     }
     try k.uvGate(s, w.ol, A.kv_b, w.gate, w.att, t, heads, d.nope, d.v, kvl);
     try c.lin(A.o, w.att, heads * d.v, t, w.mixed, H);
     try k.rmsnorm(s, w.mixed, H, A.post_norm, 1, w.y, H, t, H, d.eps);
     try k.hcPost(s, w.streams, w.post, w.y, t, n, H);
+    try w.mark(.attn_out);
 
     // MLP
     try k.hcPre(s, w.streams, L.ffn_hc, w.mixed, w.post, t, n, H, d.eps, d.hc_eps, d.hc_magnitude);
@@ -510,6 +545,7 @@ pub fn layer(w: *Work, L: *const Layer, segs: []const Seg, emb: u64) !void {
             try k.swiglu(s, w.g, w.u, I, w.h, t, I, 0);
             try c.lin(m.down, w.h, I, t, w.mixed, H);
             try k.rmsnorm(s, w.mixed, H, m.norm, 1, w.y, H, t, H, d.eps);
+            try w.mark(.dense);
         },
         .moe => |*m| try moe(w, m, H, t, d.eps),
     }
@@ -530,6 +566,7 @@ fn moe(w: *Work, m: *const Moe, H: u32, t: u32, eps: f32) !void {
     try c.lin(m.router, w.x, H, t, w.rlog, m.experts);
     try k.route(s, w.rlog, m.bias, t, m.experts, m.top, m.scale, w.ids, w.wts);
     try c.lin(m.pre, w.x, H, t, w.lat, L);
+    try w.mark(.router);
     const grouped = if (m.grouped) |gl| (if (c.experts != null and t <= w.lim.grouped_rows) gl else null) else null;
     if (grouped) |gl| {
         try k.toHalf(s, w.lat, w.half, @as(u64, t) * L);
@@ -553,6 +590,7 @@ fn moe(w: *Work, m: *const Moe, H: u32, t: u32, eps: f32) !void {
             std.log.info("hy4 moe check: grouped vs per-expert over {d} rows, worst {e} of the largest |value| {e}", .{ t, e, big });
         }
     } else try perExpert(w, m, t, w.acc);
+    try w.mark(.experts);
     try c.lin(m.post, w.acc, L, t, w.sum, H);
     const SW = m.shared[0].n();
     try c.lin(m.shared[0], w.x, H, t, w.g, SW);
@@ -561,6 +599,7 @@ fn moe(w: *Work, m: *const Moe, H: u32, t: u32, eps: f32) !void {
     try c.lin(m.shared[2], w.h, SW, t, w.mixed, H);
     try k.add(s, w.mixed, w.sum, @as(u64, t) * H);
     try k.rmsnorm(s, w.mixed, H, m.norm, 1, w.y, H, t, H, eps);
+    try w.mark(.shared);
 }
 
 /// The routed experts grouped on the host: `w.ids`, `w.wts` and `w.lat` from moe(), the weighted sum into `acc`.

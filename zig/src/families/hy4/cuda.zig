@@ -139,5 +139,7 @@ test {
     _ = @import("moe_grouped.zig");
     _ = @import("engram_batch.zig");
     _ = @import("capacity.zig");
+    _ = @import("prof.zig");
+    _ = @import("draft_plan.zig");
     std.testing.refAllDecls(@import("gpu_model.zig"));
 }
