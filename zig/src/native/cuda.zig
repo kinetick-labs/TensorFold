@@ -486,13 +486,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .slide_conversations = conversations,
         .readouts = readouts,
         .text_generation = readouts == null, // a readout engine answers its readouts only (Clef's /v1/systemone)
-    }), .{ .ctx = loaded.ctx, .text = F.explain }, snaps.warmQuiet(F));
-        .compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null, // replies hold at EOS
         .compute = compute,
         .compute_tool = if (@hasDecl(F, "compute")) F.compute.tool else .{},
         .runner = runner,
         .compute_runner = s3,
-    }), .{ .ctx = loaded.ctx, .text = F.explain });
+    }), .{ .ctx = loaded.ctx, .text = F.explain }, snaps.warmQuiet(F));
     opened = true;
     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, if (paged) |p| p.taken else 0, std.log); // TF_KV_SHARE: no copied rows
     if (@hasField(@TypeOf(loaded), "follow")) if (loaded.follow) |f| {

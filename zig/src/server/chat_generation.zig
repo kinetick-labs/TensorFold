@@ -603,6 +603,8 @@ fn neverClosed(text: []const u8, m: reply_text.Markers, close_at: ?reply_text.Cl
     if (closed) return false;
     for (reply_text.openersOf(m).calls) |c| if (reply_text.findTag(text, 0, c[0]) != null) return false;
     return true;
+}
+
 fn nonEmpty(s: []const u8) ?[]const u8 {
     return if (s.len > 0) s else null;
 }
