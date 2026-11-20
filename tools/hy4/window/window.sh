@@ -88,7 +88,7 @@ if [ -n "${HY4_SERVE_BIN:-}" ]; then
     grep -E "moe check" $D/serve.out | tail -4 | tee -a $L
     timeout 1500 python3 $D/smoke.py 8095 $D/smoke.png 2>&1 | tee -a $L
     grep -E "moe check" $D/serve.out | tail -4 | tee -a $L
-    [ -s $D/bench.py ] && timeout 1200 python3 $D/bench.py 8095 --parallel 4 2>&1 | tee -a $L
+    [ -s $D/bench.py ] && timeout $(( END - $(date +%s) - ${HY4_CAP_RESERVE_S:-900} > 180 ? END - $(date +%s) - ${HY4_CAP_RESERVE_S:-900} : 180 )) python3 $D/bench.py 8095 --parallel 4 2>&1 | tee -a $L
     log "serve: $(free -m | awk '/Mem:/{print "MemAvailable " $7 " MiB"}') after the smoke + bench"
     # HY4_HOLD=1: keep the server up for more tests until ~/hy4-logs/release exists (the deadline still restores)
     if [ -n "${HY4_HOLD:-}" ]; then rm -f $D/release; log "hold: touch $D/release to end"; while [ ! -e $D/release ] && kill -0 $(cat $D/serve.pid) 2>/dev/null; do sleep 5; done; fi
@@ -101,7 +101,7 @@ if [ -n "${HY4_SERVE_BIN:-}" ]; then
     [ $left -ge 600 ] || { log "capacity $ctx: skipped, $((left / 60)) min left in the window"; continue; }
     export HY4_CACHE_DT=${HY4_CAP_DT:-fp8}
     if serve_up $ctx; then
-      lanes=$(grep -oE "hy4: [0-9]+ lanes of" $D/serve.out | grep -oE "[0-9]+" | head -1)
+      lanes=$(grep -oE "hy4: [0-9]+ lanes of" $D/serve.out | head -1 | awk '{print $2}')  # not the 4 of "hy4"
       log "CAPACITY $ctx tokens ($HY4_CACHE_DT caches): ${lanes:-?} lanes; $(grep -E 'hy4: [0-9]+ lanes|ready, work' $D/serve.out | tr '\n' ' ')"
       grep -E "hy4 capacity:" $D/serve.out | tee -a $L
       k=${lanes:-1}; [ "$k" -gt 4 ] && k=4

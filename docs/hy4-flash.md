@@ -204,3 +204,30 @@ learnable sink) plus `mtp_fusion`, `hidden_correction`, `confidence_head`, `fina
 - Engine work: a `Draft` struct bound from the pack (bind.zig group `draft`), a forward reusing `hy4_mla_attn` with the
   target's `CacheView` of the five source layers, and the accept loop in `serve_engine` (greedy first, then
   sampling with the standard speculative acceptance).
+
+### Window 3 (20 Nov 2026, 07:50-08:35 Paris; build 210e7b76c, bf16 caches at 32k, fp8 for capacity)
+
+- Kernel tests: hc, Engram, vision, grouped-MoE tables, Engram batch, capacity passed. The forward-layer and
+  tensor-core GEMM tests failed at first, and not the same way twice. The cause was the test harness, not the kernels:
+  `Gpu.alloc` zeroed buffers with a legacy-stream `cuMemsetD8`, which does not order with the test's non-blocking
+  stream, so the memset sometimes landed after the uploads and kernels (whole outputs or caches zeroed). With the memset
+  on the test's stream every f32 plan matches layer_ref to ~4e-6 (sliding + dense and indexed + MoE, whole, chunked,
+  decode rows, two sequences with lag 0 / 8), and the TC GEMM is within 9.5e-4 (bf16) / 1.3e-4 (f16) of the fp32 GEMM.
+  The bf16 caches are within 2e-2 and fp8 within 0.3 on the random toy layers, i.e. bf16 x 16 for the coarser
+  mantissa (tolerances set to 3e-2 / 0.4). The serve's boot-time cache memset now also finishes before use.
+- MoE: grouped device MoE vs per-expert, `HY4_MOE_CHECK=4`: worst 1.9e-4 .. 2.4e-4 of the largest value (34 rows).
+- Smoke 3/3 at 32k bf16 (text 'Paris', image 'Red', thinking '17 * 3 = 51'), and 3/3 again on the 512k fp8 server.
+- bench (32k, bf16, 4 lanes; window 2 first engine in brackets): short 72 tok TTFT 0.57 s (1.25), decode 13.9 tok/s
+  (9.7); 2k TTFT 14.6 s, 125 tok/s prefill (103), decode 11.8 (8.7); 8k TTFT 64 s, 112 tok/s prefill (92), decode 11.5
+  (8.2). 4 streams at once: 27.5 tok/s aggregate, 7.1-7.9 tok/s each.
+- Long prompt (28,553 tokens, fp8): TTFT 266 s (107 tok/s prefill), decode 10.9-11.4 tok/s. Prefill is still the
+  bottleneck: the batched Engram reads and TC GEMM gave ~+20%, not the hoped-for multiple. Next: profile a prefill
+  chunk (attention over the full sparse history and the per-expert EXL3 path for 256-row chunks above
+  `HY4_MOE_GROUPED_ROWS` are the suspects).
+- Streams measured (boot with ~19 GiB free beside a 4 GiB reserve; engine log `hy4 capacity`):
+
+  | context | f32 | bf16 | fp8 | booted (fp8) |
+  |---|---|---|---|---|
+  | 256k | 2 | 4 | 6-7 | 7 lanes, 2142 MiB each, MemAvailable low 6.9 GiB with 4 streams + a 28k fill |
+  | 512k | 1 | 2 | 3 | 3 lanes, 4269 MiB each, MemAvailable 9.4 GiB after the fill |
+  | 1M | 0 | 1 | 1 | 1 lane, 8523 MiB, 10.3 GiB of the device free |

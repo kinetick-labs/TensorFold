@@ -267,6 +267,8 @@ pub const Runner = struct {
         }
         r.cache_buf = try cuda.DeviceBuffer.alloc(&r.d, per_lane * fits);
         try r.cache_buf.fill8(0, null);
+        // the legacy-stream memset does not order with the engine's non-blocking stream: finish it now
+        try r.d.check(r.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
         r.lanes = try a.alloc(Lane, fits);
         var at: u64 = r.cache_buf.ptr;
         for (r.lanes) |*ln| {
