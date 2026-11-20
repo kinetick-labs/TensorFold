@@ -1821,7 +1821,6 @@ pub const Engine = struct {
         }
     }
 
-
     /// Structured output: the last prompt row's logits (bf16, head_n wide) on the host, before the next prompt
     /// or round overwrites them (the lanes keep it for the first masked draw).
     pub fn readLastRow(e: *Engine, out: []u16) !void {

@@ -4,7 +4,6 @@ const std = @import("std");
 const lanes = @import("lanes");
 pub const Sampling = lanes.sampling.Sampling;
 
-
 // ---- sampling ------------------------------------------------------------------------------------------------------
 
 pub fn promote(bits: u16) f32 {
