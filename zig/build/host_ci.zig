@@ -157,6 +157,7 @@ const linux_host = [_][]const u8{
     "test-flashnext-buffer-plan-host",
     "test-flashnext-cleanup-host",
     "test-flashnext-completion-host",
+    "test-flashnext-mia-completion-host",
     "test-flashnext-compose-host",
     "test-flashnext-load-context-host",
     "test-flashnext-loader-host",
