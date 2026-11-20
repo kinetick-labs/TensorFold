@@ -2348,9 +2348,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     const paths = try core.checkpoint.shardFiles(gpa, io, dir);
     defer core.checkpoint.freeShardFiles(gpa, paths);
     if (paths.len != ck.files.items.len) return error.CheckpointChanged;
-    var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c) };
     var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c), .mx8 = o.mxfp8 and c.hasMxfp8(), .hc_lane = o.hc_lane };
-    var L: Loader = .{ .gpa = gpa, .io = io, .ck = &ck, .c = c, .o = o, .out = .{ .gpa = gpa, .w = &w }, .paths = paths, .rope = ropeOf(c), .mx8 = o.mxfp8 and c.hasMxfp8() };
     defer L.deinit();
     L.prefix = if (L.has("language_model.model.embed_tokens.weight")) "language_model." else "";
     try L.openExtra(dir);

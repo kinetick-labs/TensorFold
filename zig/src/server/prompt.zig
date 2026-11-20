@@ -12,8 +12,7 @@ const Value = json.Value;
 const Cx = errors.Cx;
 
 /// With image input, `ids` holds each image's tokens, `images` the images and `cache_key` the prompt the cache matches.
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, user_end: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, frames: []const ?api.Size = &.{}, message_starts: []const u32 = &.{} };
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, user_end: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, frames: []const ?api.Size = &.{}, media: ?*const api.Media = null };
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, user_end: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, frames: []const ?api.Size = &.{}, message_starts: []const u32 = &.{}, media: ?*const api.Media = null };
 
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {

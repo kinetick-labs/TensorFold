@@ -1963,25 +1963,6 @@ pub const Engine = struct {
         if (n / 2000 != (n - @min(n, rows)) / 2000) std.log.warn("spec sample: {d} drafts kept, {d} refused (residual draws), {d} plain rows", .{ e.spec_kept, e.spec_taken, e.spec_plain });
     }
 
-    /// TF_FLASHNEXT_FORCE=path (diagnostics): "pos token" lines, read again each window; a row at a listed position
-    /// takes that token instead of its draw (teacher forcing, to compare two builds' rows on one sequence).
-    fn forceRows(e: *Engine, path: []const u8, first_position: u64, out: []u32) !void {
-        var pb: [512]u8 = undefined;
-        const z = try std.fmt.bufPrintSentinel(&pb, "{s}", .{path}, 0);
-        const f = std.c.fopen(z, "r") orelse return;
-        defer _ = std.c.fclose(f);
-        const buf = try e.gpa.alloc(u8, 1 << 20);
-        defer e.gpa.free(buf);
-        const n = std.c.fread(buf.ptr, 1, buf.len, f);
-        var it = std.mem.tokenizeAny(u8, buf[0..n], " \n");
-        while (it.next()) |ps| {
-            const ts = it.next() orelse break;
-            const at = std.fmt.parseInt(u64, ps, 10) catch continue;
-            const tok = std.fmt.parseInt(u32, ts, 10) catch continue;
-            if (at >= first_position and at < first_position + out.len) out[at - first_position] = tok;
-        }
-    }
-
     var dump_file: ?*std.c.FILE = null;
     extern "c" fn fflush(f: *std.c.FILE) c_int;
     const c_fflush = fflush;

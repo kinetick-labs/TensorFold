@@ -266,7 +266,6 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     if (thinking) request.run_commit = try @import("runner_commit_ask.zig").of(a, srv.info.runner, srv.think_close, input.messages, input.tools, &request);
     if (try engine_refusal.of(srv.engine, cx, &request)) |message| return cx.refuse(message);
     if (input.trace) |trace| trace.prepared(&request, thinking, effort);
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = fields_mod.flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .frames = rendered.frames };
     const deadline: ?i96 = if (f.get("deadline_s")) |v| blk: {
         const s = (if (v == .bool) null else v.float64()) orelse return cx.refuse("deadline_s must be a number of seconds");
         if (!(s > 0 and s <= 1e6)) return cx.refuse("deadline_s must be more than 0 and at most 1000000 seconds");

@@ -139,7 +139,6 @@ pub const Server = struct {
     text: model_text.Text,
     config: Config,
     voices: @import("drama_voice_store.zig").Store = .{},
-    voices: []const @import("drama_voice.zig").Voice = &.{},
     guides: @import("runner_guide.zig").Set = .{},
     keys: ?*auth.Store,
     late_system: []const u8 = "system",

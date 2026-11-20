@@ -440,8 +440,16 @@ pub const Generation = struct {
         const recovered = g.recover and reasoning != null and reply_text.pyStrip(content).len == 0 and g.endedOnEos(reason, raw, stopped) and
             (if (native) |n| n.open_think and n.calls == null else neverClosed(text, g.srv.markers, close_at)) and !try g.callIn(reasoning.?);
         if (recovered) content = reasoning.?;
-        const read: Read = if (native) |n| .{ .text = n.content, .close = "", .content = n.content, .reasoning = nonEmpty(reply_text.pyStrip(n.reasoning)) } else try g.readText(raw, content_tokens);
-        const text, const close, const content, const reasoning = .{ read.text, read.close, read.content, read.reasoning };
+        // a resumed segment that ended at its EOS inside the think block the result turn reopened (our readText's case)
+        if (native == null and g.thinking) {
+            const t = g.collected.items;
+            const unclosed = g.resumed and close_at != .token and reasoning != null and reply_text.pyStrip(content).len == 0 and
+                t.len > 0 and g.eos(t[t.len - 1]);
+            if (unclosed and !g.close_turn) { // no turn to answer in (no room, or the template has none): its text answers
+                content = reasoning.?;
+                reasoning = null;
+            }
+        }
         g.owned = try g.ownedOf(content_tokens, raw, content); // the runner's cell writes (none: null)
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
